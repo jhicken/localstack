@@ -34,10 +34,8 @@ struct ServiceRow: View {
                 .strokeBorder(service.isRestarting ? Color.orange.opacity(0.5) : service.isFailed ? Color.red.opacity(0.35) : .clear, lineWidth: 1)
         )
         .onHover { hover = $0 }
-        .confirmationDialog("Remove \(service.name)?", isPresented: $confirmRemove) {
-            Button("Stop & Remove", role: .destructive) { store.remove(service.name) }
-        } message: {
-            Text("The service will be stopped and its definition deleted.")
+        .onAppear {
+            if ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_REMOVE"] == service.name { confirmRemove = true }
         }
     }
 
@@ -189,6 +187,25 @@ struct ServiceRow: View {
                 .fixedSize()
             }
             .controlSize(.small)
+            // Inline confirmation: a dialog/sheet would take key focus and close the menu bar panel.
+            if confirmRemove {
+                HStack(spacing: 6) {
+                    Image(systemName: "trash.fill").foregroundStyle(.red)
+                    Text("Stop and delete \(service.name)?").font(.system(size: 11, weight: .medium))
+                    Spacer()
+                    Button("Cancel") { confirmRemove = false }
+                    Button("Stop & Remove", role: .destructive) {
+                        confirmRemove = false
+                        store.remove(service.name)
+                    }
+                    .tint(.red)
+                    .buttonStyle(.borderedProminent)
+                }
+                .controlSize(.small)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.red.opacity(0.12)))
+                .transition(.opacity)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 10)

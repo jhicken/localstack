@@ -100,7 +100,22 @@ fn applescript_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// LSTACK_* settings the daemon runs with (non-default home/port), passed explicitly to the
+/// launched command instead of through the environment, so a terminal app cold-launched by
+/// the daemon doesn't inherit them into every later tab.
+fn lstack_env() -> Vec<String> {
+    ["LSTACK_HOME", "LSTACK_PORT", "LSTACK_DOCKER"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| format!("{k}={v}")))
+        .collect()
+}
+
 fn spawn(cmd: &mut Command) -> Result<(), String> {
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("LSTACK_") {
+            cmd.env_remove(&k);
+        }
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     let out = cmd.output().map_err(|e| e.to_string())?;
     if out.status.success() {
@@ -117,7 +132,15 @@ fn osascript(script: &str) -> Result<(), String> {
 /// Open the preferred terminal app running `lstack <args>`.
 pub fn open(args: &[&str]) -> Result<(), String> {
     let exe = paths::self_exe().to_string_lossy().into_owned();
-    let line: Vec<String> = std::iter::once(exe.as_str()).chain(args.iter().copied()).map(shell_quote).collect();
+    let env = lstack_env();
+    let mut argv: Vec<&str> = Vec::new();
+    if !env.is_empty() {
+        argv.push("/usr/bin/env");
+        argv.extend(env.iter().map(String::as_str));
+    }
+    argv.push(&exe);
+    argv.extend(args.iter().copied());
+    let line: Vec<String> = argv.iter().copied().map(shell_quote).collect();
     let line = line.join(" ");
     let term = current();
     let res = match term {
@@ -134,7 +157,7 @@ pub fn open(args: &[&str]) -> Result<(), String> {
         }
         "ghostty" => {
             let mut c = Command::new("/usr/bin/open");
-            c.args(["-na", "Ghostty", "--args", "-e", &exe]).args(args);
+            c.args(["-na", "Ghostty", "--args", "-e"]).args(&argv);
             spawn(&mut c)
         }
         _ => osascript(&format!(
