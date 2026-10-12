@@ -56,7 +56,10 @@ final class AppStore {
             services = snap.services.sorted { $0.name < $1.name }
             configErrors = snap.configErrors
             for s in services where s.isRunning { Task { await loadHistory(s.name) } }
-            Task { await loadSystem() }
+            Task {
+                await loadSystem()
+                await refreshSettings()
+            }
         case "service":
             guard let s = try? dec.decode(ServiceState.self, from: data) else { return }
             if let i = services.firstIndex(where: { $0.name == s.name }) {
@@ -246,6 +249,44 @@ final class AppStore {
     func refreshSettings() async {
         guard let client else { settings = nil; return }
         settings = try? await client.send("GET", "/api/settings", as: DaemonSettings.self)
+    }
+
+    // MARK: Full Disk Access
+
+    var diskAccessDismissed = UserDefaults.standard.bool(forKey: "diskAccessDismissed") {
+        didSet { UserDefaults.standard.set(diskAccessDismissed, forKey: "diskAccessDismissed") }
+    }
+    /// Set once access flips to granted while we were waiting for it; offers a restart.
+    var diskAccessJustGranted = false
+    private var diskAccessPoll: Task<Void, Never>?
+
+    /// macOS has no prompt for Full Disk Access, so take the user straight to the pane with the
+    /// helper revealed in Finder (and its path on the clipboard for ⌘⇧G), then watch for the grant.
+    func requestDiskAccess() {
+        guard let helper = settings?.helperPath else { flash("Daemon isn't running"); return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(helper, forType: .string)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: helper)])
+        diskAccessPoll?.cancel()
+        diskAccessPoll = Task {
+            for _ in 0..<150 {
+                try? await Task.sleep(for: .seconds(2))
+                if Task.isCancelled { return }
+                await refreshSettings()
+                if settings?.fullDiskAccess == true {
+                    diskAccessJustGranted = services.contains { $0.type == "process" && $0.isRunning }
+                    return
+                }
+            }
+        }
+    }
+
+    func restartScripts() {
+        diskAccessJustGranted = false
+        for s in services where s.type == "process" && s.isRunning { perform(s.name, "restart") }
     }
 
     func setTerminal(_ id: String) {

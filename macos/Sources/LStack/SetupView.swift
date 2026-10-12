@@ -172,26 +172,17 @@ struct SetupView: View {
         let granted = store.settings?.fullDiskAccess ?? false
         let detail = granted
             ? "Granted. Scripts can use tools that read other apps' data, such as the 1Password CLI (`op`)."
-            : "Scripts run by the daemon can't reach other apps' data, so tools like the 1Password CLI (`op`) can't see your accounts. Click Grant, then turn on **lstack** in the list (or add it with + from the Finder window that opens)."
+            : "Scripts run by the daemon can't reach other apps' data, so tools like the 1Password CLI (`op`) can't see your accounts. Click Grant, then drag **lstack** from the Finder window into the list (or click +, press ⌘⇧G and paste, its path is copied) and turn it on."
         return SetupRow(icon: "lock.shield.fill", tint: granted ? .green : .orange, title: "Full Disk Access", detail: detail) {
             if granted {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
             } else {
                 VStack(alignment: .trailing, spacing: 6) {
-                    Button("Grant…") { grantDiskAccess() }.controlSize(.small)
+                    Button("Grant…") { store.requestDiskAccess() }.controlSize(.small)
                     Button("Recheck") { Task { await store.refreshSettings() } }
                         .buttonStyle(.link).font(.system(size: 10))
                 }
             }
-        }
-    }
-
-    private func grantDiskAccess() {
-        if let helper = store.settings?.helperPath {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: helper)])
-        }
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-            NSWorkspace.shared.open(url)
         }
     }
 

@@ -14,6 +14,7 @@ struct PopoverView: View {
                     .padding(.horizontal, 8)
                     .padding(.bottom, 8)
             }
+            diskAccessBanner
             Divider().opacity(0.5)
             if !store.connected {
                 disconnected
@@ -58,6 +59,7 @@ struct PopoverView: View {
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
         .background(MenuWindowSizer(height: contentHeight))
         .animation(.snappy(duration: 0.25), value: store.toast)
+        .onAppear { Task { await store.refreshSettings() } }
     }
 
     private var header: some View {
@@ -76,6 +78,20 @@ struct PopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    @ViewBuilder private var diskAccessBanner: some View {
+        if store.connected, store.diskAccessJustGranted {
+            Banner(icon: "checkmark.shield.fill", tint: .green,
+                   text: "Full Disk Access granted. Restart scripts so they pick it up.",
+                   action: "Restart Scripts", perform: store.restartScripts,
+                   dismiss: { store.diskAccessJustGranted = false })
+        } else if store.connected, let st = store.settings, !st.fullDiskAccess, !store.diskAccessDismissed {
+            Banner(icon: "lock.shield.fill", tint: .orange,
+                   text: "Scripts can't use the 1Password CLI (op) or other apps' data until LStack has Full Disk Access.",
+                   action: "Grant Access…", perform: store.requestDiskAccess,
+                   dismiss: { store.diskAccessDismissed = true })
+        }
     }
 
     private var subtitle: String {
@@ -144,6 +160,33 @@ struct PopoverView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
+    }
+}
+
+private struct Banner: View {
+    let icon: String
+    let tint: Color
+    let text: String
+    let action: String
+    let perform: () -> Void
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: icon).foregroundStyle(tint).font(.system(size: 14))
+            Text(text).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button(action, action: perform).controlSize(.small)
+            Button(action: dismiss) {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Hide (you can still grant it in Settings)")
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(tint.opacity(0.12)))
+        .padding(.horizontal, 8)
+        .padding(.bottom, 8)
     }
 }
 

@@ -169,7 +169,7 @@ lstack add web -- 'cd ~/code/web && export PORT=3000 && source .env && bun run d
 - **What isn't split.** Anything that needs runtime expansion (`$VAR`, `$(…)`, globs) is left alone, as is everything after a pipe or subshell. Pass `--no-split` to keep the command exactly as typed.
 - **In the app.** The Add Service window shows a **Split Out** suggestion as you type.
 
-**1Password CLI (`op`) and other tools that read app data.** macOS privacy rules apply to scripts launched by the LStack daemon. Without permission, `op` can't read 1Password's settings, so it reports "No accounts configured" and never shows the Touch ID prompt. To fix this, grant **Full Disk Access** to the helper. Open **Settings → Full Disk Access → Grant…**, which reveals `LStack.app/Contents/Helpers/lstack` and opens the matching System Settings pane. Add the helper there, then restart the service. If it stops working after an update, remove the entry and add it again.
+**1Password CLI (`op`) and other tools that read app data.** macOS privacy rules apply to scripts launched by the LStack daemon. Without permission, `op` can't read 1Password's settings, so it reports "No accounts configured" and never shows the Touch ID prompt. To fix this, grant **Full Disk Access** to the helper. Click **Grant Access…** in the menu bar banner (or **Settings → Full Disk Access → Grant…**). It copies the helper's path, reveals `LStack.app/Contents/Helpers/lstack` and opens the matching System Settings pane. Drag `lstack` into the list, or click +, press ⌘⇧G and paste, then turn it on. LStack detects the grant and offers to restart your scripts. If it stops working after an update, remove the entry and add it again.
 
 ### Service YAML
 
