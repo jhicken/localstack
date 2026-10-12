@@ -1,0 +1,107 @@
+import SwiftUI
+
+enum Theme {
+    static func statusColor(_ status: String) -> Color {
+        switch status {
+        case "running": return .green
+        case "starting", "stopping": return .orange
+        case "crashed", "errored": return .red
+        default: return .secondary.opacity(0.6)
+        }
+    }
+
+    static func typeIcon(_ type: String) -> String {
+        switch type {
+        case "process": return "terminal.fill"
+        case "docker": return "shippingbox.fill"
+        case "compose": return "square.stack.3d.up.fill"
+        case "k8s": return "helm"
+        default: return "questionmark.circle"
+        }
+    }
+
+    static func typeColor(_ type: String) -> Color {
+        switch type {
+        case "process": return .indigo
+        case "docker": return .blue
+        case "compose": return .cyan
+        case "k8s": return .purple
+        default: return .gray
+        }
+    }
+}
+
+struct StatusDot: View {
+    let status: String
+    var size: CGFloat = 8
+    @State private var pulse = false
+
+    var body: some View {
+        let color = Theme.statusColor(status)
+        Circle()
+            .fill(color)
+            .frame(width: size, height: size)
+            .shadow(color: status == "running" ? color.opacity(0.8) : .clear, radius: 3)
+            .overlay(
+                Circle()
+                    .stroke(color.opacity(0.5), lineWidth: 2)
+                    .scaleEffect(pulse ? 2.2 : 1)
+                    .opacity(pulse ? 0 : 1)
+                    .opacity(status == "starting" || status == "stopping" ? 1 : 0)
+            )
+            .onAppear {
+                withAnimation(.easeOut(duration: 1.2).repeatForever(autoreverses: false)) { pulse = true }
+            }
+    }
+}
+
+struct TypeBadge: View {
+    let type: String
+    var body: some View {
+        Image(systemName: Theme.typeIcon(type))
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 22, height: 22)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Theme.typeColor(type).gradient)
+            )
+    }
+}
+
+struct Pill: View {
+    let icon: String
+    let text: String
+    var tint: Color = .secondary
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 9, weight: .bold))
+            Text(text).font(.system(size: 11, weight: .medium)).monospacedDigit()
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(tint.opacity(0.12)))
+    }
+}
+
+struct IconButton: View {
+    let icon: String
+    let help: String
+    var tint: Color = .primary
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 26, height: 24)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(hover ? Color.primary.opacity(0.1) : .clear))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .onHover { hover = $0 }
+    }
+}

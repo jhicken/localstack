@@ -1,0 +1,5 @@
+target/
+dist/
+macos/.build/
+*.log
+.DS_Store
