@@ -119,6 +119,61 @@ impl CpuSampler {
     }
 }
 
+/// Whole-machine CPU and memory, for the "how loaded is this Mac" view.
+#[derive(Default)]
+pub struct HostSampler {
+    prev: Option<[u64; 4]>,
+}
+
+pub fn host_cores() -> u32 {
+    std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)
+}
+
+pub fn host_mem_total() -> f64 {
+    let mut v: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let rc = unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), &mut v as *mut u64 as *mut _, &mut len, std::ptr::null_mut(), 0) };
+    if rc == 0 { v as f64 } else { 0.0 }
+}
+
+#[allow(deprecated)]
+fn host_port() -> libc::mach_port_t {
+    static PORT: OnceLock<libc::mach_port_t> = OnceLock::new();
+    *PORT.get_or_init(|| unsafe { libc::mach_host_self() })
+}
+
+/// Cumulative (user, system, idle, nice) CPU ticks across all cores.
+fn host_ticks() -> Option<[u64; 4]> {
+    let mut info = libc::host_cpu_load_info { cpu_ticks: [0; 4] };
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    let rc = unsafe { libc::host_statistics(host_port(), libc::HOST_CPU_LOAD_INFO, &mut info as *mut _ as libc::host_info_t, &mut count) };
+    (rc == 0).then(|| info.cpu_ticks.map(|t| t as u64))
+}
+
+/// "Memory Used" as Activity Monitor computes it: app memory + wired + compressed.
+pub fn host_mem_used() -> Option<f64> {
+    let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let rc = unsafe { libc::host_statistics64(host_port(), libc::HOST_VM_INFO64, &mut vm as *mut _ as libc::host_info64_t, &mut count) };
+    if rc != 0 {
+        return None;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as f64;
+    let app = (vm.internal_page_count as f64 - vm.purgeable_count as f64).max(0.0);
+    Some((app + vm.wire_count as f64 + vm.compressor_page_count as f64) * page)
+}
+
+impl HostSampler {
+    /// Machine CPU busy % (0–100 of all cores) since the previous call.
+    pub fn cpu(&mut self) -> Option<f64> {
+        let now = host_ticks()?;
+        let prev = self.prev.replace(now)?;
+        let d: Vec<u64> = now.iter().zip(prev).map(|(a, b)| a.saturating_sub(b)).collect();
+        let total: u64 = d.iter().sum();
+        (total > 0).then(|| (total - d[2]) as f64 / total as f64 * 100.0)
+    }
+}
+
 /// Cumulative per-pid network bytes from `nettop` (rx, tx).
 pub async fn network_table() -> Option<HashMap<i32, (f64, f64)>> {
     let out = tokio::time::timeout(

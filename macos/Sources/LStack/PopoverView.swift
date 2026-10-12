@@ -4,10 +4,16 @@ struct PopoverView: View {
     @Environment(AppStore.self) private var store
     @Environment(\.openWindow) private var openWindow
     @State private var listHeight: CGFloat = 0
+    @State private var contentHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            if store.connected, let sys = store.system, !sys.samples.isEmpty {
+                SystemCard(info: sys)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+            }
             Divider().opacity(0.5)
             if !store.connected {
                 disconnected
@@ -49,6 +55,8 @@ struct PopoverView: View {
         }
         .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+        .background(MenuWindowSizer(height: contentHeight))
         .animation(.snappy(duration: 0.25), value: store.toast)
     }
 
@@ -60,10 +68,6 @@ struct PopoverView: View {
                 Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
-            if store.connected {
-                Pill(icon: "cpu", text: Fmt.pct(store.totalCPU), tint: .green)
-                Pill(icon: "memorychip", text: Fmt.bytes(store.totalMem), tint: .blue)
-            }
             IconButton(icon: "plus", help: "Add service") {
                 openWindow(id: "add")
                 bringToFront()
@@ -80,7 +84,7 @@ struct PopoverView: View {
         let f = store.failedCount
         var parts = ["\(r) running"]
         let stopped = store.services.count - r - f
-        if stopped > 0 || f == 0 { parts.append("\(max(stopped, 0)) stopped") }
+        if stopped > 0 { parts.append("\(max(stopped, 0)) stopped") }
         if f > 0 { parts.append("\(f) failing") }
         return parts.joined(separator: " · ")
     }

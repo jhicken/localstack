@@ -130,6 +130,21 @@ pub struct MetricSample {
     pub net_tx: Option<f64>,
 }
 
+/// Whole-machine load at one point in time, with LStack's own share of it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemSample {
+    pub ts: i64,
+    /// Busy CPU, % of all cores (0–100).
+    pub cpu: f64,
+    /// Memory in use (bytes).
+    pub mem: f64,
+    /// CPU used by LStack services, % of all cores.
+    pub ls_cpu: f64,
+    /// Memory used by LStack services (bytes).
+    pub ls_mem: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceState {

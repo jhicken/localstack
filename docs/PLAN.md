@@ -56,6 +56,7 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | Remote 2FA | Optional TOTP (RFC 6238, SHA-1, 6 digits, ±1 step, replay-protected). Enroll with `lstack remote 2fa on` (terminal QR) or Settings (QR plus confirm code). The sign-in form asks for the code when enabled. |
 | Terminal app | `~/.localstack/settings.json` picks Terminal, iTerm, cmux or Ghostty for Dashboard/Attach/Shell (Settings picker or `lstack terminal`) |
 | Crash loops | Restart countdown (`restartAt`) shown in the menu bar, TUI, CLI and web, with an always-visible Stop. Stop cancels the pending restart and waits for an in-flight start instead of returning "busy". |
+| System load | Whole-machine CPU/memory sampled from Mach host stats every 3 s (`/api/system`, SSE `system`), shown in the menu bar panel as sparklines plus an LStack vs. other-apps breakdown. The panel also shrinks back when content gets shorter. |
 | Full Disk Access | Settings detects whether the helper has Full Disk Access (needed by `op` and similar tools under launchd) and links to the System Settings pane |
 
 ## Phase 2 — Daily-driver polish

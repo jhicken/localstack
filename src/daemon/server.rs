@@ -101,6 +101,7 @@ pub fn router(st: AppState) -> Router {
         .route("/api/services/:name/logs", get(logs).delete(clear_logs))
         .route("/api/services/:name/logs/stream", get(log_stream))
         .route("/api/services/:name/metrics", get(metrics))
+        .route("/api/system", get(system))
         .route("/api/services/:name/open-terminal", post(open_term))
         .route("/api/events", get(events))
         .route("/api/remote", get(remote_status).put(remote_update))
@@ -193,6 +194,10 @@ async fn clear_logs(State(st): State<AppState>, Path(name): Path<String>) -> Res
     ok()
 }
 
+async fn system(State(st): State<AppState>) -> Res {
+    Ok(Json(st.sup.system()))
+}
+
 pub(super) async fn metrics(State(st): State<AppState>, Path(name): Path<String>, q: Q) -> Res {
     st.sup.get_state(&name)?;
     let now = now_ms();
@@ -275,6 +280,7 @@ pub(super) async fn events_stream(st: AppState, redact: bool) -> Response {
                     Ok(Event::Service(s)) => sse_msg("service", &clean(*s)),
                     Ok(Event::Removed(name)) => sse_msg("removed", &json!({ "name": name })),
                     Ok(Event::Metrics(name, m)) => sse_msg("metrics", &json!({ "name": name, "metrics": m })),
+                    Ok(Event::System(s)) => sse_msg("system", &s),
                     Err(broadcast::error::RecvError::Lagged(_)) => snapshot(&sup),
                     Err(_) => break,
                 },

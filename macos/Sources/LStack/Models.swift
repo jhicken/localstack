@@ -10,6 +10,23 @@ struct MetricSample: Codable, Hashable {
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
 }
 
+/// Whole-machine load with LStack's share (`/api/system`, SSE "system").
+struct SystemSample: Codable, Hashable {
+    let ts: Double
+    let cpu: Double      // % of all cores
+    let mem: Double      // bytes in use
+    let lsCpu: Double    // LStack services, % of all cores
+    let lsMem: Double
+
+    var date: Date { Date(timeIntervalSince1970: ts / 1000) }
+}
+
+struct SystemInfo: Codable {
+    var cores: Int
+    var memTotal: Double
+    var samples: [SystemSample]
+}
+
 struct HealthCheck: Codable, Hashable {
     var type: String
     var url: String?
@@ -141,6 +158,11 @@ enum Fmt {
     static func rate(_ n: Double?) -> String {
         guard let n else { return "—" }
         return bytes(n) + "/s"
+    }
+
+    static func gb(_ n: Double) -> String {
+        let g = n / 1_073_741_824
+        return String(format: g >= 10 ? "%.0f GB" : "%.1f GB", g)
     }
 
     static func pct(_ n: Double?) -> String {

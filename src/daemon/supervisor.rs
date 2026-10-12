@@ -2,11 +2,11 @@
 use super::docker_api;
 use super::health;
 use super::logs::LogStore;
-use super::procinfo::{self, CpuSampler};
+use super::procinfo::{self, CpuSampler, HostSampler};
 use super::store::MetricsStore;
 use crate::config;
 use crate::paths::{self, now_ms};
-use crate::types::{MetricSample, ServiceConfig, ServiceState};
+use crate::types::{MetricSample, ServiceConfig, ServiceState, SystemSample};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +24,11 @@ pub enum Event {
     Service(Box<ServiceState>),
     Removed(String),
     Metrics(String, MetricSample),
+    System(SystemSample),
 }
+
+/// ~15 minutes of whole-machine samples at the 3 s cadence.
+const SYSTEM_HISTORY: usize = 300;
 
 #[derive(Debug)]
 pub struct SupErr {
@@ -189,6 +193,7 @@ pub struct Sup {
     pub events: broadcast::Sender<Event>,
     pub store: MetricsStore,
     cpu: Mutex<CpuSampler>,
+    host: Mutex<(HostSampler, std::collections::VecDeque<SystemSample>)>,
     docker_prev: Mutex<HashMap<String, (f64, f64)>>,
     loops: Mutex<Vec<AbortHandle>>,
 }
@@ -212,6 +217,7 @@ impl Sup {
             events,
             store: MetricsStore::open(&paths::db())?,
             cpu: Mutex::new(CpuSampler::default()),
+            host: Mutex::new((HostSampler::default(), std::collections::VecDeque::new())),
             docker_prev: Mutex::new(HashMap::new()),
             loops: Mutex::new(vec![]),
         }))
@@ -298,7 +304,10 @@ impl Sup {
                 let _ = sup.start(&name).await;
             });
         }
-        self.every(3_000, |s| async move { s.sample_processes().await });
+        self.every(3_000, |s| async move {
+            s.sample_processes().await;
+            s.sample_system();
+        });
         self.every(5_000, |s| async move { s.sample_docker().await });
         self.every(30_000, |s| async move { s.sample_network().await });
         self.every(4_000, |s| async move { s.refresh_external().await });
@@ -749,6 +758,36 @@ impl Sup {
         }
         drop(g);
         self.write_state();
+    }
+
+    fn sample_system(&self) {
+        let cores = procinfo::host_cores() as f64;
+        let (ls_cpu, ls_mem) = self
+            .lock()
+            .services
+            .values()
+            .filter(|m| m.rt.status == "running")
+            .filter_map(|m| m.metrics)
+            .fold((0.0, 0.0), |a, s| (a.0 + s.cpu, a.1 + s.mem));
+        let mut h = self.host.lock().unwrap();
+        let Some(cpu) = h.0.cpu() else { return };
+        let mem = procinfo::host_mem_used().unwrap_or(0.0);
+        let s = SystemSample { ts: now_ms(), cpu, mem, ls_cpu: (ls_cpu / cores).min(cpu.max(0.0)), ls_mem: ls_mem.min(mem) };
+        if h.1.len() >= SYSTEM_HISTORY {
+            h.1.pop_front();
+        }
+        h.1.push_back(s);
+        drop(h);
+        let _ = self.events.send(Event::System(s));
+    }
+
+    pub fn system(&self) -> serde_json::Value {
+        let h = self.host.lock().unwrap();
+        serde_json::json!({
+            "cores": procinfo::host_cores(),
+            "memTotal": procinfo::host_mem_total(),
+            "samples": h.1.iter().collect::<Vec<_>>(),
+        })
     }
 
     async fn sample_docker(self: &Arc<Self>) {

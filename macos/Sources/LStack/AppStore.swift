@@ -13,6 +13,7 @@ final class AppStore {
     var toast: String?
     var startingDaemon = false
     var expanded: String?
+    var system: SystemInfo?
 
     private var client: DaemonClient?
     private var toastTask: Task<Void, Never>?
@@ -55,6 +56,7 @@ final class AppStore {
             services = snap.services.sorted { $0.name < $1.name }
             configErrors = snap.configErrors
             for s in services where s.isRunning { Task { await loadHistory(s.name) } }
+            Task { await loadSystem() }
         case "service":
             guard let s = try? dec.decode(ServiceState.self, from: data) else { return }
             if let i = services.firstIndex(where: { $0.name == s.name }) {
@@ -76,9 +78,17 @@ final class AppStore {
             h.append(e.metrics)
             if h.count > Self.historyLimit { h.removeFirst(h.count - Self.historyLimit) }
             history[e.name] = h
+        case "system":
+            guard let s = try? dec.decode(SystemSample.self, from: data), system != nil else { return }
+            system!.samples.append(s)
+            if system!.samples.count > 300 { system!.samples.removeFirst(system!.samples.count - 300) }
         default:
             break
         }
+    }
+
+    func loadSystem() async {
+        if let s = try? await client?.send("GET", "/api/system", as: SystemInfo.self) { system = s }
     }
 
     func loadHistory(_ name: String) async {
