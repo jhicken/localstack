@@ -3,6 +3,7 @@ import SwiftUI
 struct PopoverView: View {
     @Environment(AppStore.self) private var store
     @Environment(\.openWindow) private var openWindow
+    @State private var listHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -14,7 +15,7 @@ struct PopoverView: View {
                 empty
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 4) {
+                    VStack(spacing: 4) {
                         ForEach(store.services) { s in
                             ServiceRow(service: s)
                         }
@@ -27,9 +28,12 @@ struct PopoverView: View {
                         }
                     }
                     .padding(8)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
                 }
-                .frame(maxHeight: 520)
-                .fixedSize(horizontal: false, vertical: true)
+                // A ScrollView has no reliable ideal height, which left the menu bar window taller than
+                // its content (blank space above/below a short list). Size it to the measured list.
+                .frame(height: min(max(listHeight, 60), 520))
+                .scrollBounceBehavior(.basedOnSize)
             }
             if let toast = store.toast {
                 Text(toast)
@@ -44,6 +48,7 @@ struct PopoverView: View {
             footer
         }
         .frame(width: 400)
+        .fixedSize(horizontal: false, vertical: true)
         .animation(.snappy(duration: 0.25), value: store.toast)
     }
 
@@ -73,7 +78,9 @@ struct PopoverView: View {
         guard store.connected else { return "daemon offline" }
         let r = store.running.count
         let f = store.failedCount
-        var parts = ["\(r) running", "\(store.services.count - r) stopped"]
+        var parts = ["\(r) running"]
+        let stopped = store.services.count - r - f
+        if stopped > 0 || f == 0 { parts.append("\(max(stopped, 0)) stopped") }
         if f > 0 { parts.append("\(f) failing") }
         return parts.joined(separator: " · ")
     }

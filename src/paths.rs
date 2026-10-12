@@ -32,6 +32,9 @@ pub fn daemon_log() -> PathBuf {
 pub fn remote_config() -> PathBuf {
     home().join("remote.json")
 }
+pub fn settings_file() -> PathBuf {
+    home().join("settings.json")
+}
 pub fn state_file() -> PathBuf {
     home().join("state.json")
 }

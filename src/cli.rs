@@ -2,7 +2,7 @@
 use crate::client::{self, Client};
 use crate::fmt as c;
 use crate::types::{HealthCheck, LogLine, ServiceConfig, ServiceState};
-use crate::{config, launchd, paths, setup};
+use crate::{cmdline, config, launchd, paths, setup};
 use serde_json::json;
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -28,7 +28,8 @@ fn help() -> String {
   lstack metrics <name> [--range 1h|24h|7d]
   lstack setup [--cli] [--login] [--app <path>]   install the CLI + start at login
   lstack setup status|repair|uninstall
-  lstack remote [on|off|passwd|status]   web dashboard for other machines (see below)
+  lstack remote [on|off|passwd|2fa|status]   web dashboard for other machines (see below)
+  lstack terminal [terminal|iterm|cmux|ghostty]   app used to open the dashboard / attach
   lstack daemon run|start|stop|restart|status|logs
   lstack reload                  re-read {}
 
@@ -44,15 +45,21 @@ fn help() -> String {
   -v, --volume <h:c>     docker: volume (repeatable)
       --file <path>      compose: compose file     --project <name>   compose: project name
       --health-url <url> HTTP health check         --health-port <n>  TCP health check
+  -s, --source <file>    source this file before running (repeatable; default: your shell rc, e.g. ~/.zshrc)
+      --no-source        don't source any shell config (scripts still run in a login shell)
+      --no-split         keep the command as typed (by default a leading `cd dir &&`, `FOO=bar`,
+                         `export …` and `source …` are moved into cwd / env / source)
       --now              start immediately after adding
 
 {}
   lstack remote on [--port 7380] [--user admin] [--bind 0.0.0.0] [--allow-control|--read-only] [--password-stdin]
   lstack remote passwd [--user <name>] [--password-stdin]
+  lstack remote 2fa on|off       authenticator-app codes (TOTP) at sign-in
   lstack remote off
 
 {}
   lstack add api -a -c ~/code/api -- npm run dev
+  lstack add web -a -- 'cd ~/code/web && PORT=3000 bun run dev'     # → cwd, env PORT, command
   lstack add db -t docker --image postgres:16 -p 5432:5432 -e POSTGRES_PASSWORD=dev -a
   lstack add stack -t compose --file ~/code/app/docker-compose.yml -a
 ",
@@ -96,6 +103,7 @@ pub fn main(argv: Vec<String>) -> i32 {
         "metrics" => cmd_metrics(&rest),
         "setup" => setup::run(&rest),
         "remote" => cmd_remote(&rest),
+        "terminal" => cmd_terminal(&rest),
         "startup" => cmd_startup(&rest),
         "daemon" => return cmd_daemon(&rest),
         "reload" => (|| {
@@ -214,7 +222,7 @@ fn cmd_list(args: &[String]) -> R {
                 vec![
                     format!("{} {}", c::status_dot(&s.status), c::bold(&s.name)),
                     c::dim(&s.kind),
-                    c::status_color(&s.status, &s.status),
+                    if s.restart_at.is_some() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) },
                     c::health_label(&s.health),
                     c::pct(s.metrics.as_ref().map(|m| m.cpu)),
                     c::bytes(s.metrics.as_ref().map(|m| m.mem)),
@@ -237,7 +245,10 @@ fn cmd_show(args: &[String]) -> R {
     let cl = client::connect(true)?;
     let s = cl.get(&name)?;
     let m = cl.metrics(&name, "1h", 60).unwrap_or_default();
-    println!("{} {} {}  {}  {}", c::status_dot(&s.status), c::bold(&s.name), c::dim(&format!("({})", s.kind)), c::status_color(&s.status, &s.status), c::health_label(&s.health));
+    println!("{} {} {}  {}  {}", c::status_dot(&s.status), c::bold(&s.name), c::dim(&format!("({})", s.kind)), if s.restart_at.is_some() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) }, c::health_label(&s.health));
+    if s.restart_at.is_some() {
+        println!("{}", c::dim(&format!("crash loop: `lstack stop {}` cancels the pending restart", s.name)));
+    }
     if let Some(d) = &s.description {
         println!("{}", c::dim(d));
     }
@@ -292,6 +303,9 @@ fn cmd_add(args: &[String]) -> R {
             ("project", "", true),
             ("health-url", "", true),
             ("health-port", "", true),
+            ("source", "s", true),
+            ("no-source", "", false),
+            ("no-split", "", false),
             ("now", "", false),
         ],
     )?;
@@ -313,7 +327,7 @@ fn cmd_add(args: &[String]) -> R {
             description: a.get("description").map(String::from),
             autostart: Some(a.has("autostart")),
             restart: a.get("restart").map(String::from),
-            command: if cmd.is_empty() { None } else { Some(cmd.join(" ")) },
+            command: if cmd.is_empty() { None } else { Some(cmdline::join_argv(cmd)) },
             cwd: match a.get("cwd") {
                 Some(d) => Some(to_abs(d)),
                 None if kind == "process" => std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned()),
@@ -341,6 +355,15 @@ fn cmd_add(args: &[String]) -> R {
         } else if let Some(p) = a.get("health-port") {
             cfg.healthcheck = Some(HealthCheck { kind: "tcp".into(), port: Some(p.parse().map_err(|_| "--health-port must be a number")?), ..Default::default() });
         }
+        let sources = a.all("source");
+        if a.has("no-source") {
+            cfg.source = Some(vec![]);
+        } else if !sources.is_empty() {
+            cfg.source = Some(sources.iter().map(|s| if s.starts_with('~') { s.clone() } else { to_abs(s) }).collect());
+        }
+        if kind == "process" && !a.has("no-split") {
+            split_command(&mut cfg);
+        }
         cfg
     };
     cfg = config::validate(cfg)?;
@@ -356,6 +379,39 @@ fn cmd_add(args: &[String]) -> R {
         println!("  {} {}", c::status_dot(&s.status), s.status);
     }
     Ok(())
+}
+
+/// Move leading `cd …`, `FOO=bar`, `export …` and `source …` out of the command into
+/// cwd / env / source, so the service definition is easy to read and edit.
+fn split_command(cfg: &mut ServiceConfig) {
+    let Some(command) = cfg.command.clone() else { return };
+    let base = cfg.cwd.clone().unwrap_or_else(|| paths::user_home().to_string_lossy().into_owned());
+    let sp = cmdline::split(&command, &base);
+    if !sp.changed() {
+        return;
+    }
+    let mut notes = vec![];
+    if let Some(d) = &sp.cwd {
+        notes.push(format!("cwd {d}"));
+        cfg.cwd = Some(d.clone());
+    }
+    if !sp.env.is_empty() {
+        notes.push(format!("env {}", sp.env.keys().cloned().collect::<Vec<_>>().join(", ")));
+        let mut env = cfg.env.clone().unwrap_or_default();
+        for (k, v) in &sp.env {
+            env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        cfg.env = Some(env);
+    }
+    if !sp.source.is_empty() {
+        notes.push(format!("source {}", sp.source.join(", ")));
+        let shell = cfg.shell.clone().unwrap_or_else(cmdline::user_shell);
+        let mut src = cfg.source.clone().unwrap_or_else(|| cmdline::default_source(&shell));
+        src.extend(sp.source.iter().cloned());
+        cfg.source = Some(src);
+    }
+    cfg.command = Some(sp.command.clone());
+    println!("{} split out {}  {}", c::cyan("↳"), notes.join(" · "), c::dim("(--no-split to keep the command as typed)"));
 }
 
 fn cmd_edit(args: &[String]) -> R {
@@ -625,6 +681,8 @@ fn print_remote(v: &serde_json::Value) {
     println!("  {:<9} {}:{}", c::dim("listen"), v["bind"].as_str().unwrap_or("?"), v["port"]);
     let pw = if v["hasPassword"].as_bool().unwrap_or(false) { "" } else { "  (no password set)" };
     println!("  {:<9} {}{pw}", c::dim("login"), v["username"].as_str().unwrap_or("?"));
+    let tfa = if v["totp"].as_bool().unwrap_or(false) { c::green("on (authenticator code required)") } else { c::dim("off — lstack remote 2fa on") };
+    println!("  {:<9} {tfa}", c::dim("2fa"));
     let access = if v["allowControl"].as_bool().unwrap_or(false) { "view + start/stop/restart" } else { "read-only" };
     println!("  {:<9} {access}", c::dim("access"));
     if let Some(e) = v["error"].as_str() {
@@ -648,11 +706,15 @@ fn cmd_remote(args: &[String]) -> R {
             ("allow-control", "", false),
             ("read-only", "", false),
             ("password-stdin", "", false),
+            ("code", "", true),
             ("json", "", false),
         ],
     )?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("status");
+    if matches!(sub, "2fa" | "totp" | "otp") {
+        return remote_2fa(&cl, a.pos.get(1).map(String::as_str).unwrap_or("status"), a.get("code"));
+    }
     let current: serde_json::Value = cl.req("GET", "/api/remote", None)?;
     let mut patch = serde_json::Map::new();
     if let Some(p) = a.get("port") {
@@ -696,6 +758,93 @@ fn cmd_remote(args: &[String]) -> R {
     }
     let v: serde_json::Value = cl.req("PUT", "/api/remote", Some(serde_json::Value::Object(patch)))?;
     print_remote(&v);
+    Ok(())
+}
+
+fn remote_2fa(cl: &client::Client, sub: &str, code: Option<&str>) -> R {
+    match sub {
+        "status" => {
+            let v: serde_json::Value = cl.req("GET", "/api/remote", None)?;
+            let on = v["totp"].as_bool().unwrap_or(false);
+            println!("two-factor sign-in: {}", if on { c::green("on") } else { c::dim("off") });
+            Ok(())
+        }
+        "on" | "enable" | "setup" => {
+            let v: serde_json::Value = cl.req("POST", "/api/remote/totp", None)?;
+            let (secret, uri) = (v["secret"].as_str().unwrap_or(""), v["uri"].as_str().unwrap_or(""));
+            println!("Scan this with an authenticator app (1Password, Google Authenticator, Authy…):\n");
+            if let Some(qr) = qr_lines(uri) {
+                println!("{qr}");
+            }
+            let grouped: Vec<String> = secret.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+            println!("or enter the key manually: {}\n", c::bold(&grouped.join(" ")));
+            let code = match code {
+                Some(c) => c.to_string(),
+                None => {
+                    eprint!("Enter the 6-digit code to confirm: ");
+                    let mut s = String::new();
+                    std::io::stdin().lock().read_line(&mut s).map_err(|e| e.to_string())?;
+                    s.trim().to_string()
+                }
+            };
+            let v: serde_json::Value = cl.req("POST", "/api/remote/totp/confirm", Some(json!({ "code": code })))?;
+            println!("{} two-factor sign-in is on; remote browsers were signed out", c::green("✓"));
+            print_remote(&v);
+            Ok(())
+        }
+        "off" | "disable" => {
+            let v: serde_json::Value = cl.req("DELETE", "/api/remote/totp", None)?;
+            println!("{} two-factor sign-in is off", c::green("✓"));
+            print_remote(&v);
+            Ok(())
+        }
+        other => Err(format!("unknown 2fa command {other:?} (on, off, status)")),
+    }
+}
+
+/// Renders a QR code with half-block characters and explicit black/white colours, so it scans on
+/// dark and light terminal themes alike.
+fn qr_lines(data: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    let w = code.width();
+    let colors = code.to_colors();
+    let quiet = 2usize;
+    let dark = |x: isize, y: isize| -> bool {
+        x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < w && colors[y as usize * w + x as usize] == qrcode::Color::Dark
+    };
+    let size = (w + 2 * quiet) as isize;
+    let mut out = String::new();
+    let mut y = -(quiet as isize);
+    while y < size - quiet as isize {
+        out.push_str("  ");
+        for x in -(quiet as isize)..size - quiet as isize {
+            let fg = if dark(x, y) { 30 } else { 97 };
+            let bg = if dark(x, y + 1) { 40 } else { 107 };
+            out.push_str(&format!("\x1b[{fg};{bg}m▀"));
+        }
+        out.push_str("\x1b[0m\n");
+        y += 2;
+    }
+    Some(out)
+}
+
+fn cmd_terminal(args: &[String]) -> R {
+    let cl = client::connect(true)?;
+    let v: serde_json::Value = match args.first() {
+        Some(t) => cl.req("PUT", "/api/settings", Some(json!({ "terminal": t })))?,
+        None => cl.req("GET", "/api/settings", None)?,
+    };
+    let cur = v["terminal"].as_str().unwrap_or("terminal");
+    for t in v["terminals"].as_array().into_iter().flatten() {
+        let id = t["id"].as_str().unwrap_or("");
+        let installed = t["installed"].as_bool().unwrap_or(false);
+        let mark = if id == cur { c::green("●") } else { c::dim("○") };
+        let note = if installed { String::new() } else { c::dim("  (not installed)") };
+        println!("{mark} {:<9} {}{note}", id, t["name"].as_str().unwrap_or(""));
+    }
+    if args.is_empty() {
+        println!("{}", c::dim("change with: lstack terminal <id>"));
+    }
     Ok(())
 }
 

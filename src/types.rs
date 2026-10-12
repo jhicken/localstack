@@ -20,6 +20,15 @@ fn lenient_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D
     Ok(raw.map(|v| v.into_iter().filter_map(scalar_string).collect()))
 }
 
+/// A list, or a single string as shorthand for a one-item list.
+fn string_or_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(match Option::<serde_yaml::Value>::deserialize(d)? {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::Sequence(v)) => Some(v.into_iter().filter_map(scalar_string).collect()),
+        Some(v) => Some(scalar_string(v).into_iter().collect()),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthCheck {
@@ -66,6 +75,9 @@ pub struct ServiceConfig {
     pub env: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// Files sourced before the command (default: the shell's rc file, e.g. ~/.zshrc). `[]` = none.
+    #[serde(skip_serializing_if = "Option::is_none", default, deserialize_with = "string_or_vec")]
+    pub source: Option<Vec<String>>,
     // docker
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
@@ -139,6 +151,9 @@ pub struct ServiceState {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub restarts: u32,
+    /// Set while a crash-loop restart is scheduled: when it will fire (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub restart_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -167,4 +182,14 @@ pub struct DaemonInfo {
     pub bin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub running: Option<bool>,
+}
+
+impl ServiceState {
+    /// Status for display: "restarting 12s" while a crash-loop restart is pending.
+    pub fn status_label(&self) -> String {
+        match self.restart_at {
+            Some(t) => format!("restarting {}s", ((t - crate::paths::now_ms()).max(0) + 999) / 1000),
+            None => self.status.clone(),
+        }
+    }
 }

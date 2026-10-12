@@ -50,7 +50,13 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 |---|---|
 | Remote dashboard | Opt-in second listener (`lstack remote on`, or the Settings toggle) serving an embedded web UI. It shows services, health, CPU/memory history (15m–7d) and live logs with filter, pause and download. Optional start/stop/restart. Single account with a PBKDF2 password hash, HttpOnly session cookies, per-IP login throttling, CSRF header, strict CSP, and redacted env values. Turning it off ends sessions and open streams. |
 | Icon | Code-drawn app icon (`macos/icon/make-icon.swift`), used for the app bundle, the in-app headers and the web UI |
-| Releases | `macos/release.sh` builds, tags `v<version>`, pushes, and uploads the dmg/zip/checksums to GitHub Releases |
+| Releases | `macos/release.sh` tags and pushes `v<version>`; a GitHub Actions workflow builds on macOS and attaches the dmg/zip/checksums to the release (`--local` uploads from this Mac with `gh`) |
+| Shell environment | Scripts run in the user's login shell and source `source:` files first (default `~/.zshrc`/`~/.bashrc`), then `eval` the command, so PATH, nvm/bun, `op` and aliases match Terminal. Leading `cd`/`FOO=bar`/`export`/`source` steps are split into cwd/env/source by `lstack add` and the app's Add Service form. |
+
+| Remote 2FA | Optional TOTP (RFC 6238, SHA-1, 6 digits, ±1 step, replay-protected). Enroll with `lstack remote 2fa on` (terminal QR) or Settings (QR plus confirm code). The sign-in form asks for the code when enabled. |
+| Terminal app | `~/.localstack/settings.json` picks Terminal, iTerm, cmux or Ghostty for Dashboard/Attach/Shell (Settings picker or `lstack terminal`) |
+| Crash loops | Restart countdown (`restartAt`) shown in the menu bar, TUI, CLI and web, with an always-visible Stop. Stop cancels the pending restart and waits for an in-flight start instead of returning "busy". |
+| Full Disk Access | Settings detects whether the helper has Full Disk Access (needed by `op` and similar tools under launchd) and links to the System Settings pane |
 
 ## Phase 2 — Daily-driver polish
 

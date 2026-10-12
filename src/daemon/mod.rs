@@ -8,6 +8,8 @@ pub mod remote;
 pub mod server;
 pub mod store;
 pub mod supervisor;
+pub mod terminal;
+pub mod totp;
 
 use crate::paths::{self, now_ms, VERSION};
 use crate::types::DaemonInfo;

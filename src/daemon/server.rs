@@ -104,12 +104,13 @@ pub fn router(st: AppState) -> Router {
         .route("/api/services/:name/open-terminal", post(open_term))
         .route("/api/events", get(events))
         .route("/api/remote", get(remote_status).put(remote_update))
+        .route("/api/remote/totp", post(|State(st): State<AppState>| async move { to_json(st.remote.totp_begin()) }).delete(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(st.remote.totp_disable()?)) }))
+        .route("/api/remote/totp/confirm", post(totp_confirm))
+        .route("/api/settings", get(|| async { to_json(super::terminal::status()) }).put(settings_update))
+        .route("/api/split-command", post(split_command))
         .route("/api/reload", post(|State(st): State<AppState>| async move { to_json(st.sup.reload()) }))
         .route("/api/shutdown", post(shutdown))
-        .route("/api/open-dashboard", post(|| async {
-            open_terminal(&["top"]);
-            ok()
-        }))
+        .route("/api/open-dashboard", post(|| async { open_terminal(&["top"]).await }))
         .fallback(|m: Method, uri: axum::http::Uri| async move { ApiErr(404, format!("no route for {m} {}", uri.path())) })
         .layer(middleware::from_fn_with_state(st.clone(), auth))
         .with_state(st)
@@ -124,6 +125,22 @@ async fn create(State(st): State<AppState>, q: Q, body: Bytes) -> Res {
     let cfg: ServiceConfig = serde_json::from_value(v).map_err(|e| ApiErr(400, e.to_string()))?;
     let cfg = config::validate(cfg).map_err(|e| ApiErr(400, e))?;
     to_json(st.sup.create(cfg, q.get("start").map(String::as_str) == Some("1")).await?)
+}
+
+/// Suggest cwd / env / source split out of a pasted command (used by the app's Add Service form).
+async fn split_command(body: Bytes) -> Res {
+    let v = parse_body(&body)?;
+    let command = v.get("command").and_then(Value::as_str).unwrap_or_default();
+    let home = paths::user_home().to_string_lossy().into_owned();
+    let base = v.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()).map(paths::expand_home).unwrap_or(home);
+    let shell = crate::cmdline::user_shell();
+    let sp = crate::cmdline::split(command, &base);
+    to_json(json!({
+        "changed": sp.changed(),
+        "split": sp,
+        "shell": shell,
+        "defaultSource": crate::cmdline::default_source(&shell),
+    }))
 }
 
 async fn get_one(State(st): State<AppState>, Path(name): Path<String>) -> Res {
@@ -293,23 +310,40 @@ async fn shutdown(State(st): State<AppState>) -> Res {
 
 async fn open_term(State(st): State<AppState>, Path(name): Path<String>) -> Res {
     let s = st.sup.get_state(&name)?;
-    open_terminal(&[if s.kind == "process" { "attach" } else { "exec" }, &s.name]);
-    ok()
+    open_terminal(&[if s.kind == "process" { "attach" } else { "exec" }, &s.name]).await
 }
 
-/// Open Terminal.app running `lstack <args>`.
-pub fn open_terminal(args: &[&str]) {
-    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    let exe = paths::self_exe().to_string_lossy().into_owned();
-    let cmd: Vec<String> = std::iter::once(exe.as_str()).chain(args.iter().copied()).map(q).collect();
-    let cmd = cmd.join(" ").replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("tell application \"Terminal\"\n  activate\n  do script \"{cmd}\"\nend tell");
-    let _ = std::process::Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+async fn totp_confirm(State(st): State<AppState>, body: Bytes) -> Res {
+    let v = parse_body(&body)?;
+    let code = v.get("code").and_then(Value::as_str).unwrap_or_default();
+    st.remote.totp_confirm(code)?;
+    // Restart the listener so open remote streams from the old sessions are cut off.
+    let remote = st.remote.clone();
+    remote.apply(&st).await;
+    Ok(Json(st.remote.status()))
+}
+
+async fn settings_update(body: Bytes) -> Res {
+    let v = parse_body(&body)?;
+    let mut s = super::terminal::load();
+    if let Some(t) = v.get("terminal").and_then(Value::as_str) {
+        if !t.is_empty() && !super::terminal::is_known(t) {
+            return Err(ApiErr(400, format!("unknown terminal {t:?} (terminal, iterm, cmux, ghostty)")));
+        }
+        s.terminal = t.to_string();
+    }
+    super::terminal::save(&s).map_err(|e| ApiErr(500, format!("cannot save settings.json: {e}")))?;
+    to_json(super::terminal::status())
+}
+
+/// Open the preferred terminal app running `lstack <args>` (runs osascript/open, so off the async runtime).
+async fn open_terminal(args: &[&str]) -> Res {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || super::terminal::open(&args.iter().map(String::as_str).collect::<Vec<_>>()))
+        .await
+        .map_err(|e| ApiErr(500, e.to_string()))?
+        .map_err(|e| ApiErr(500, e))?;
+    ok()
 }
 
 #[cfg(test)]

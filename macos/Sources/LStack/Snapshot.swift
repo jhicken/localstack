@@ -18,6 +18,9 @@ enum SnapshotRenderer {
                 await store.refreshSetup()
                 render(SetupView().environment(store), size: nil, to: path.replacingOccurrences(of: ".png", with: "-setup.png"), delay: 1.5)
             }
+            if let cmd = ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_ADD"] {
+                render(AddServiceView(command: cmd).environment(store), size: nil, to: path.replacingOccurrences(of: ".png", with: "-add.png"), delay: 2)
+            }
             if let logs {
                 render(LogView(name: logs).environment(store), size: NSSize(width: 860, height: 420), to: path.replacingOccurrences(of: ".png", with: "-logs.png"), delay: 3)
             }

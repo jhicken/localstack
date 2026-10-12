@@ -1,4 +1,5 @@
 mod cli;
+mod cmdline;
 mod client;
 mod config;
 mod daemon;

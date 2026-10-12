@@ -106,7 +106,7 @@ impl Sup {
         if !std::path::Path::new(&cwd).is_dir() {
             return self.fail(name, gen, &format!("cwd does not exist: {cwd}"));
         }
-        let shell = cfg.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(|| "/bin/zsh".into());
+        let shell = cfg.shell.clone().filter(|s| !s.is_empty()).unwrap_or_else(crate::cmdline::user_shell);
         let command = cfg.command.clone().unwrap_or_default();
         self.with(name, Some(gen), |m| {
             m.rt.stopping = false;
@@ -116,11 +116,12 @@ impl Sup {
             m.system(format!("$ {command}  (cwd: {cwd})"));
         });
         let mut cmd = tokio::process::Command::new(&shell);
-        cmd.arg("-c")
-            .arg(&command)
+        cmd.args(crate::cmdline::shell_args(&shell, cfg.source.as_deref()))
             .current_dir(&cwd)
+            .env("SHELL", &shell)
             .envs(cfg.env.clone().unwrap_or_default())
             .env("LSTACK_SERVICE", name)
+            .env("LSTACK_COMMAND", &command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

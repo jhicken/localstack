@@ -1,0 +1,66 @@
+# Builds LStack.app on a macOS runner and publishes the .dmg / .zip / checksums to GitHub Releases.
+# Triggered by pushing a version tag (macos/release.sh does that), or manually for an existing tag.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [[ "$TAG" == "v$VERSION" ]] || { echo "::error::tag $TAG does not match Cargo.toml version $VERSION"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test --release --quiet
+
+      - name: Build app, zip and dmg
+        run: macos/build.sh
+
+      - name: Checksums
+        run: |
+          cd dist
+          shasum -a 256 "LStack-$VERSION-arm64.dmg" "LStack-$VERSION-arm64.zip" > "LStack-$VERSION-arm64.sha256"
+          cat "LStack-$VERSION-arm64.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ASSETS=("dist/LStack-$VERSION-arm64.dmg" "dist/LStack-$VERSION-arm64.zip" "dist/LStack-$VERSION-arm64.sha256")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$TAG" "${ASSETS[@]}" --title "LStack $VERSION" --generate-notes --verify-tag
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LStack-${{ env.VERSION }}
+          path: dist/LStack-*

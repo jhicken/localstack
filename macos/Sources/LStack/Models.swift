@@ -22,9 +22,11 @@ struct ServiceConfig: Codable, Hashable {
     var description: String?
     var autostart: Bool?
     var restart: String?
+    var maxRestarts: Int?
     var command: String?
     var cwd: String?
     var env: [String: String]?
+    var source: [String]?
     var image: String?
     var container: String?
     var ports: [String]?
@@ -32,6 +34,20 @@ struct ServiceConfig: Codable, Hashable {
     var composeFile: String?
     var project: String?
     var healthcheck: HealthCheck?
+}
+
+/// Result of `POST /api/split-command`: leading `cd`/env/`source` steps peeled off a command.
+struct CommandSplit: Decodable {
+    struct Parts: Decodable {
+        let command: String
+        let cwd: String?
+        let env: [String: String]
+        let source: [String]
+    }
+    let changed: Bool
+    let split: Parts
+    let shell: String
+    let defaultSource: [String]
 }
 
 struct ServiceState: Codable, Identifiable, Hashable {
@@ -47,6 +63,8 @@ struct ServiceState: Codable, Identifiable, Hashable {
     let startedAt: Double?
     let exitCode: Int?
     let restarts: Int
+    /// Set while a crash-loop restart is pending (ms since epoch).
+    let restartAt: Double?
     let lastError: String?
     var metrics: MetricSample?
     let config: ServiceConfig
@@ -54,6 +72,15 @@ struct ServiceState: Codable, Identifiable, Hashable {
     var isRunning: Bool { status == "running" }
     var isTransitioning: Bool { status == "starting" || status == "stopping" }
     var isFailed: Bool { status == "crashed" || status == "errored" }
+    /// Crashed and waiting to be restarted; Stop cancels the pending restart.
+    var isRestarting: Bool { restartAt != nil }
+    /// Whether Stop applies (running, starting/stopping, or between crash-loop attempts).
+    var isStoppable: Bool { isRunning || isTransitioning || isRestarting }
+
+    func restartsIn(now: Date = Date()) -> Int {
+        guard let r = restartAt else { return 0 }
+        return max(0, Int(ceil((r / 1000) - now.timeIntervalSince1970)))
+    }
 
     var uptime: TimeInterval? {
         guard let s = startedAt, isRunning else { return nil }
@@ -139,6 +166,7 @@ struct RemoteStatus: Codable, Equatable {
     var username: String
     var hasPassword: Bool
     var allowControl: Bool
+    var totp: Bool?
     var hostname: String?
     var urls: [String]
     var error: String?
@@ -150,4 +178,22 @@ struct RemotePatch: Encodable {
     var username: String?
     var password: String?
     var allowControl: Bool?
+}
+
+struct TotpSetup: Decodable {
+    let secret: String
+    let uri: String
+}
+
+/// `GET /api/settings`: daemon-wide preferences plus a little system info.
+struct DaemonSettings: Decodable, Equatable {
+    struct TerminalApp: Decodable, Equatable, Identifiable {
+        let id: String
+        let name: String
+        let installed: Bool
+    }
+    var terminal: String
+    var terminals: [TerminalApp]
+    var fullDiskAccess: Bool
+    var helperPath: String
 }

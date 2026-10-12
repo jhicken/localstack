@@ -113,12 +113,20 @@ final class AppStore {
         try await client.send("POST", "/api/services\(start ? "?start=1" : "")", body: cfg, as: ServiceState.self)
     }
 
+    func splitCommand(_ command: String, cwd: String) async -> CommandSplit? {
+        try? await client?.send("POST", "/api/split-command", body: ["command": command, "cwd": cwd], as: CommandSplit.self)
+    }
+
     func openTerminal(_ name: String) {
-        Task { try? await client?.send("POST", "/api/services/\(name.urlPath)/open-terminal") }
+        Task {
+            do { try await client?.send("POST", "/api/services/\(name.urlPath)/open-terminal") } catch { flash(error.localizedDescription) }
+        }
     }
 
     func openDashboard() {
-        Task { try? await client?.send("POST", "/api/open-dashboard") }
+        Task {
+            do { try await client?.send("POST", "/api/open-dashboard") } catch { flash(error.localizedDescription) }
+        }
     }
 
     func revealConfig(_ name: String? = nil) {
@@ -195,6 +203,46 @@ final class AppStore {
         } catch {
             await refreshRemote()
             return error.localizedDescription
+        }
+    }
+
+    /// Begin two-factor enrollment. Returns the secret + otpauth URI to show as a QR code.
+    func totpBegin() async throws -> TotpSetup {
+        guard let client else { throw DaemonError.notRunning }
+        return try await client.send("POST", "/api/remote/totp", as: TotpSetup.self)
+    }
+
+    /// Returns an error message, or nil once the code is accepted and 2FA is on.
+    func totpConfirm(_ code: String) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            remote = try await client.send("POST", "/api/remote/totp/confirm", body: ["code": code], as: RemoteStatus.self)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func totpDisable() async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            remote = try await client.send("DELETE", "/api/remote/totp", as: RemoteStatus.self)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    // MARK: daemon settings
+
+    var settings: DaemonSettings?
+
+    func refreshSettings() async {
+        guard let client else { settings = nil; return }
+        settings = try? await client.send("GET", "/api/settings", as: DaemonSettings.self)
+    }
+
+    func setTerminal(_ id: String) {
+        Task {
+            do {
+                settings = try await client?.send("PUT", "/api/settings", body: ["terminal": id], as: DaemonSettings.self)
+            } catch { flash(error.localizedDescription) }
         }
     }
 

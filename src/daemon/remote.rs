@@ -2,6 +2,7 @@
 //! small web UI plus a read-only API behind a username/password login, so you can check on services and
 //! logs from another machine's browser. Start/stop/restart are only exposed when `allowControl` is set.
 use super::server::{self, ApiErr, AppState};
+use super::totp;
 use crate::paths::{self, now_ms, VERSION};
 use crate::types::ServiceState;
 use axum::body::{Body, Bytes};
@@ -44,6 +45,8 @@ pub struct RemoteConfig {
     pub username: String,
     pub password_hash: String,
     pub allow_control: bool,
+    /// Base32 TOTP secret; empty = two-factor login off.
+    pub totp_secret: String,
 }
 
 impl Default for RemoteConfig {
@@ -55,6 +58,7 @@ impl Default for RemoteConfig {
             username: "admin".into(),
             password_hash: String::new(),
             allow_control: false,
+            totp_secret: String::new(),
         }
     }
 }
@@ -127,6 +131,10 @@ pub struct Remote {
     error: Mutex<Option<String>>,
     sessions: Mutex<HashMap<String, (String, i64)>>,
     failures: Mutex<HashMap<IpAddr, (u32, i64)>>,
+    /// Secret being enrolled, until confirmed with a valid code.
+    totp_pending: Mutex<Option<String>>,
+    /// Highest TOTP time step accepted so far; a code can't be used twice.
+    totp_last_step: Mutex<u64>,
     /// Bumped whenever the listener or credentials change; open streams and stale routers stop serving.
     gen: watch::Sender<u64>,
 }
@@ -150,6 +158,8 @@ impl Remote {
             error: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
+            totp_pending: Mutex::new(None),
+            totp_last_step: Mutex::new(0),
             gen: watch::channel(0).0,
         })
     }
@@ -184,6 +194,7 @@ impl Remote {
             "username": cfg.username,
             "hasPassword": !cfg.password_hash.is_empty(),
             "allowControl": cfg.allow_control,
+            "totp": !cfg.totp_secret.is_empty(),
             "hostname": hostname(),
             "urls": urls,
             "error": *self.error.lock().unwrap(),
@@ -241,14 +252,30 @@ impl Remote {
     /// Make the listener match the config (called at boot and after every change).
     pub async fn apply(self: &Arc<Self>, app: &AppState) {
         let cfg = self.config();
-        self.stop();
+        let old = self.running.lock().unwrap().take();
+        self.bump();
+        if let Some(r) = old {
+            // Wait for the old listener to be dropped so its port can be bound again.
+            r.task.abort();
+            let _ = r.task.await;
+        }
         *self.error.lock().unwrap() = None;
         if !cfg.enabled {
             self.sessions.lock().unwrap().clear();
             return;
         }
         let addr = format!("{}:{}", cfg.bind, cfg.port);
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
+        let mut bound = tokio::net::TcpListener::bind(&addr).await;
+        for _ in 0..10 {
+            match &bound {
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    bound = tokio::net::TcpListener::bind(&addr).await;
+                }
+                _ => break,
+            }
+        }
+        let listener = match bound {
             Ok(l) => l,
             Err(e) => {
                 let msg = format!("cannot listen on {addr}: {e}");
@@ -265,6 +292,54 @@ impl Remote {
         });
         println!("{} remote dashboard listening on http://{addr}", paths::iso(now_ms()));
         *self.running.lock().unwrap() = Some(Running { port: cfg.port, bind: cfg.bind, task });
+    }
+
+    /// Start two-factor enrollment: returns a fresh secret and its otpauth:// URI. Login is unaffected
+    /// until `totp_confirm` sees a valid code for it.
+    pub fn totp_begin(&self) -> Value {
+        let cfg = self.config();
+        let secret = totp::new_secret();
+        let uri = totp::uri(&secret, &format!("{}@{}", cfg.username, hostname()), "LStack");
+        *self.totp_pending.lock().unwrap() = Some(secret.clone());
+        json!({ "secret": secret, "uri": uri })
+    }
+
+    pub fn totp_confirm(&self, code: &str) -> Result<Value, ApiErr> {
+        let secret = self.totp_pending.lock().unwrap().clone().ok_or_else(|| ApiErr::new(400, "start two-factor setup first"))?;
+        let step = totp::verify(&secret, code, totp::current_step()).ok_or_else(|| ApiErr::new(400, "that code isn't valid — check the time on your phone and try the next one"))?;
+        let mut cfg = self.config();
+        cfg.totp_secret = secret;
+        save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
+        *self.cfg.lock().unwrap() = cfg;
+        *self.totp_pending.lock().unwrap() = None;
+        *self.totp_last_step.lock().unwrap() = step;
+        self.sessions.lock().unwrap().clear();
+        println!("{} remote: two-factor login enabled", paths::iso(now_ms()));
+        Ok(self.status())
+    }
+
+    pub fn totp_disable(&self) -> Result<Value, ApiErr> {
+        let mut cfg = self.config();
+        *self.totp_pending.lock().unwrap() = None;
+        if cfg.totp_secret.is_empty() {
+            return Ok(self.status());
+        }
+        cfg.totp_secret.clear();
+        save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
+        *self.cfg.lock().unwrap() = cfg;
+        println!("{} remote: two-factor login disabled", paths::iso(now_ms()));
+        Ok(self.status())
+    }
+
+    /// Checks a login code and consumes its time step.
+    fn totp_check(&self, secret: &str, code: Option<&str>) -> bool {
+        let Some(step) = code.and_then(|c| totp::verify(secret, c, totp::current_step())) else { return false };
+        let mut last = self.totp_last_step.lock().unwrap();
+        if step <= *last {
+            return false;
+        }
+        *last = step;
+        true
     }
 
     pub fn stop(&self) {
@@ -366,7 +441,7 @@ fn router(app: AppState, remote: Arc<Remote>, gen: u64) -> Router {
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", APP_JS.as_bytes()) }))
         .route("/app.css", get(|| async { asset("text/css; charset=utf-8", APP_CSS.as_bytes()) }))
         .route("/icon.png", get(|| async { asset("image/png", ICON_PNG) }))
-        .route("/api/login", post(login))
+        .route("/api/login", get(login_info).post(login))
         .merge(api)
         .fallback(|| async { ApiErr::new(404, "not found") })
         .layer(middleware::from_fn_with_state(rs.clone(), guard))
@@ -429,6 +504,8 @@ async fn require_session(State(rs): State<RState>, req: Request, next: Next) -> 
 struct Login {
     username: String,
     password: String,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 async fn login(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
@@ -447,8 +524,10 @@ async fn login(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAd
     let cfg = rs.remote.config();
     let user_ok = ct_eq(l.username.as_bytes(), cfg.username.as_bytes());
     let stored = cfg.password_hash.clone();
-    let pass_ok = tokio::task::spawn_blocking(move || verify_password(&l.password, &stored)).await.unwrap_or(false);
-    if !(user_ok && pass_ok) {
+    let password = l.password;
+    let pass_ok = tokio::task::spawn_blocking(move || verify_password(&password, &stored)).await.unwrap_or(false);
+    let code_ok = cfg.totp_secret.is_empty() || (user_ok && pass_ok && rs.remote.totp_check(&cfg.totp_secret, l.code.as_deref()));
+    if !(user_ok && pass_ok && code_ok) {
         let n = {
             let mut f = rs.remote.failures.lock().unwrap();
             let e = f.entry(ip).or_insert((0, now));
@@ -457,7 +536,8 @@ async fn login(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAd
         };
         println!("{} remote: failed login from {ip} ({n}/{MAX_FAILURES})", paths::iso(now));
         tokio::time::sleep(Duration::from_millis(400)).await;
-        return ApiErr::new(401, "invalid username or password").into_response();
+        let msg = if cfg.totp_secret.is_empty() { "invalid username or password" } else { "invalid username, password or code" };
+        return ApiErr::new(401, msg).into_response();
     }
     rs.remote.failures.lock().unwrap().remove(&ip);
     let token = random_hex(32);
@@ -465,6 +545,11 @@ async fn login(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAd
     println!("{} remote: {} logged in from {ip}", paths::iso(now), cfg.username);
     let cookie = format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}", SESSION_TTL_MS / 1000);
     ([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true, "user": cfg.username }))).into_response()
+}
+
+/// Public: what the sign-in form needs to show.
+async fn login_info(State(rs): State<RState>) -> Json<Value> {
+    Json(json!({ "totp": !rs.remote.config().totp_secret.is_empty() }))
 }
 
 async fn logout(State(rs): State<RState>, req: Request) -> Response {
@@ -488,6 +573,7 @@ async fn session(State(rs): State<RState>, req: Request) -> Json<Value> {
         "hostname": hostname(),
         "version": VERSION,
         "allowControl": cfg.allow_control,
+        "totp": !cfg.totp_secret.is_empty(),
         "daemonStartedAt": crate::client::read_info().map(|i| i.started_at),
     }))
 }
@@ -571,6 +657,7 @@ mod tests {
             started_at: None,
             exit_code: None,
             restarts: 0,
+            restart_at: None,
             last_error: None,
             metrics: None,
             config: cfg,

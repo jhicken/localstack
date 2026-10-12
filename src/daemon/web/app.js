@@ -42,6 +42,9 @@
   const clock = (ts) => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const shortTime = (ts, range) => new Date(ts).toLocaleString([], range === "7d" ? { weekday: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
   const live = (s) => ["running", "starting", "stopping"].includes(s.status);
+  // A crash-looping service is between attempts: not live, but Stop cancels the pending restart.
+  const looping = (s) => !!s.restartAt;
+  const statusLabel = (s) => looping(s) ? `restarting ${Math.max(0, Math.ceil((s.restartAt - Date.now()) / 1000))}s` : s.status;
   const enc = encodeURIComponent;
 
   async function api(path, opts = {}) {
@@ -83,20 +86,27 @@
         <p>Sign in to view this machine's services</p>
         <label class="field"><span>Username</span><input name="username" autocomplete="username" required autofocus></label>
         <label class="field"><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label>
+        <label class="field" id="codefield" ${S.totp ? "" : "hidden"}><span>Authenticator code</span><input name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" placeholder="123 456" ${S.totp ? "required" : ""}></label>
         <button class="btn-primary" type="submit">Sign In</button>
         <div class="error">${esc(error || "")}</div>
       </form></div>`));
     const form = $app.querySelector("form");
+    const setTotp = (on) => {
+      S.totp = on;
+      form.querySelector("#codefield").hidden = !on;
+      form.code.required = on;
+    };
+    api("/api/login", { login: true }).then((v) => setTotp(!!v.totp)).catch(() => {});
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const btn = form.querySelector("button");
       btn.disabled = true;
       try {
-        await api("/api/login", { method: "POST", login: true, body: { username: form.username.value, password: form.password.value } });
+        await api("/api/login", { method: "POST", login: true, body: { username: form.username.value, password: form.password.value, code: S.totp ? form.code.value : undefined } });
         await start();
       } catch (err) {
         form.querySelector(".error").textContent = err.message;
-        form.password.select();
+        if (S.totp) { form.code.value = ""; form.code.focus(); } else form.password.select();
       } finally { btn.disabled = false; }
     });
   }
@@ -177,7 +187,7 @@
       if (!S.selected) S.selected = s.name;
       renderList();
       if (s.name === S.selected) {
-        if (prev && prev.status === s.status && prev.health === s.health && prev.lastError === s.lastError) renderTiles();
+        if (prev && prev.status === s.status && prev.restartAt === s.restartAt && prev.health === s.health && prev.lastError === s.lastError) renderTiles();
         else renderHead();
       }
     });
@@ -228,10 +238,10 @@
     const rows = all.map((s) => {
       const m = live(s) ? s.metrics : null;
       const hist = (S.history.get(s.name) || []).map((p) => p.cpu);
-      const uptime = live(s) && s.startedAt ? dur(Date.now() - s.startedAt) : s.status;
+      const uptime = live(s) && s.startedAt ? dur(Date.now() - s.startedAt) : statusLabel(s);
       const health = s.health && !["none", "unknown"].includes(s.health) ? `<span class="h-${esc(s.health)}">● ${esc(s.health)}</span>` : "";
       return `<div class="svc ${s.name === S.selected ? "sel" : ""}" data-name="${esc(s.name)}">
-        <span class="dot ${esc(s.status)}"></span>
+        <span class="dot ${esc(looping(s) ? "starting" : s.status)}"></span>
         <span class="name">${esc(s.name)}</span>
         <span class="nums"><b>${m ? pct(m.cpu) : "—"}</b> · ${m ? bytes(m.mem) : "—"}</span>
         <span class="meta"><span class="badge ${esc(s.type)}">${esc(s.type)}</span>${esc(uptime)} ${health}</span>
@@ -320,7 +330,7 @@
       ? `<div class="d-actions">
           <button class="btn go" data-act="start" ${live(s) ? "disabled" : ""}>▶ Start</button>
           <button class="btn re" data-act="restart">↻ Restart</button>
-          <button class="btn stop" data-act="stop" ${live(s) ? "" : "disabled"}>■ Stop</button>
+          <button class="btn stop" data-act="stop" ${live(s) || looping(s) ? "" : "disabled"}>■ Stop</button>
         </div>`
       : "";
     const health = s.health && !["none", "unknown"].includes(s.health) ? `<span class="pill ${esc(s.health)}">${esc(s.health)}</span>` : "";
@@ -328,7 +338,7 @@
       <div class="d-head">
         <div class="d-icon ${esc(s.type)}">${ICONS[s.type] || ICONS.process}</div>
         <div class="d-title">
-          <h2>${esc(s.name)} <span class="pill ${esc(s.status)}">${esc(s.status)}</span> ${health} ${s.autostart ? '<span class="pill atboot">starts at login</span>' : ""}</h2>
+          <h2>${esc(s.name)} <span class="pill ${esc(looping(s) ? "starting" : s.status)}">${esc(statusLabel(s))}</span> ${health} ${s.autostart ? '<span class="pill atboot">starts at login</span>' : ""}</h2>
           <div class="sub">${esc(what)}${c.cwd ? ` · ${esc(c.cwd)}` : ""}</div>
         </div>
         ${ctl}

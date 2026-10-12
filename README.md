@@ -99,6 +99,7 @@ lstack add api -a -c ~/code/api -- npm run dev                         # script,
 lstack add db -t docker --image postgres:16 -p 5432:5432 -e POSTGRES_PASSWORD=dev -a
 lstack add stack -t compose --file ~/code/app/docker-compose.yml -a
 lstack add web --health-url http://localhost:3000/health -- npm start
+lstack add app -a -- 'cd ~/code/app && PORT=3000 bun run dev'        # cd/env are split out automatically
 
 lstack                 # htop-style dashboard (↑↓ select, s/x/r start/stop/restart,
                        #   a toggle autostart, l logs, i type to stdin, e shell, ? help)
@@ -109,6 +110,7 @@ lstack exec db psql -U postgres
 lstack metrics api --range 24h
 lstack enable api / lstack disable api
 lstack rm api
+lstack terminal iterm  # app used by Dashboard/Attach: terminal | iterm | cmux | ghostty
 ```
 
 Run `lstack help` for everything.
@@ -122,11 +124,15 @@ lstack remote on                    # asks for a password the first time; listen
 lstack remote on --port 8080 --user jeff --read-only
 lstack remote passwd                # change the password (signs everyone out)
 lstack remote status                # shows the URLs to open, e.g. http://192.168.1.20:7380
+lstack remote 2fa on                # two-factor sign-in: scan the QR, enter a code to confirm
+lstack remote 2fa off
 lstack remote off
 echo "$PW" | lstack remote on --password-stdin   # non-interactive
 ```
 
 Then open `http://<this-mac>:7380` and sign in.
+
+**Two-factor sign-in (TOTP).** Run `lstack remote 2fa on`, or use **Settings → Remote dashboard → Two-factor → Set Up…**, then scan the QR code with 1Password, Google Authenticator, Authy or a similar app. After that, the sign-in page also asks for a 6-digit code. A code can be used only once, and the clock may be off by ±30 s.
 
 - **Separate from the local API.** The daemon's own API stays on 127.0.0.1. The remote server is a second listener that exposes a read-mostly subset of it.
 - **Accounts.** There is one account. The password is stored as a PBKDF2-SHA256 hash (120k rounds) in `remote.json`.
@@ -135,6 +141,35 @@ Then open `http://<this-mac>:7380` and sign in.
 - **Controls.** Start/stop/restart buttons appear only when **Allow start / stop / restart** is enabled (`--allow-control`, the default). Use `--read-only` for view-only access.
 - **Secrets.** Environment variable values are redacted (`••••`). Responses send a strict CSP, `X-Frame-Options: DENY` and CSRF header checks.
 - **Plain HTTP.** Use it on a trusted network, or over a VPN such as Tailscale. macOS may ask you once to allow incoming connections.
+
+### Shell environment
+
+Scripts run the way they would in a new Terminal tab. That matters because the daemon is started by launchd with a bare environment, so tools like `bun`, `nvm`, Homebrew binaries or the 1Password `op` CLI would otherwise be missing.
+
+- Each script runs in your **login shell** (`$SHELL -l`, so `~/.zprofile` and Homebrew's `shellenv` apply).
+- Before the command runs, the shell **sources** the files in `source:`. The default is your shell's rc file (`~/.zshrc` for zsh, `~/.bashrc` for bash).
+- The command is `eval`ed after sourcing, so aliases and functions from those files work.
+- Use `source: [...]` to replace the list, for example `[~/.zshrc, .venv/bin/activate]`. Use `source: []`, or `lstack add --no-source`, to skip shell config.
+- From the CLI, `-s/--source <file>` adds files. In the app, use the **Shell environment → Source files** field.
+
+**Command splitting.** When you add a script, these leading setup steps are moved out of the command into their own fields:
+
+| Leading step | Moved to |
+|---|---|
+| `cd <dir> &&` | `cwd` |
+| `FOO=bar`, `export FOO=bar &&` | `env` |
+| `source <file> &&`, `. <file> &&` | `source` |
+
+```sh
+lstack add web -- 'cd ~/code/web && export PORT=3000 && source .env && bun run dev'
+# ↳ split out cwd ~/code/web · env PORT · source ~/code/web/.env
+#   command: bun run dev
+```
+
+- **What isn't split.** Anything that needs runtime expansion (`$VAR`, `$(…)`, globs) is left alone, as is everything after a pipe or subshell. Pass `--no-split` to keep the command exactly as typed.
+- **In the app.** The Add Service window shows a **Split Out** suggestion as you type.
+
+**1Password CLI (`op`) and other tools that read app data.** macOS privacy rules apply to scripts launched by the LStack daemon. Without permission, `op` can't read 1Password's settings, so it reports "No accounts configured" and never shows the Touch ID prompt. To fix this, grant **Full Disk Access** to the helper. Open **Settings → Full Disk Access → Grant…**, which reveals `LStack.app/Contents/Helpers/lstack` and opens the matching System Settings pane. Add the helper there, then restart the service. If it stops working after an update, remove the entry and add it again.
 
 ### Service YAML
 
@@ -145,6 +180,7 @@ type: process            # process | docker | compose | k8s
 command: npm run dev
 cwd: ~/code/api
 env: { PORT: "3000" }
+source: [~/.zshrc, .env] # sourced first (default: your shell rc); [] = none
 autostart: true          # start at login / daemon boot
 restart: on-failure      # always | on-failure | never
 maxRestarts: 10
@@ -171,9 +207,11 @@ autostart: true
 
 ## Behavior notes
 
-- Scripts run in their own process group under `$SHELL -c`. Stopping sends SIGTERM, then SIGKILL after 8 s.
+- Scripts run in their own process group under `$SHELL -l` (see Shell environment). Stopping sends SIGTERM, then SIGKILL after 8 s.
 - When the daemon exits, it stops scripts but **leaves containers running**. On restart it re-adopts them, and it reaps orphaned script process groups if the daemon was killed.
 - At login, the daemon waits up to 10 minutes for Docker Desktop before it starts container services.
+- **Crash loops.** Crashed scripts restart with exponential backoff (1 s → 30 s, up to `maxRestarts`). While a script waits to restart, the menu bar shows **RESTART IN Ns** with a red stop button. `lstack ls` and `lstack top` show `restarting Ns`. Stopping it cancels the pending restart, and stop waits for a start that's already in progress.
+- **Terminal app.** Dashboard, Attach and Shell open in the app chosen under **Settings → Terminal app** (or `lstack terminal <id>`): Terminal, iTerm, cmux or Ghostty. macOS asks once to allow LStack to control iTerm or Terminal.
 - The API binds to 127.0.0.1 only and requires the token in `daemon.json`.
 
 ## Development
@@ -198,18 +236,25 @@ Layout also includes `src/daemon/remote.rs` + `src/daemon/web/` (remote dashboar
 
 ## Releases
 
-Releases are published at **[github.com/jhicken/localstack/releases](https://github.com/jhicken/localstack/releases)**. Each release includes a `.dmg`, a `.zip` and SHA-256 checksums for Apple Silicon.
+Releases are published at **[github.com/jhicken/localstack/releases](https://github.com/jhicken/localstack/releases)**. Each release includes:
+
+- `LStack-<version>-arm64.dmg`: open it and drag LStack to Applications.
+- `LStack-<version>-arm64.zip`
+- `LStack-<version>-arm64.sha256`: checksums for both files.
 
 To cut a release:
 
 ```sh
 # 1. bump `version` in Cargo.toml and commit
-# 2. build, tag v<version>, push, and upload to GitHub Releases:
-macos/release.sh                    # release notes are generated from commits
-macos/release.sh --notes "Fixes…"   # or write your own
-macos/release.sh --draft            # create as a draft
+# 2. tag v<version> and push it; GitHub Actions builds the app and attaches the .dmg/.zip
+macos/release.sh
+
+# or build on this Mac and upload with the GitHub CLI (gh auth login)
+macos/release.sh --local [--draft]
 ```
 
-The script needs the GitHub CLI (`brew install gh && gh auth login`) and a clean working tree. Re-running it for an existing tag replaces that release's assets.
+- **The CI workflow** (`.github/workflows/release.yml`) runs on a macOS runner. It checks that the tag matches `Cargo.toml`, runs the tests, builds with `macos/build.sh`, and then creates the release, or replaces the assets if the release already exists.
+- **Rebuilding an existing tag.** Run the workflow manually from the Actions tab.
+- **Code signing.** Builds are ad-hoc signed. The first time you open a downloaded copy, right-click the app and choose **Open**.
 
 See [docs/PLAN.md](docs/PLAN.md) for the roadmap.

@@ -31,7 +31,7 @@ struct ServiceRow: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(service.isFailed ? Color.red.opacity(0.35) : .clear, lineWidth: 1)
+                .strokeBorder(service.isRestarting ? Color.orange.opacity(0.5) : service.isFailed ? Color.red.opacity(0.35) : .clear, lineWidth: 1)
         )
         .onHover { hover = $0 }
         .confirmationDialog("Remove \(service.name)?", isPresented: $confirmRemove) {
@@ -47,7 +47,7 @@ struct ServiceRow: View {
         HStack(spacing: 10) {
             TypeBadge(type: service.type)
                 .overlay(alignment: .bottomTrailing) {
-                    StatusDot(status: service.status, size: 8)
+                    StatusDot(status: service.isRestarting ? "starting" : service.status, size: 8)
                         .padding(1.5)
                         .background(Circle().fill(.background))
                         .offset(x: 4, y: 4)
@@ -72,6 +72,18 @@ struct ServiceRow: View {
             Spacer(minLength: 6)
             if hover || expanded {
                 controls
+            } else if service.isRestarting {
+                // Crash loop: make it obvious it can be stopped without hovering.
+                HStack(spacing: 4) {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text("restart in \(service.restartsIn(now: ctx.date))s")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.orange)
+                            .textCase(.uppercase)
+                            .monospacedDigit()
+                    }
+                    IconButton(icon: "stop.fill", help: "Stop — cancel the pending restart", tint: .red) { store.perform(service.name, "stop") }
+                }
             } else if service.isRunning {
                 VStack(alignment: .trailing, spacing: 1) {
                     Text(Fmt.pct(service.metrics?.cpu)).font(.system(size: 11, weight: .medium)).monospacedDigit()
@@ -100,6 +112,10 @@ struct ServiceRow: View {
     }
 
     private var subtitle: String {
+        if service.isRestarting {
+            let max = service.config.maxRestarts ?? 10
+            return "Crashed\(service.exitCode.map { " (exit \($0))" } ?? "") · retry \(service.restarts)/\(max)"
+        }
         if service.isFailed, let e = service.lastError { return e }
         if let u = service.uptime { return "up \(Fmt.duration(u)) · \(service.summary)" }
         return service.description ?? service.summary
@@ -107,8 +123,8 @@ struct ServiceRow: View {
 
     private var controls: some View {
         HStack(spacing: 0) {
-            if service.isRunning || service.isTransitioning {
-                IconButton(icon: "stop.fill", help: "Stop", tint: .red) { store.perform(service.name, "stop") }
+            if service.isStoppable {
+                IconButton(icon: "stop.fill", help: service.isRestarting ? "Stop — cancel the pending restart" : "Stop", tint: .red) { store.perform(service.name, "stop") }
             } else {
                 IconButton(icon: "play.fill", help: "Start", tint: .green) { store.perform(service.name, "start") }
             }

@@ -63,7 +63,12 @@ ditto -c -k --keepParent "$APP" "$ZIP"
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -quiet -volname "LStack $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+# hdiutil occasionally fails with "Resource busy" (notably on CI runners); retry a few times.
+for attempt in 1 2 3 4; do
+  hdiutil create -quiet -volname "LStack $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG" && break
+  [[ $attempt == 4 ]] && { echo "✗ hdiutil failed" >&2; exit 1; }
+  sleep $((attempt * 3))
+done
 rm -rf "$STAGE"
 
 echo "✓ $APP  ($(du -sh "$APP" | cut -f1))"

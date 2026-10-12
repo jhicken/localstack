@@ -511,7 +511,7 @@ fn draw_list(fr: &mut Frame, ui: &Ui, area: Rect) {
             let run = s.status == "running";
             let m = s.metrics.as_ref();
             let cpu = if run { f::pct(m.map(|m| m.cpu)) } else { String::new() };
-            let mem = if run { f::bytes(m.map(|m| m.mem)) } else { s.status.clone() };
+            let mem = if run { f::bytes(m.map(|m| m.mem)) } else if s.restart_at.is_some() { "restarting".into() } else { s.status.clone() };
             let line = Line::from(vec![
                 Span::raw(" "),
                 Span::styled("●", Style::new().fg(status_color(&s.status))),
@@ -543,7 +543,8 @@ fn draw_list(fr: &mut Frame, ui: &Ui, area: Rect) {
 
 fn details(s: &ServiceState, hist: &[MetricSample], w: usize) -> Vec<Line<'static>> {
     let mut out = vec![];
-    let mut head = vec![dim(format!(" {}  ", s.kind)), Span::styled(s.status.clone(), Style::new().fg(status_color(&s.status))), Span::raw("  ")];
+    let st = if s.restart_at.is_some() { Span::styled(format!("{} (x to stop)", s.status_label()), Style::new().fg(Color::Yellow)) } else { Span::styled(s.status.clone(), Style::new().fg(status_color(&s.status))) };
+    let mut head = vec![dim(format!(" {}  ", s.kind)), st, Span::raw("  ")];
     match s.health.as_str() {
         "healthy" => head.push(Span::styled("♥ healthy  ", Style::new().fg(Color::Green))),
         "unhealthy" => head.push(Span::styled("♥ unhealthy  ", Style::new().fg(Color::Red))),

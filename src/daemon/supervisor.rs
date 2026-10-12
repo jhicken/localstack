@@ -120,6 +120,8 @@ pub struct Managed {
     want_running: bool,
     restarts: u32,
     restart_task: Option<AbortHandle>,
+    /// When the pending crash-loop restart fires (ms), while one is scheduled.
+    restart_at: Option<i64>,
     health: &'static str,
     health_task: Option<AbortHandle>,
     metrics: Option<MetricSample>,
@@ -156,15 +158,20 @@ impl Managed {
             started_at: if self.rt.status == "running" { self.rt.started_at } else { None },
             exit_code: self.rt.exit_code,
             restarts: self.restarts,
+            restart_at: self.restart_at,
             last_error: self.rt.last_error.clone(),
             metrics: self.metrics,
             config: self.pending.clone().unwrap_or_else(|| self.cfg.clone()),
         }
     }
-    fn abort_tasks(&mut self) {
+    fn cancel_restart(&mut self) {
+        self.restart_at = None;
         if let Some(h) = self.restart_task.take() {
             h.abort();
         }
+    }
+    fn abort_tasks(&mut self) {
+        self.cancel_restart();
         if let Some(h) = self.health_task.take() {
             h.abort();
         }
@@ -237,6 +244,16 @@ impl Sup {
 
     fn get<T>(&self, name: &str, f: impl FnOnce(&mut Managed) -> T) -> R<T> {
         self.with(name, None, f).ok_or_else(|| SupErr::new(404, format!("no such service \"{name}\"")))
+    }
+
+    async fn wait_busy(self: &Arc<Self>, name: &str) -> R<BusyGuard> {
+        let deadline = now_ms() + 60_000;
+        loop {
+            match self.try_busy(name) {
+                Err(e) if e.status == 409 && now_ms() < deadline => tokio::time::sleep(Duration::from_millis(100)).await,
+                r => return r,
+            }
+        }
     }
 
     fn try_busy(self: &Arc<Self>, name: &str) -> R<BusyGuard> {
@@ -412,9 +429,7 @@ impl Sup {
 
     pub async fn start(self: &Arc<Self>, name: &str) -> R<ServiceState> {
         let live = self.get(name, |m| {
-            if let Some(h) = m.restart_task.take() {
-                h.abort();
-            }
+            m.cancel_restart();
             m.want_running = true;
             m.restarts = 0;
             matches!(m.rt.status, "running" | "starting")
@@ -427,15 +442,22 @@ impl Sup {
     }
 
     pub async fn stop(self: &Arc<Self>, name: &str) -> R<ServiceState> {
-        self.get(name, |m| {
+        let was_restarting = self.get(name, |m| {
             m.want_running = false;
-            if let Some(h) = m.restart_task.take() {
-                h.abort();
+            let r = m.restart_at.is_some();
+            m.cancel_restart();
+            if r {
+                m.sys("crash-loop restart cancelled");
             }
+            r
         })?;
         {
-            let _g = self.try_busy(name)?;
+            // A start may be in flight (e.g. a crash-loop restart); wait for it rather than refusing.
+            let _g = self.wait_busy(name).await?;
             self.driver_stop(name).await;
+        }
+        if was_restarting {
+            self.with(name, None, |m| self.changed(m));
         }
         self.get(name, |m| {
             if let Some(p) = m.pending.take() {
@@ -486,6 +508,7 @@ impl Sup {
             want_running: false,
             restarts: 0,
             restart_task: None,
+            restart_at: None,
             health_task: None,
             metrics: None,
             net: None,
@@ -627,6 +650,7 @@ impl Sup {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 let want = sup.with(&n, None, |m| {
                     m.restart_task = None;
+                    m.restart_at = None;
                     m.want_running
                 });
                 if want != Some(true) {
@@ -637,6 +661,7 @@ impl Sup {
                 }
             });
             m.restart_task = Some(h.abort_handle());
+            m.restart_at = Some(now_ms() + delay as i64);
             self.changed(m);
         });
     }

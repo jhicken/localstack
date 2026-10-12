@@ -16,6 +16,9 @@ struct AddServiceView: View {
     @State private var composeFile = ""
     @State private var project = ""
     @State private var env = ""
+    @State private var sources = "~/.zshrc"
+    @State private var defaultSource = ["~/.zshrc"]
+    @State private var suggestion: CommandSplit?
     @State private var restart = "on-failure"
     @State private var autostart = true
     @State private var startNow = true
@@ -24,6 +27,10 @@ struct AddServiceView: View {
     @State private var healthPort = ""
     @State private var error: String?
     @State private var saving = false
+
+    init(command: String = "") {
+        _command = State(initialValue: command)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,6 +50,9 @@ struct AddServiceView: View {
                     case "process":
                         TextField("Command", text: $command, prompt: Text("npm run dev"))
                             .font(.system(.body, design: .monospaced))
+                        if let s = suggestion, s.changed {
+                            splitHint(s)
+                        }
                         pathField("Working directory", $cwd, directories: true)
                     case "docker":
                         TextField("Image", text: $image, prompt: Text("postgres:16"))
@@ -55,6 +65,18 @@ struct AddServiceView: View {
                     if type != "compose" {
                         TextField("Environment", text: $env, prompt: Text("KEY=value, OTHER=value"), axis: .vertical)
                             .lineLimit(1...4)
+                    }
+                }
+                if type == "process" {
+                    Section {
+                        TextField("Source files", text: $sources, prompt: Text("none"), axis: .vertical)
+                            .font(.system(.body, design: .monospaced))
+                            .lineLimit(1...4)
+                    } header: {
+                        Text("Shell environment")
+                    } footer: {
+                        Text("Runs in a login shell, like a new Terminal tab, after sourcing these files (comma or newline separated), so PATH, nvm, bun, op and aliases work. Clear it to skip your shell config.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Section("Behavior") {
@@ -97,6 +119,46 @@ struct AddServiceView: View {
         }
         .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
+        .task {
+            if let s = await store.splitCommand("", cwd: cwd) {
+                if sources == defaultSource.joined(separator: ", ") { sources = s.defaultSource.joined(separator: ", ") }
+                defaultSource = s.defaultSource
+            }
+        }
+        .task(id: command) {
+            guard type == "process", !command.isEmpty else { suggestion = nil; return }
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            suggestion = await store.splitCommand(command, cwd: cwd)
+        }
+    }
+
+    private func splitHint(_ s: CommandSplit) -> some View {
+        var parts: [String] = []
+        if let d = s.split.cwd { parts.append("cd \((d as NSString).abbreviatingWithTildeInPath)") }
+        if !s.split.env.isEmpty { parts.append("env " + s.split.env.keys.sorted().joined(separator: ", ")) }
+        if !s.split.source.isEmpty { parts.append("source " + s.split.source.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")) }
+        return HStack(spacing: 8) {
+            Image(systemName: "wand.and.stars").foregroundStyle(.tint)
+            Text("Found \(parts.joined(separator: " · "))")
+                .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            Spacer()
+            Button("Split Out") { applySplit(s.split) }
+                .controlSize(.small)
+        }
+    }
+
+    private func applySplit(_ p: CommandSplit.Parts) {
+        if let d = p.cwd { cwd = d }
+        if !p.env.isEmpty {
+            let lines = p.env.keys.sorted().map { "\($0)=\(p.env[$0]!)" }
+            env = ([env.trimmingCharacters(in: .whitespacesAndNewlines)].filter { !$0.isEmpty } + lines).joined(separator: "\n")
+        }
+        if !p.source.isEmpty {
+            sources = ((list(sources) ?? []) + p.source).joined(separator: ", ")
+        }
+        suggestion = nil
+        command = p.command
     }
 
     private func pathField(_ label: String, _ binding: Binding<String>, directories: Bool) -> some View {
@@ -127,6 +189,8 @@ struct AddServiceView: View {
         case "process":
             cfg.command = command
             cfg.cwd = cwd
+            let files = list(sources) ?? []
+            cfg.source = files == defaultSource ? nil : files
         case "docker":
             cfg.image = image.isEmpty ? nil : image
             cfg.container = container.isEmpty ? nil : container
