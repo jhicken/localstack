@@ -225,6 +225,7 @@ pub fn status_json() -> serde_json::Value {
     let me = paths::self_exe();
     let info = client::read_info();
     let alive = info.as_ref().is_some_and(client::ping);
+    let stale = info.as_ref().filter(|_| alive).and_then(daemon_stale);
     json!({
         "version": paths::VERSION,
         "bin": me,
@@ -251,8 +252,25 @@ pub fn status_json() -> serde_json::Value {
             "port": info.as_ref().filter(|_| alive).map(|i| i.port),
             "version": info.as_ref().filter(|_| alive).map(|i| i.version.clone()),
             "bin": info.as_ref().filter(|_| alive).and_then(|i| i.bin.clone()),
+            "stale": stale.is_some(),
+            "staleReason": stale,
         }
     })
+}
+
+/// Why the running daemon is out of date, if it is: a different version, or its binary was replaced
+/// after it started (e.g. the app was updated in place, keeping the same path).
+pub fn daemon_stale(i: &crate::types::DaemonInfo) -> Option<String> {
+    if i.version != paths::VERSION {
+        return Some(format!("the background service is running v{} but this is v{}", i.version, paths::VERSION));
+    }
+    let bin = PathBuf::from(i.bin.as_deref()?);
+    if canon(&bin) != canon(&paths::self_exe()) {
+        return None;
+    }
+    let modified = std::fs::metadata(&bin).and_then(|m| m.modified()).ok()?;
+    let modified_ms = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
+    (modified_ms > i.started_at + 2_000).then(|| "LStack was updated after the background service started".to_string())
 }
 
 fn print_notes(notes: &[String]) {

@@ -177,6 +177,7 @@ impl Client {
 pub fn connect(autostart: bool) -> Res<Client> {
     if let Some(info) = read_info() {
         if ping(&info) {
+            warn_if_stale(&info);
             return Ok(Client::new(info));
         }
     }
@@ -193,6 +194,16 @@ pub fn connect(autostart: bool) -> Res<Client> {
         }
     }
     Err(format!("daemon failed to start — see {}", paths::daemon_log().display()))
+}
+
+fn warn_if_stale(info: &DaemonInfo) {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    if let Some(why) = crate::setup::daemon_stale(info) {
+        eprintln!("{}", crate::fmt::yellow(&format!("! {why} — run `lstack daemon restart` to update it")));
+    }
 }
 
 pub fn spawn_daemon() {

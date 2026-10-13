@@ -339,6 +339,37 @@ final class AppStore {
 
     func refreshSetup() async {
         setup = await Helper.status()
+        if let d = setup?.daemon, d.running, d.stale == true {
+            daemonOutdated = d.staleReason ?? "LStack was updated after the background service started"
+        } else {
+            daemonOutdated = nil
+        }
+    }
+
+    /// Set when the running daemon is older than this app; offers a restart.
+    var daemonOutdated: String?
+    var restartingDaemon = false
+
+    func restartDaemon() {
+        restartingDaemon = true
+        Task {
+            let r = await Helper.run(["daemon", "restart"])
+            restartingDaemon = false
+            if r.status != 0 { flash(r.output.isEmpty ? "Couldn't restart the daemon" : r.output.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            await refreshSetup()
+        }
+    }
+
+    /// Ask (once per launch) whether to restart an out-of-date daemon. "Later" leaves a banner in the menu.
+    private func offerDaemonRestart() {
+        guard let why = daemonOutdated else { return }
+        let alert = NSAlert()
+        alert.messageText = "Restart the LStack background service?"
+        alert.informativeText = "\(why.prefix(1).uppercased() + why.dropFirst()), so new features and process info may not work until it restarts.\n\nScripts LStack started will stop and autostart ones start again. Containers keep running."
+        alert.addButton(withTitle: "Restart Now")
+        alert.addButton(withTitle: "Later")
+        bringToFront()
+        if alert.runModal() == .alertFirstButtonReturn { restartDaemon() }
     }
 
     /// Called once at launch. Returns true if the setup window should be shown.
@@ -350,6 +381,7 @@ final class AppStore {
         }
         await refreshSetup()
         if setup?.daemon.running == false { startDaemon() }
+        if onboarded { offerDaemonRestart() }
         return !onboarded
     }
 

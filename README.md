@@ -81,6 +81,8 @@ LStack ships as **one app**. `LStack.app` contains the SwiftUI menu bar app and 
 
    You can reopen this window later from the ⚙ **Settings** button in the popover.
 
+**Updating.** Quit LStack, replace the app in Applications and open it again. The background service (daemon) keeps running across app restarts, so if it is older than the new app, LStack asks whether to restart it. Choose **Later** and a banner in the menu offers it again. Restarting stops scripts LStack started; autostart ones start again and containers keep running. From a terminal: `lstack daemon restart`. The CLI also warns when it talks to an out-of-date daemon.
+
 You can do the same from a terminal:
 
 ```sh

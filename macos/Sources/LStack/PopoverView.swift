@@ -14,6 +14,7 @@ struct PopoverView: View {
                     .padding(.horizontal, 8)
                     .padding(.bottom, 8)
             }
+            daemonBanner
             diskAccessBanner
             cmuxBanner
             Divider().opacity(0.5)
@@ -96,6 +97,15 @@ struct PopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    @ViewBuilder private var daemonBanner: some View {
+        if let why = store.daemonOutdated {
+            Banner(icon: "arrow.triangle.2.circlepath", tint: .orange,
+                   text: store.restartingDaemon ? "Restarting the background service…" : "\(why.prefix(1).uppercased() + why.dropFirst()). Restart it to finish updating.",
+                   action: "Restart", perform: store.restartDaemon,
+                   dismiss: { store.daemonOutdated = nil })
+        }
     }
 
     @ViewBuilder private var diskAccessBanner: some View {

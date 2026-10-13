@@ -118,6 +118,9 @@ struct SetupStatus: Codable, Sendable {
         let pid: Int?
         let port: Int?
         let version: String?
+        /// The daemon is running an older binary than this app (e.g. after an in-place update).
+        let stale: Bool?
+        let staleReason: String?
     }
     let version: String
     let bin: String
