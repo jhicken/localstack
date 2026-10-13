@@ -492,19 +492,6 @@ async fn open_terminal_with(args: &[&str], terminal: Option<String>) -> Res {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn durations() {
-        use super::parse_duration as p;
-        assert_eq!(p("30s"), 30_000);
-        assert_eq!(p("5m"), 300_000);
-        assert_eq!(p("2h"), 7_200_000);
-        assert_eq!(p("1d"), 86_400_000);
-        assert_eq!(p("90"), 90_000);
-        assert_eq!(p("junk"), 3_600_000);
-    }
-}
 
 // ------------------------------------------------------------------ machines (peers)
 
@@ -641,4 +628,18 @@ pub(super) async fn m_log_stream(State(st): State<AppState>, Path((m, name)): Pa
         }
     });
     Ok(sse_response(rx))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn durations() {
+        use super::parse_duration as p;
+        assert_eq!(p("30s"), 30_000);
+        assert_eq!(p("5m"), 300_000);
+        assert_eq!(p("2h"), 7_200_000);
+        assert_eq!(p("1d"), 86_400_000);
+        assert_eq!(p("90"), 90_000);
+        assert_eq!(p("junk"), 3_600_000);
+    }
 }

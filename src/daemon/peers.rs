@@ -507,8 +507,7 @@ mod tests {
         assert!(normalize_url("ftp://x").is_err());
         assert_eq!(host_of("http://studio.local:7380"), "studio.local");
         assert_eq!(host_of("http://[fd00::1]:7380"), "[fd00::1]");
-        let mut s = ServiceState::default();
-        s.urls = vec![crate::types::ServiceUrl { url: "http://localhost:3000/x".into(), source: "detected".into(), ..Default::default() }];
+        let mut s = ServiceState { urls: vec![crate::types::ServiceUrl { url: "http://localhost:3000/x".into(), source: "detected".into(), ..Default::default() }], ..Default::default() };
         rewrite_urls(&mut s, "studio.local");
         assert_eq!(s.urls[0].url, "http://studio.local:3000/x");
         assert_eq!(slug("Jeffs MacBook.local"), "Jeffs-MacBook");

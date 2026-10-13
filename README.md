@@ -336,16 +336,15 @@ Releases are published at **[github.com/jhicken/localstack/releases](https://git
 - `LStack-<version>-arm64.zip`
 - `LStack-<version>-arm64.sha256`: checksums for both files.
 
-To cut a release:
+To cut a release, commit your work, then run:
 
 ```sh
-# 1. bump `version` in Cargo.toml and commit
-# 2. tag v<version> and push it; GitHub Actions builds the app and attaches the .dmg/.zip
-macos/release.sh
-
-# or build on this Mac and upload with the GitHub CLI (gh auth login)
-macos/release.sh --local [--draft]
+macos/release.sh                  # patch bump: 0.3.3 → 0.3.4 (or: minor | major | 1.2.3 | current)
+macos/release.sh minor --dry-run  # run the checks and show the new version, change nothing
+macos/release.sh --local [--draft]  # build on this Mac and upload with the GitHub CLI (gh auth login)
 ```
+
+The script requires a clean tree that is up to date with origin. It runs `cargo test` and `cargo clippy -D warnings`, bumps `version` in `Cargo.toml` and `Cargo.lock`, and commits `chore: release vX.Y.Z`. Then it tags the commit and pushes the branch and tag together. If anything fails before the push, it removes the bump commit and tag, leaving the tree as it was.
 
 - **The CI workflow** (`.github/workflows/release.yml`) runs on a macOS runner. It checks that the tag matches `Cargo.toml`, runs the tests, builds with `macos/build.sh`, and then creates the release, or replaces the assets if the release already exists.
 - **Rebuilding an existing tag.** Run the workflow manually from the Actions tab.
