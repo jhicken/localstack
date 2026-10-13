@@ -297,14 +297,22 @@ fn machines_pair_and_proxy() {
     assert_eq!(u["localOnly"], true);
     assert!(client.get("/api/processes").unwrap()["thresholds"].is_object());
 
-    // Pairing codes need remote access on.
+    // Pairing codes need sharing on. Sharing works with the web dashboard off.
+    let status = |path: &str| match ureq::get(path).call() {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(c, _)) => c,
+        Err(_) => 0,
+    };
     assert_eq!(client.post("/api/remote/pair-code", None).unwrap_err().0, 400);
     let rport = free_port();
     client
-        .call("PUT", "/api/remote", Some(json!({ "enabled": true, "bind": "127.0.0.1", "port": rport, "username": "me", "password": "correct horse", "allowControl": true })))
+        .call("PUT", "/api/remote", Some(json!({ "enabled": false, "sharing": true, "bind": "127.0.0.1", "port": rport, "username": "me", "password": "correct horse", "allowControl": true })))
         .unwrap();
     let url = format!("127.0.0.1:{rport}");
-    wait_until("remote listener", 10, || ureq::get(&format!("http://{url}/api/login")).call().is_ok());
+    wait_until("remote listener", 10, || status(&format!("http://{url}/api/login")) == 404);
+    assert_eq!(status(&format!("http://{url}/")), 404, "web dashboard is off");
+    let rs = client.get("/api/remote").unwrap();
+    assert_eq!((rs["sharing"].clone(), rs["enabled"].clone()), (json!(true), json!(false)));
 
     // Wrong code is refused; a fresh code pairs once.
     assert_eq!(host.post("/api/machines", Some(json!({ "url": url, "code": "AAAA-AAAA" }))).unwrap_err().0, 401);
@@ -342,7 +350,7 @@ fn machines_pair_and_proxy() {
 
     // Control follows the client's allowControl.
     client.call("PUT", "/api/remote", Some(json!({ "allowControl": false }))).unwrap();
-    wait_until("remote restart", 10, || ureq::get(&format!("http://{url}/api/login")).call().is_ok());
+    wait_until("remote restart", 10, || status(&format!("http://{url}/api/login")) == 404);
     wait_until("control refused", 20, || host.post("/api/machines/studio/services/web/start", None).is_err_and(|e| e.0 == 403));
 
     // Revoking the token on the client cuts the host off.

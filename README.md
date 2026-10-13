@@ -116,28 +116,32 @@ lstack terminal iterm  # app used by Dashboard/Attach: terminal | iterm | cmux |
 lstack ps              # other busy processes (over the CPU / memory / network thresholds)
 ```
 
-The menu bar footer has two dashboard buttons: **Terminal** opens `lstack top` in your terminal app, and **Web** opens the web dashboard in your browser. Web appears only when the remote dashboard is on.
+The menu bar footer has two dashboard buttons: **Terminal** opens `lstack top` in your terminal app, and **Web** opens the web dashboard in your browser. Web appears only when the web dashboard is on.
 
 Run `lstack help` for everything.
 
-## Remote dashboard
+## Web dashboard
 
-LStack can serve a small web dashboard, so you can check on a machine from another computer's browser. It shows services, health, CPU and memory history, and live logs. It is **off by default**. Turn it on from **Settings → Remote dashboard** in the app, or from the CLI:
+LStack can serve a small web dashboard. It shows services, health, CPU and memory history, live logs, and a whole-machine view per machine: click the CPU/MEM row under a machine to see CPU and memory charts for the last 15 minutes, with LStack's share highlighted, plus the busy processes. It is **off by default**. Turn it on from **Settings → Web dashboard** in the app, or from the CLI.
+
+You choose who can open it: **this Mac only** (the listener binds to 127.0.0.1, and other devices get 403), or **other devices too**. Sharing with other Macs is a separate switch (see [Other machines](#other-machines)), so you can use the dashboard locally without exposing it, or share with paired Macs while the dashboard stays off.
 
 ```sh
-lstack remote on                    # asks for a password the first time; listens on 0.0.0.0:7380
+lstack remote on --local            # asks for a password the first time; http://127.0.0.1:7380
+lstack remote web network           # let other devices open it too (listens on 0.0.0.0:7380)
+lstack remote web local             # back to this Mac only
 lstack remote on --port 8080 --user jeff --read-only
 lstack remote passwd                # change the password (signs everyone out)
 lstack remote status                # shows the URLs to open, e.g. http://192.168.1.20:7380
 lstack remote 2fa on                # two-factor sign-in: scan the QR, enter a code to confirm
 lstack remote 2fa off
-lstack remote off
+lstack remote off                   # dashboard off (sharing is unaffected)
 echo "$PW" | lstack remote on --password-stdin   # non-interactive
 ```
 
-Then open `http://<this-mac>:7380` and sign in.
+Then open `http://127.0.0.1:7380` (or `http://<this-mac>:7380` from another device) and sign in. Configs from before the split keep their behavior: the dashboard stays open to other devices and sharing stays on if the dashboard was on.
 
-**Two-factor sign-in (TOTP).** Run `lstack remote 2fa on`, or use **Settings → Remote dashboard → Two-factor → Set Up…**, then scan the QR code with 1Password, Google Authenticator, Authy or a similar app. After that, the sign-in page also asks for a 6-digit code. A code can be used only once, and the clock may be off by ±30 s.
+**Two-factor sign-in (TOTP).** Run `lstack remote 2fa on`, or use **Settings → Web dashboard → Two-factor → Set Up…**, then scan the QR code with 1Password, Google Authenticator, Authy or a similar app. After that, the sign-in page also asks for a 6-digit code. A code can be used only once, and the clock may be off by ±30 s.
 
 - **Separate from the local API.** The daemon's own API stays on 127.0.0.1. The remote server is a second listener that exposes a read-mostly subset of it.
 - **Accounts.** There is one account. The password is stored as a PBKDF2-SHA256 hash (120k rounds) in `remote.json`.
@@ -214,7 +218,7 @@ You can also manage this in **Settings → Monitoring**, where you set the ping 
 
 A Mac can watch other Macs that run LStack. Their services and busy processes then appear, grouped by machine, in the menu bar, `lstack ls`, `lstack top` and the web dashboard.
 
-1. On the Mac to be watched, turn on the remote dashboard, then run `lstack remote pair`, or click **Settings → Machines → Pair this Mac → Show Code**. You get a one-time code, valid for 10 minutes.
+1. On the Mac to be watched, turn on sharing (`lstack remote share on`, or **Settings → Machines → Share this Mac**). Then run `lstack remote pair` or click **Show Pairing Code**. You get a one-time code, valid for 10 minutes. Sharing doesn't need the web dashboard.
 2. On your Mac, run `lstack machine add <address> --code XXXX-XXXX`, or use **Settings → Machines**. You can also sign in with the other Mac's dashboard login (`--user`, plus 2FA if it is on).
 
 ```sh
@@ -227,7 +231,7 @@ lstack machine rm mini
 lstack remote peers               # on the watched Mac: who's watching; `rm <id>` revokes
 ```
 
-- **Control.** Start, stop and restart are allowed only when the watched Mac's remote dashboard has **Allow start / stop / restart** turned on. Otherwise its services are read-only.
+- **Control.** Start, stop and restart are allowed only when the watched Mac allows it (**Paired Macs can start / stop / restart** in Settings → Machines, the same setting as the web dashboard's). Turning sharing off (`lstack remote share off`) disconnects watchers until it is back on; their tokens are kept. Otherwise its services are read-only.
 - **Auth.** Each pairing gets its own long-lived bearer token. The watched Mac stores it only as a SHA-256 hash in `remote.json`. Revoking it cuts off that machine's live streams immediately.
 - **No secrets cross.** Secret values are never sent, env values and ping URLs are redacted, and logs are scrubbed on the watched Mac before they're sent.
 - **Plain HTTP.** As with the dashboard, use a trusted network or a VPN such as Tailscale.

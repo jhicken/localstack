@@ -1,6 +1,10 @@
-//! Optional remote web dashboard. When enabled, a second HTTP listener (default 0.0.0.0:7380) serves a
-//! small web UI plus a read-only API behind a username/password login, so you can check on services and
-//! logs from another machine's browser. Start/stop/restart are only exposed when `allowControl` is set.
+//! Optional second HTTP listener (default port 7380) with two independent features:
+//! - the **web dashboard** (`enabled`): a small web UI behind a username/password login. Available on this
+//!   Mac only, or to other devices too when `webRemote` is set;
+//! - **sharing** (`sharing`): `/peer/*`, which paired Macs use to show this machine's services.
+//!
+//! The listener binds to the network only when one of them is remote; otherwise to 127.0.0.1.
+//! Start/stop/restart are only exposed when `allowControl` is set.
 use super::server::{self, ApiErr, AppState};
 use super::totp;
 use crate::paths::{self, now_ms, VERSION};
@@ -39,7 +43,12 @@ const ICON_PNG: &[u8] = include_bytes!("web/icon.png");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RemoteConfig {
+    /// Web dashboard on.
     pub enabled: bool,
+    /// The web dashboard is reachable from other devices (not just this Mac). Missing in old configs = on.
+    pub web_remote: Option<bool>,
+    /// Share this machine's services with paired Macs. Missing in old configs = same as `enabled`.
+    pub sharing: Option<bool>,
     pub port: u16,
     pub bind: String,
     pub username: String,
@@ -74,6 +83,8 @@ impl Default for RemoteConfig {
     fn default() -> Self {
         RemoteConfig {
             enabled: false,
+            web_remote: None,
+            sharing: None,
             port: DEFAULT_PORT,
             bind: "0.0.0.0".into(),
             username: "admin".into(),
@@ -86,10 +97,59 @@ impl Default for RemoteConfig {
 }
 
 pub fn load_config() -> RemoteConfig {
-    std::fs::read(paths::remote_config())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    match std::fs::read(paths::remote_config()).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+        Some(cfg) => migrate(cfg),
+        // Fresh install: everything off, dashboard local-only once turned on.
+        None => RemoteConfig { web_remote: Some(false), sharing: Some(false), ..Default::default() },
+    }
+}
+
+/// Before the split, `enabled` meant "dashboard on the network + sharing": keep that behavior.
+fn migrate(mut cfg: RemoteConfig) -> RemoteConfig {
+    cfg.web_remote.get_or_insert(true);
+    cfg.sharing.get_or_insert(cfg.enabled);
+    cfg
+}
+
+impl RemoteConfig {
+    pub fn web_remote(&self) -> bool {
+        self.web_remote.unwrap_or(false)
+    }
+    pub fn sharing(&self) -> bool {
+        self.sharing.unwrap_or(false)
+    }
+    /// Whether the listener runs at all.
+    pub fn listening(&self) -> bool {
+        self.enabled || self.sharing()
+    }
+    /// The address to bind: the configured one when anything is remote, else loopback only.
+    pub fn bind_addr(&self) -> String {
+        if self.sharing() || (self.enabled && self.web_remote()) {
+            self.bind.clone()
+        } else {
+            "127.0.0.1".into()
+        }
+    }
+    /// Whether a request for `path` from `ip` may be served (None) or why not (status, message).
+    pub fn admit(&self, path: &str, ip: IpAddr) -> Option<(u16, &'static str)> {
+        if path.starts_with("/peer/") {
+            return (!self.sharing()).then_some((404, "this Mac isn't sharing with other Macs"));
+        }
+        if !self.enabled {
+            return Some((404, "the web dashboard is off"));
+        }
+        if !self.web_remote() && !is_loopback(ip) {
+            return Some((403, "the web dashboard is only available on this Mac"));
+        }
+        None
+    }
+}
+
+fn is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.is_loopback(),
+        IpAddr::V6(v) => v.is_loopback() || v.to_ipv4_mapped().is_some_and(|v| v.is_loopback()),
+    }
 }
 
 fn save_config(cfg: &RemoteConfig) -> std::io::Result<()> {
@@ -167,6 +227,8 @@ pub struct Remote {
 #[serde(rename_all = "camelCase")]
 pub struct RemotePatch {
     pub enabled: Option<bool>,
+    pub web_remote: Option<bool>,
+    pub sharing: Option<bool>,
     pub port: Option<u16>,
     pub bind: Option<String>,
     pub username: Option<String>,
@@ -191,15 +253,15 @@ impl Remote {
 
     /// New one-time code another machine can use to pair with this one (valid 10 minutes).
     pub fn new_pair_code(&self) -> Result<Value, ApiErr> {
-        if !self.config().enabled {
-            return Err(ApiErr::new(400, "turn on remote access first (lstack remote on) so other machines can reach this one"));
+        if !self.config().sharing() {
+            return Err(ApiErr::new(400, "turn on sharing first (lstack remote share on) so other Macs can reach this one"));
         }
         const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         let raw = random_hex(8);
         let code: String = raw.as_bytes().chunks(2).map(|c| ALPHABET[u8::from_str_radix(std::str::from_utf8(c).unwrap_or("0"), 16).unwrap_or(0) as usize % ALPHABET.len()] as char).collect();
         let exp = now_ms() + PAIR_CODE_TTL_MS;
         *self.pair_code.lock().unwrap() = Some((code.clone(), exp));
-        Ok(json!({ "code": format!("{}-{}", &code[..4], &code[4..]), "expiresAt": exp, "urls": self.status()["urls"] }))
+        Ok(json!({ "code": format!("{}-{}", &code[..4], &code[4..]), "expiresAt": exp, "urls": self.status()["shareUrls"] }))
     }
 
     fn take_pair_code(&self, code: &str) -> bool {
@@ -277,18 +339,28 @@ impl Remote {
     pub fn status(&self) -> Value {
         let cfg = self.config();
         let running = self.running.lock().unwrap();
-        let urls: Vec<String> = match &*running {
+        let network: Vec<String> = match &*running {
             Some(r) if r.bind == "0.0.0.0" || r.bind == "::" => {
                 local_addresses().into_iter().map(|ip| format!("http://{ip}:{}", r.port)).collect()
             }
             Some(r) => vec![format!("http://{}:{}", r.bind, r.port)],
             None => vec![],
         };
+        // Dashboard links: network addresses when other devices may use it, else this Mac's.
+        let urls: Vec<String> = match &*running {
+            Some(r) if cfg.enabled && !cfg.web_remote() => vec![format!("http://127.0.0.1:{}", r.port)],
+            Some(_) if cfg.enabled => network.clone(),
+            _ => vec![],
+        };
+        let share_urls: Vec<String> = if cfg.sharing() { network } else { vec![] };
         json!({
             "enabled": cfg.enabled,
+            "webRemote": cfg.web_remote(),
+            "sharing": cfg.sharing(),
+            "shareUrls": share_urls,
             "running": running.is_some(),
             "port": cfg.port,
-            "bind": cfg.bind,
+            "bind": running.as_ref().map_or(cfg.bind.clone(), |r| r.bind.clone()),
             "username": cfg.username,
             "hasPassword": !cfg.password_hash.is_empty(),
             "allowControl": cfg.allow_control,
@@ -334,8 +406,14 @@ impl Remote {
         if let Some(e) = patch.enabled {
             cfg.enabled = e;
         }
+        if let Some(w) = patch.web_remote {
+            cfg.web_remote = Some(w);
+        }
+        if let Some(sh) = patch.sharing {
+            cfg.sharing = Some(sh);
+        }
         if cfg.enabled && cfg.password_hash.is_empty() {
-            return Err(ApiErr::new(400, "set a password before enabling remote access"));
+            return Err(ApiErr::new(400, "set a password before turning on the web dashboard"));
         }
         save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
         let creds_changed = cfg.username != old.username || cfg.password_hash != old.password_hash;
@@ -360,9 +438,12 @@ impl Remote {
         *self.error.lock().unwrap() = None;
         if !cfg.enabled {
             self.sessions.lock().unwrap().clear();
+        }
+        if !cfg.listening() {
             return;
         }
-        let addr = format!("{}:{}", cfg.bind, cfg.port);
+        let bind = cfg.bind_addr();
+        let addr = format!("{bind}:{}", cfg.port);
         let mut bound = tokio::net::TcpListener::bind(&addr).await;
         for _ in 0..10 {
             match &bound {
@@ -388,8 +469,13 @@ impl Remote {
             let svc = app_router.into_make_service_with_connect_info::<SocketAddr>();
             let _ = axum::serve(listener, svc).await;
         });
-        println!("{} remote dashboard listening on http://{addr}", paths::iso(now_ms()));
-        *self.running.lock().unwrap() = Some(Running { port: cfg.port, bind: cfg.bind, task });
+        let what = match (cfg.enabled, cfg.sharing()) {
+            (true, true) => "web dashboard + sharing",
+            (true, false) => "web dashboard",
+            _ => "sharing",
+        };
+        println!("{} remote: {what} listening on http://{addr}", paths::iso(now_ms()));
+        *self.running.lock().unwrap() = Some(Running { port: cfg.port, bind, task });
     }
 
     /// Start two-factor enrollment: returns a fresh secret and its otpauth:// URI. Login is unaffected
@@ -533,6 +619,7 @@ fn router(app: AppState, remote: Arc<Remote>, gen: u64) -> Router {
         .route("/api/services/:name/:action", post(action))
         .route("/api/events", get(events))
         .route("/api/logout", post(logout))
+        .route("/api/system", get(|State(rs): State<RState>| async move { Json(rs.app.sup.system()) }))
         .route("/api/processes", get(|State(rs): State<RState>| async move { server::processes(State(rs.app)).await.into_response() }))
         .route("/api/machines", get(|State(rs): State<RState>| async move { server::machines_list(State(rs.app)).await.into_response() }))
         .route("/api/machines/:m", get(|State(rs): State<RState>, p: Path<String>| async move { server::machine_get(State(rs.app), p).await.into_response() }))
@@ -583,6 +670,10 @@ fn asset(ctype: &'static str, body: &'static [u8]) -> Response {
 async fn guard(State(rs): State<RState>, req: Request, next: Next) -> Response {
     if rs.remote.generation() != rs.gen {
         return ApiErr::new(503, "remote access disabled").into_response();
+    }
+    let ip = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    if let Some((code, msg)) = rs.remote.config().admit(req.uri().path(), ip) {
+        return ApiErr::new(code, msg).into_response();
     }
     if req.method() != Method::GET && req.headers().get("x-lstack").is_none() {
         return ApiErr::new(403, "missing X-LStack header").into_response();
@@ -850,6 +941,47 @@ async fn action(State(rs): State<RState>, Path((name, action)): Path<(String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_and_sharing_are_separate() {
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let mut c = RemoteConfig { enabled: true, web_remote: Some(false), sharing: Some(false), ..Default::default() };
+        assert_eq!(c.bind_addr(), "127.0.0.1");
+        assert!(c.admit("/", lo).is_none());
+        assert!(c.admit("/api/services", mapped).is_none());
+        assert_eq!(c.admit("/", lan).unwrap().0, 403);
+        assert_eq!(c.admit("/peer/api/services", lo).unwrap().0, 404);
+
+        c.sharing = Some(true);
+        assert_eq!(c.bind_addr(), "0.0.0.0");
+        assert!(c.admit("/peer/api/services", lan).is_none());
+        assert_eq!(c.admit("/api/login", lan).unwrap().0, 403);
+
+        c.enabled = false;
+        assert!(c.listening());
+        assert_eq!(c.admit("/", lo).unwrap().0, 404);
+        assert!(c.admit("/peer/pair", lan).is_none());
+
+        c.sharing = Some(false);
+        assert!(!c.listening());
+
+        c = RemoteConfig { enabled: true, web_remote: Some(true), sharing: Some(false), ..Default::default() };
+        assert_eq!(c.bind_addr(), "0.0.0.0");
+        assert!(c.admit("/", lan).is_none());
+        assert!(c.admit("/peer/api/system", lan).is_some());
+    }
+
+    #[test]
+    fn old_config_keeps_behavior() {
+        let old: RemoteConfig = serde_json::from_str(r#"{"enabled":true,"port":7380}"#).unwrap();
+        assert_eq!((old.web_remote, old.sharing), (None, None));
+        let c = migrate(old);
+        assert!(c.web_remote() && c.sharing());
+        let off = migrate(serde_json::from_str(r#"{"enabled":false}"#).unwrap());
+        assert!(off.web_remote() && !off.sharing());
+    }
 
     #[test]
     fn password_roundtrip() {

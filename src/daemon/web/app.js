@@ -16,6 +16,7 @@
     machines: new Map(), // peer name -> {info, services: Map, configErrors, processes, system}
     processes: [],
     thresholds: null,
+    system: null, // this machine's {cores, memTotal, samples}
     range: "15m",
     logs: [],
     filter: "",
@@ -68,6 +69,12 @@
   const svcPath = (s) => (s._m ? `/api/machines/${enc(s._m)}/services/${enc(s.name)}` : `/api/services/${enc(s.name)}`);
   const sortedSvcs = (map) => [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
   const sortedPeers = () => [...S.machines.values()].sort((a, b) => a.info.name.localeCompare(b.info.name));
+  // A machine overview is selected with a 3-element key; services use 2 (see keyOf).
+  const machKey = (m) => JSON.stringify([m || "", "", "machine"]);
+  const selMach = () => { try { const a = JSON.parse(S.selected); return Array.isArray(a) && a.length === 3 ? a[0] : null; } catch { return null; } };
+  const machExists = (m) => m === "" || S.machines.has(m);
+  const sysOf = (m) => (m ? S.machines.get(m)?.system : S.system);
+  const SYS_HISTORY = 300;
   const canControl = (s) => !!S.session?.allowControl && (!s._m || !!S.machines.get(s._m)?.info.allowControl);
   {
     const v = localStorage.getItem("lstack.sel");
@@ -98,6 +105,7 @@
     process: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
     docker: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg>',
     compose: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M12 3 3 7.5l9 4.5 9-4.5z"/><path d="m3 12 9 4.5 9-4.5"/><path d="m3 16.5 9 4.5 9-4.5"/></svg>',
+    machine: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>',
     k8s: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><path d="M12 3v6M12 15v6M3 12h6M15 12h6"/></svg>',
   };
 
@@ -166,6 +174,7 @@
     };
     openEvents();
     loadProcesses();
+    loadSystem();
     clearInterval(S.tickTimer);
     S.tickTimer = setInterval(() => { renderList(); renderTiles(); }, 1000);
   }
@@ -200,16 +209,38 @@
     const local = sortedSvcs(S.services)[0];
     if (local) return svcKey(local);
     for (const M of sortedPeers()) { const s = sortedSvcs(M.services)[0]; if (s) return svcKey(s); }
-    return null;
+    return machKey("");
   }
 
   function ensureSelection() {
-    if (!getSvc(S.selected)) S.selected = firstKey();
+    const m = selMach();
+    if (m !== null ? !machExists(m) : !getSvc(S.selected)) S.selected = firstKey();
   }
 
-  // Re-render the detail pane only when the selected service changed; otherwise refresh its header.
+  // Re-render the detail pane only when the selection changed; otherwise refresh its header.
   function refreshDetail() {
+    if (selMach() !== null) { if (S.shown !== S.selected || !machExists(selMach())) renderDetail(); else renderMachineLive(); return; }
     if (S.shown !== S.selected || !selSvc()) renderDetail(); else renderHead();
+  }
+
+  async function loadSystem() {
+    try {
+      const d = await api("/api/system");
+      const cur = (S.system?.samples || []).filter((x) => !d.samples?.length || x.ts > d.samples[d.samples.length - 1].ts);
+      S.system = { ...d, samples: [...(d.samples || []), ...cur].slice(-SYS_HISTORY) };
+      renderList();
+      if (selMach() === "") renderMachineLive();
+    } catch { /* ignore */ }
+  }
+
+  function onSystem(m, sample) {
+    let sys = sysOf(m);
+    if (!sys) {
+      sys = { samples: [] };
+      if (m) { const M = S.machines.get(m); if (!M) return; M.system = sys; } else S.system = sys;
+    }
+    sys.samples = [...(sys.samples || []).slice(-(SYS_HISTORY - 1)), sample];
+    if (selMach() === m) renderMachineLive();
   }
 
   async function loadProcesses() {
@@ -292,7 +323,7 @@
       case "removed": onRemoved(name, data.name); break;
       case "metrics": onMetrics(name, data.name, data.metrics); break;
       case "processes": M.processes = data.processes || []; renderList(); break;
-      case "system": if (M.system) M.system.samples = [...(M.system.samples || []).slice(-(HISTORY - 1)), data]; break;
+      case "system": onSystem(name, data); break;
     }
   }
 
@@ -332,7 +363,12 @@
     es.addEventListener("service", (e) => onService("", JSON.parse(e.data)));
     es.addEventListener("removed", (e) => onRemoved("", JSON.parse(e.data).name));
     es.addEventListener("metrics", (e) => { const { name, metrics } = JSON.parse(e.data); onMetrics("", name, metrics); });
-    es.addEventListener("processes", (e) => { S.processes = JSON.parse(e.data).processes || []; renderList(); });
+    es.addEventListener("processes", (e) => {
+      S.processes = JSON.parse(e.data).processes || [];
+      renderList();
+      if (selMach() === "") renderMachineLive();
+    });
+    es.addEventListener("system", (e) => onSystem("", JSON.parse(e.data)));
   }
 
   async function seedHistory(s) {
@@ -413,6 +449,19 @@
     return `<div class="mach" title="${esc(tip)}"><span class="mdot ${esc(st)}"></span><b>${esc(i.name)}</b>${sub ? `<span class="m-sub">${esc(sub)}</span>` : ""}${ro}<span class="m-n">${count}</span></div>${err}`;
   }
 
+  // Clickable whole-machine row: CPU and memory now, with sparklines of the last minutes.
+  function machRow(m) {
+    const sys = sysOf(m);
+    const smp = (sys?.samples || []).slice(-HISTORY);
+    const last = smp[smp.length - 1];
+    const memPct = last && sys.memTotal ? (last.mem / sys.memTotal) * 100 : null;
+    const k = machKey(m);
+    return `<div class="msum ${k === S.selected ? "sel" : ""}" data-key="${esc(k)}" title="Whole-machine load">
+        <span class="mk">CPU</span><b>${last ? pct(last.cpu) : "—"}</b>${sparkline(smp.map((x) => x.cpu), 54, 16, "#34d399")}
+        <span class="mk">MEM</span><b>${memPct != null ? pct(memPct) : last ? bytes(last.mem) : "—"}</b>${sparkline(smp.map((x) => x.mem), 54, 16, "#60a5fa")}
+      </div>`;
+  }
+
   function renderList() {
     const el = document.getElementById("list");
     if (!el) return;
@@ -427,17 +476,17 @@
     if (el.querySelector(":active")) return;
     const peers = sortedPeers();
     const total = all.length + peers.reduce((a, M) => a + M.services.size, 0);
-    const localBody = svcSection(all, S.configErrors, '<div class="empty">No services defined yet.<br>Add one with <code>lstack add</code>.</div>') + procPanel(S.processes, S.thresholds);
+    const localBody = machRow("") + svcSection(all, S.configErrors, '<div class="empty">No services defined yet.<br>Add one with <code>lstack add</code>.</div>') + procPanel(S.processes, S.thresholds);
     let html = `<div class="list-head"><span>Services</span><span>${total}</span></div>`;
     if (!peers.length) html += localBody;
     else {
       html += `<div class="machine">${machHead({ name: S.local || S.session?.hostname || "this machine", local: true, status: "online", hostname: S.session?.hostname, version: S.session?.version }, all.length)}${localBody}</div>`;
       for (const M of peers) {
-        html += `<div class="machine ${M.info.status === "online" ? "" : "stale"}">${machHead(M.info, M.services.size)}${svcSection(sortedSvcs(M.services), M.configErrors, '<div class="empty sm">No services.</div>')}${procPanel(M.processes)}</div>`;
+        html += `<div class="machine ${M.info.status === "online" ? "" : "stale"}">${machHead(M.info, M.services.size)}${machRow(M.info.name)}${svcSection(sortedSvcs(M.services), M.configErrors, '<div class="empty sm">No services.</div>')}${procPanel(M.processes)}</div>`;
       }
     }
     el.innerHTML = html;
-    el.querySelectorAll(".svc").forEach((row) => row.addEventListener("click", (e) => {
+    el.querySelectorAll(".svc, .msum").forEach((row) => row.addEventListener("click", (e) => {
       if (e.target.closest("a")) return;
       select(row.dataset.key);
     }));
@@ -456,6 +505,8 @@
     if (!el) return;
     S.logStream?.close(); S.logStream = null;
     clearInterval(S.chartTimer);
+    const mach = selMach();
+    if (mach !== null && machExists(mach)) { S.shown = S.selected; renderMachine(el, mach); return; }
     const s = selSvc();
     S.shown = s ? S.selected : null;
     if (!s) { el.innerHTML = '<div class="empty">Select a service.</div>'; return; }
@@ -601,6 +652,57 @@
     renderHead(); renderList();
   }
 
+  // ------------------------------------------------------------------ machine overview
+  function machInfo(m) {
+    if (!m) return { name: S.local || S.session?.hostname || "this machine", local: true, status: "online", hostname: S.session?.hostname, version: S.session?.version };
+    return S.machines.get(m)?.info || { name: m };
+  }
+
+  function renderMachine(el, m) {
+    const i = machInfo(m);
+    const st = i.status || "offline";
+    el.innerHTML = `
+      <div class="d-head">
+        <div class="d-icon machine">${ICONS.machine}</div>
+        <div class="d-title">
+          <h2>${esc(i.name)} <span class="pill ${st === "online" ? "running" : "stopped"}">${esc(i.local ? "this machine" : st)}</span></h2>
+          <div class="sub">${esc([i.hostname, i.version && `LStack ${i.version}`, !i.local && i.url].filter(Boolean).join(" · "))}</div>
+        </div>
+      </div>
+      <div class="tiles" id="mtiles"></div>
+      <div class="card-h"><span class="t">Whole machine · last ${Math.round((SYS_HISTORY * 3) / 60)} min</span>
+        <span class="legend"><span class="sw all"></span>all processes <span class="sw ls"></span>LStack services</span></div>
+      <div class="charts">
+        <div class="card"><div class="card-h"><span class="t">CPU</span><span class="val" id="mcpuv"></span></div><div class="chart-wrap"><div class="chart" id="mcpuc"></div></div></div>
+        <div class="card"><div class="card-h"><span class="t">Memory</span><span class="val" id="mmemv"></span></div><div class="chart-wrap"><div class="chart" id="mmemc"></div></div></div>
+      </div>
+      <div id="mprocs"></div>`;
+    renderMachineLive();
+  }
+
+  function renderMachineLive() {
+    const m = selMach();
+    if (m === null || !document.getElementById("mtiles")) return;
+    const sys = sysOf(m) || {};
+    const data = sys.samples || [];
+    const last = data[data.length - 1] || {};
+    const total = sys.memTotal;
+    const svcs = [...(svcMap(m)?.values() || [])];
+    const up = svcs.filter(live).length;
+    const tiles = [
+      ["CPU", pct(last.cpu)], ["Memory used", bytes(last.mem)], ["RAM", bytes(total)], ["Cores", sys.cores ?? "—"],
+      ["LStack CPU", pct(last.lsCpu)], ["LStack memory", bytes(last.lsMem)], ["Running", `${up} / ${svcs.length}`],
+    ];
+    document.getElementById("mtiles").innerHTML = tiles.map(([k, v]) => `<div class="tile"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
+    document.getElementById("mcpuv").textContent = pct(last.cpu);
+    document.getElementById("mmemv").textContent = total && last.mem != null ? pct((last.mem / total) * 100) : bytes(last.mem);
+    const range = "15m";
+    chart(document.getElementById("mcpuc"), data, "cpu", "#34d399", pct, 5, { key2: "lsCpu", color2: "#f59e0b", max: 100, range });
+    chart(document.getElementById("mmemc"), data, "mem", "#60a5fa", bytes, 1024 * 1024, { key2: "lsMem", color2: "#f59e0b", max: total, range });
+    const pe = document.getElementById("mprocs");
+    if (!pe.querySelector(":active")) pe.innerHTML = m ? procPanel(S.machines.get(m)?.processes) : procPanel(S.processes, S.thresholds);
+  }
+
   // ------------------------------------------------------------------ charts
   let chartData = [];
   async function loadCharts() {
@@ -628,24 +730,30 @@
     chart(document.getElementById("memc"), chartData, "mem", "#60a5fa", bytes, 1024 * 1024);
   }
 
-  function chart(el, data, key, color, fmt, floor) {
+  // `o.key2` draws a second series (e.g. LStack's share) over the first; `o.max` fixes the y scale.
+  function chart(el, data, key, color, fmt, floor, o = {}) {
     if (!el) return;
-    const W = 600, H = 130;
+    const W = 600, H = 130, range = o.range || S.range;
     if (data.length < 2) { el.innerHTML = '<div class="empty">No data for this range yet.</div>'; return; }
     const t0 = data[0].ts, t1 = data[data.length - 1].ts, span = Math.max(1, t1 - t0);
-    const max = Math.max(floor, ...data.map((d) => d[key] || 0)) * 1.15;
-    const x = (ts) => ((ts - t0) / span) * W, y = (v) => H - (v / max) * H;
-    const line = data.map((d, i) => `${i ? "L" : "M"}${x(d.ts).toFixed(1)},${y(d[key] || 0).toFixed(1)}`).join("");
+    const max = o.max || Math.max(floor, ...data.map((d) => d[key] || 0)) * 1.15;
+    const x = (ts) => ((ts - t0) / span) * W, y = (v) => H - (Math.min(v, max) / max) * H;
+    const path = (k) => data.map((d, i) => `${i ? "L" : "M"}${x(d.ts).toFixed(1)},${y(d[k] || 0).toFixed(1)}`).join("");
+    const line = path(key);
     const id = `g${key}`;
+    const second = o.key2
+      ? `<path d="${path(o.key2)}L${W},${H}L0,${H}Z" fill="${o.color2}" fill-opacity="0.22"/><path d="${path(o.key2)}" fill="none" stroke="${o.color2}" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>`
+      : "";
     el.innerHTML = `
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
         <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity="0.35"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
         ${[0.25, 0.5, 0.75].map((f) => `<line x1="0" x2="${W}" y1="${H * f}" y2="${H * f}" stroke="rgba(255,255,255,0.06)" stroke-width="1" vector-effect="non-scaling-stroke"/>`).join("")}
         <path d="${line}L${W},${H}L0,${H}Z" fill="url(#${id})"/>
         <path d="${line}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+        ${second}
       </svg>
       <span class="axis ymax">${esc(fmt(max))}</span>
-      <span class="axis t0">${esc(shortTime(t0, S.range))}</span><span class="axis t1">${esc(shortTime(t1, S.range))}</span>
+      <span class="axis t0">${esc(shortTime(t0, range))}</span><span class="axis t1">${esc(shortTime(t1, range))}</span>
       <div class="cursor"></div><div class="tip"></div>`;
     const tip = el.querySelector(".tip"), cur = el.querySelector(".cursor");
     el.onmousemove = (e) => {
@@ -655,8 +763,8 @@
       for (const d of data) if (Math.abs(d.ts - ts) < Math.abs(best.ts - ts)) best = d;
       const px = (x(best.ts) / W) * r.width;
       cur.style.left = `${px}px`;
-      tip.style.left = `${Math.min(Math.max(px, 50), r.width - 50)}px`;
-      tip.textContent = `${fmt(best[key] || 0)} · ${clock(best.ts)}`;
+      tip.style.left = `${Math.min(Math.max(px, 70), r.width - 70)}px`;
+      tip.textContent = `${fmt(best[key] || 0)}${o.key2 ? ` (LStack ${fmt(best[o.key2] || 0)})` : ""} · ${clock(best.ts)}`;
     };
   }
 

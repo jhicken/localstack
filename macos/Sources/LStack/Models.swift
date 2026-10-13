@@ -390,10 +390,17 @@ struct RemoteStatus: Codable, Equatable {
     var hostname: String?
     var urls: [String]
     var error: String?
+    /// Other devices may open the web dashboard (false = this Mac only).
+    var webRemote: Bool?
+    /// Paired Macs can watch this one.
+    var sharing: Bool?
+    var shareUrls: [String]?
 }
 
 struct RemotePatch: Encodable {
     var enabled: Bool?
+    var webRemote: Bool?
+    var sharing: Bool?
     var port: Int?
     var username: String?
     var password: String?

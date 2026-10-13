@@ -70,6 +70,8 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | Heartbeats | healthchecks.io-compatible pings per service (`/start`, success interval, `/fail` with scrubbed logs) and a machine heartbeat. Ping key kept in the secret store. `lstack heartbeat`, Settings → Monitoring. |
 | Busy processes | All-process CPU/mem/net sampling with thresholds (default 10% CPU, 10% RAM, 1 MB/s, 15 rows). SSE `processes`, `/api/processes`, `lstack ps`, shown per machine in every UI. |
 | Machines | Pair other Macs (one-time code or dashboard login + 2FA). The host keeps an SSE subscription per peer (`peers.json`), and `/api/machines/:m/…` proxies logs/metrics/control (gated by the peer's allowControl). `name@machine` in the CLI, grouped by machine in the menu bar, TUI, CLI and web. Peer tokens are hashed and revocable (`lstack remote peers`). |
+| Web vs sharing | The web dashboard (`enabled`, plus `webRemote`: this Mac only or other devices) and sharing with paired Macs (`sharing`) are independent switches on the same listener. It binds to loopback unless something is remote, and requests are gated per path and client IP. `lstack remote web local\|network`, `lstack remote share on\|off`; Settings → Web dashboard / Machines → Share this Mac. Old configs migrate to their previous behavior. |
+| Machine charts | The web dashboard has a per-machine overview (local and peers): CPU/memory sparklines in the list, plus whole-machine charts with LStack's share overlaid, tiles and busy processes. `/api/system` was added to the web API. |
 
 ## Phase 2 — Daily-driver polish
 

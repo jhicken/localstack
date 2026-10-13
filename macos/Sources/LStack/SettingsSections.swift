@@ -202,7 +202,7 @@ struct MachinesSettings: View {
         VStack(alignment: .leading, spacing: 12) {
             SettingsCard {
                 SetupRow(icon: "desktopcomputer", tint: .blue, title: "Watch another Mac",
-                         detail: "See its services and busy processes here, in the CLI and the web dashboard. On the other Mac turn on the remote dashboard, then use a pairing code (Machines → Pair this Mac) or its dashboard login.") {
+                         detail: "See its services and busy processes here, in the CLI and the web dashboard. On the other Mac turn on “Share this Mac” (Settings → Machines), then use its pairing code or its dashboard login.") {
                     EmptyView()
                 }
                 Divider().padding(.leading, 52)
@@ -217,17 +217,40 @@ struct MachinesSettings: View {
                 }
             }
             SettingsCard {
-                SetupRow(icon: "link.badge.plus", tint: .teal, title: "Pair this Mac",
+                SetupRow(icon: "link.badge.plus", tint: sharing ? .teal : .secondary, title: "Share this Mac",
                          detail: pairDetail) {
-                    Button(pair == nil ? "Show Code" : "New Code") {
+                    Toggle("", isOn: Binding(get: { sharing }, set: { v in
+                        busy = true
                         Task {
-                            do { pair = try await store.pairCode() } catch { self.error = error.localizedDescription }
+                            error = await store.updateRemote(RemotePatch(sharing: v))
+                            if !v { pair = nil }
+                            busy = false
                         }
-                    }
-                    .controlSize(.small)
-                    .disabled(store.remote?.running != true)
+                    }))
+                    .toggleStyle(.switch).labelsHidden().disabled(busy || store.remote == nil)
                 }
-                if let pair {
+                if sharing, let r = store.remote {
+                    Divider().padding(.leading, 52)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle("Paired Macs can start / stop / restart (also applies to the web dashboard)", isOn: Binding(
+                            get: { r.allowControl },
+                            set: { v in Task { error = await store.updateRemote(RemotePatch(allowControl: v)) } }))
+                            .toggleStyle(.checkbox).font(.system(size: 11))
+                        if let e = r.error { Text(e).font(.system(size: 11)).foregroundStyle(.red) }
+                        ForEach(r.shareUrls ?? [], id: \.self) { u in
+                            Label(u, systemImage: "network").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
+                        Button(pair == nil ? "Show Pairing Code" : "New Code") {
+                            Task {
+                                do { pair = try await store.pairCode() } catch { self.error = error.localizedDescription }
+                            }
+                        }
+                        .controlSize(.small)
+                        .disabled(!r.running)
+                    }
+                    .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
+                }
+                if sharing, let pair {
                     Divider().padding(.leading, 52)
                     HStack(spacing: 10) {
                         Text(pair.code).font(.system(size: 22, weight: .bold, design: .monospaced)).textSelection(.enabled)
@@ -277,11 +300,13 @@ struct MachinesSettings: View {
         }
     }
 
+    private var sharing: Bool { store.remote?.sharing ?? false }
+
     private var pairDetail: String {
-        if store.remote?.running != true {
-            return "Let another Mac watch this one: turn on the remote dashboard (General) first, then show a one-time code to enter there."
+        if !sharing {
+            return "Let other Macs watch this one's services and busy processes. Independent of the web dashboard; paired Macs never see secrets."
         }
-        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with this Mac's address. What it can do follows this Mac's “Allow control” setting."
+        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below, or sign in there with this Mac's dashboard login. Plain HTTP — use a trusted network or a VPN like Tailscale."
     }
 
     private var addForm: some View {

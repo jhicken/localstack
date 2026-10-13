@@ -237,3 +237,17 @@ section.detail { overflow-y: auto; padding: 20px 24px 24px; display: flex; flex-
   .logs input.filter { width: 100%; margin-left: 0; }
 }
 .card-h .seg { margin-left: auto; }
+
+/* whole-machine summary row + overview */
+.msum { display: flex; align-items: center; gap: 6px; padding: 7px 10px; margin: 4px 0 6px; border-radius: 10px; cursor: pointer; font-size: 12px; font-variant-numeric: tabular-nums; border: 1px solid transparent; }
+.msum:hover { background: var(--panel); }
+.msum.sel { background: var(--panel); border-color: var(--border); }
+.msum .mk { color: var(--muted); font-size: 11px; }
+.msum .mk:not(:first-child) { margin-left: 8px; }
+.msum b { min-width: 40px; }
+.d-icon.machine { background: linear-gradient(135deg, #64748b, #334155); }
+.legend { margin-left: auto; color: var(--muted); font-size: 11.5px; display: inline-flex; align-items: center; gap: 5px; }
+.legend .sw { width: 10px; height: 3px; border-radius: 2px; display: inline-block; margin-left: 6px; }
+.legend .sw.all { background: #34d399; }
+.legend .sw.ls { background: #f59e0b; }
+#mprocs { margin-top: 14px; }

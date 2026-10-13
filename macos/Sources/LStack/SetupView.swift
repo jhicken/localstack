@@ -14,6 +14,7 @@ struct SetupView: View {
     @State private var rPass = ""
     @State private var rPort = ""
     @State private var rControl = false
+    @State private var rWebRemote = false
     @State private var rEditing = false
     @State private var rBusy = false
     @State private var rError: String?
@@ -239,21 +240,24 @@ struct SetupView: View {
         }
     }
 
-    // MARK: remote dashboard
+    // MARK: web dashboard
 
     private var remoteCard: some View {
         let r = store.remote
         let on = r?.enabled ?? false
         let detail: String
-        if let r, r.running {
-            detail = "Anyone who signs in as **\(r.username)** can view status, metrics and logs\(r.allowControl ? " and start/stop services" : " (read-only)"). Plain HTTP — use on a trusted network or a VPN like Tailscale."
-        } else if let e = r?.error {
+        let can = "view status, metrics and logs\(r?.allowControl == true ? " and start/stop services" : " (read-only)")"
+        if let r, r.running, on, r.webRemote == true {
+            detail = "Anyone on your network who signs in as **\(r.username)** can \(can). Plain HTTP — use on a trusted network or a VPN like Tailscale."
+        } else if let r, r.running, on {
+            detail = "Only this Mac can open it. Sign in as **\(r.username)** to \(can)."
+        } else if on, let e = r?.error {
             detail = e
         } else {
-            detail = "Serve a password-protected web dashboard with live status, metrics and logs, so you can check on this Mac from another device."
+            detail = "A password-protected web dashboard with live status, metrics and logs — for this Mac only, or for your other devices too. Sharing with other Macs is separate (Settings → Machines)."
         }
         return VStack(alignment: .leading, spacing: 0) {
-            SetupRow(icon: "globe", tint: r?.running == true ? .teal : .secondary, title: "Remote dashboard", detail: detail) {
+            SetupRow(icon: "globe", tint: on && r?.running == true ? .teal : .secondary, title: "Web dashboard", detail: detail) {
                 Toggle("", isOn: Binding(get: { on || rEditing }, set: { v in
                     if v {
                         if r?.hasPassword == true { saveRemote(enable: true) } else { rEditing = true }
@@ -264,7 +268,7 @@ struct SetupView: View {
                 }))
                 .toggleStyle(.switch).labelsHidden().disabled(rBusy || r == nil)
             }
-            if let r, r.running, !r.urls.isEmpty {
+            if let r, r.running, on, !r.urls.isEmpty {
                 Divider().padding(.leading, 52)
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(r.urls, id: \.self) { u in
@@ -302,6 +306,14 @@ struct SetupView: View {
                     Text("Password").font(.system(size: 11)).foregroundStyle(.secondary)
                     SecureField(r?.hasPassword == true ? "unchanged" : "at least 8 characters", text: $rPass)
                         .textFieldStyle(.roundedBorder).frame(width: 180)
+                }
+                GridRow {
+                    Text("Open from").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Picker("", selection: $rWebRemote) {
+                        Text("This Mac only").tag(false)
+                        Text("Other devices too").tag(true)
+                    }
+                    .pickerStyle(.segmented).labelsHidden().frame(width: 240)
                 }
                 GridRow {
                     Text("Port").font(.system(size: 11)).foregroundStyle(.secondary)
@@ -413,6 +425,7 @@ struct SetupView: View {
         rUser = r.username
         rPort = String(r.port)
         rControl = r.allowControl
+        rWebRemote = r.webRemote ?? false
         rPass = ""
     }
 
@@ -425,6 +438,7 @@ struct SetupView: View {
             if !rPass.isEmpty { patch.password = rPass }
             if let p = Int(rPort), p != r.port { patch.port = p }
             if rControl != r.allowControl { patch.allowControl = rControl }
+            if rWebRemote != (r.webRemote ?? false) { patch.webRemote = rWebRemote }
         }
         rBusy = true
         Task {

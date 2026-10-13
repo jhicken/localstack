@@ -277,7 +277,7 @@ final class AppStore {
 
     /// The web dashboard (remote access) in the browser.
     func openWeb() {
-        guard let u = remote?.urls.first, let url = URL(string: u) else { flash("Turn on the remote dashboard in Settings first"); return }
+        guard let u = remote?.urls.first, let url = URL(string: u) else { flash("Turn on the web dashboard in Settings first"); return }
         NSWorkspace.shared.open(url)
     }
 

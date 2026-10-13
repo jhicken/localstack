@@ -57,11 +57,14 @@ fn help() -> String {
       --now              start immediately after adding
 
 {}
-  lstack remote on [--port 7380] [--user admin] [--bind 0.0.0.0] [--allow-control|--read-only] [--password-stdin]
+  lstack remote on [--local|--network] [--port 7380] [--user admin] [--bind 0.0.0.0] [--allow-control|--read-only] [--password-stdin]
+                                 web dashboard on (--local: this Mac only)
+  lstack remote web local|network  who can open the web dashboard
+  lstack remote off              web dashboard off
+  lstack remote share on|off     let paired Macs see this machine's services
   lstack remote passwd [--user <name>] [--password-stdin]
   lstack remote 2fa on|off       authenticator-app codes (TOTP) at sign-in
-  lstack remote off
-  lstack remote pair             one-time code another Mac uses to watch this one
+  lstack remote pair             one-time code another Mac uses to watch this one (needs sharing)
   lstack remote peers [rm <id>]  machines that watch this one (revoke access)
 
 {}
@@ -767,15 +770,15 @@ fn ask_new_password(stdin_only: bool) -> Result<String, String> {
 
 fn print_remote(v: &serde_json::Value) {
     let running = v["running"].as_bool().unwrap_or(false);
-    let state = if running {
-        c::green("● on")
-    } else if v["enabled"].as_bool().unwrap_or(false) {
-        c::red("● enabled but not listening")
-    } else {
-        c::dim("○ off")
-    };
-    println!("{state}  remote dashboard");
-    println!("  {:<9} {}:{}", c::dim("listen"), v["bind"].as_str().unwrap_or("?"), v["port"]);
+    let web = v["enabled"].as_bool().unwrap_or(false);
+    let share = v["sharing"].as_bool().unwrap_or(false);
+    let onoff = |on: bool| if !on { c::dim("○ off") } else if running { c::green("● on") } else { c::red("● on but not listening") };
+    let reach = if v["webRemote"].as_bool().unwrap_or(false) { "other devices can open it" } else { "this Mac only" };
+    println!("{}  web dashboard{}", onoff(web), if web { c::dim(&format!("  ({reach})")) } else { String::new() });
+    println!("{}  sharing with other Macs", onoff(share));
+    if running {
+        println!("  {:<9} {}:{}", c::dim("listen"), v["bind"].as_str().unwrap_or("?"), v["port"]);
+    }
     let pw = if v["hasPassword"].as_bool().unwrap_or(false) { "" } else { "  (no password set)" };
     println!("  {:<9} {}{pw}", c::dim("login"), v["username"].as_str().unwrap_or("?"));
     let tfa = if v["totp"].as_bool().unwrap_or(false) { c::green("on (authenticator code required)") } else { c::dim("off — lstack remote 2fa on") };
@@ -786,9 +789,12 @@ fn print_remote(v: &serde_json::Value) {
         println!("  {:<9} {}", c::dim("error"), c::red(e));
     }
     for u in v["urls"].as_array().into_iter().flatten() {
-        println!("  {:<9} {}", c::dim("url"), c::cyan(u.as_str().unwrap_or("")));
+        println!("  {:<9} {}", c::dim("web"), c::cyan(u.as_str().unwrap_or("")));
     }
-    if running {
+    for u in v["shareUrls"].as_array().into_iter().flatten() {
+        println!("  {:<9} {}", c::dim("share"), c::cyan(u.as_str().unwrap_or("")));
+    }
+    if running && (share || v["webRemote"].as_bool().unwrap_or(false)) {
         println!("{}", c::dim("  Plain HTTP: use on a trusted network or over a VPN such as Tailscale."));
     }
 }
@@ -805,6 +811,8 @@ fn cmd_remote(args: &[String]) -> R {
             ("password-stdin", "", false),
             ("code", "", true),
             ("json", "", false),
+            ("local", "", false),
+            ("network", "", false),
         ],
     )?;
     let cl = client::connect(true)?;
@@ -832,6 +840,13 @@ fn cmd_remote(args: &[String]) -> R {
     if a.has("read-only") {
         patch.insert("allowControl".into(), json!(false));
     }
+    if a.has("local") {
+        patch.insert("webRemote".into(), json!(false));
+    }
+    if a.has("network") {
+        patch.insert("webRemote".into(), json!(true));
+    }
+    let arg = a.pos.get(1).map(String::as_str);
     match sub {
         "status" if patch.is_empty() => {
             if a.has("json") {
@@ -854,7 +869,25 @@ fn cmd_remote(args: &[String]) -> R {
         "passwd" | "password" => {
             patch.insert("password".into(), json!(ask_new_password(a.has("password-stdin"))?));
         }
-        other => return Err(format!("unknown remote command {other:?} (on, off, passwd, status)")),
+        "web" => match arg {
+            Some("local") => {
+                patch.insert("webRemote".into(), json!(false));
+            }
+            Some("network" | "remote") => {
+                patch.insert("webRemote".into(), json!(true));
+            }
+            _ => return Err("usage: lstack remote web local|network".into()),
+        },
+        "share" | "sharing" => match arg {
+            Some("on") => {
+                patch.insert("sharing".into(), json!(true));
+            }
+            Some("off") => {
+                patch.insert("sharing".into(), json!(false));
+            }
+            _ => return Err("usage: lstack remote share on|off".into()),
+        },
+        other => return Err(format!("unknown remote command {other:?} (on, off, web, share, passwd, status)")),
     }
     let v: serde_json::Value = cl.req("PUT", "/api/remote", Some(serde_json::Value::Object(patch)))?;
     print_remote(&v);
