@@ -275,7 +275,23 @@ fn machines_pair_and_proxy() {
         .unwrap();
     client.post("/api/services/web/start", None).unwrap();
     let want_url = format!("http://localhost:{web_port}");
-    wait_until("url detection", 20, || client.svc("web")["urls"].as_array().is_some_and(|u| u.iter().any(|u| u["url"] == json!(want_url))));
+    // First the server must be up (python's first launch can be slow on a fresh CI runner)…
+    let up = || std::net::TcpStream::connect(("127.0.0.1", web_port)).is_ok();
+    let t0 = Instant::now();
+    while !up() && t0.elapsed() < Duration::from_secs(90) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(up(), "web server never listened on {web_port}: {}\nlogs:\n{}", client.svc("web"), client.logs("web"));
+    // …then it is detected within a couple of 5 s sampling rounds.
+    let found = || client.svc("web")["urls"].as_array().is_some_and(|u| u.iter().any(|u| u["url"] == json!(want_url)));
+    let t1 = Instant::now();
+    while !found() && t1.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !found() {
+        let lsof = Command::new("/usr/sbin/lsof").args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"]).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        panic!("url {want_url} not detected (server up after {:?}): {}\nlsof: {lsof:?}", t0.elapsed() - t1.elapsed(), client.svc("web"));
+    }
     let u = &client.svc("web")["urls"][0];
     assert_eq!(u["source"], "detected");
     assert_eq!(u["localOnly"], true);

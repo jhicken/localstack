@@ -305,7 +305,7 @@ mod port_tests {
     async fn finds_own_listener() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        let Some(m) = listening_ports().await else { return };
+        let m = listening_ports().await.expect("lsof failed or timed out");
         let mine = m.get(&(std::process::id() as i32)).cloned().unwrap_or_default();
         assert!(mine.iter().any(|x| x.port == port && x.loopback()), "{mine:?}");
     }
