@@ -30,6 +30,11 @@ fn help() -> String {
   lstack setup status|repair|uninstall
   lstack remote [on|off|passwd|2fa|status]   web dashboard for other machines (see below)
   lstack terminal [terminal|iterm|cmux|ghostty]   app used to open the dashboard / attach
+  lstack terminal cmux --fix     let LStack open cmux workspaces (socket password mode)
+  lstack secret set|ls|rm|rotate-key|unlock   write-only secrets passed to services as env vars
+  lstack ps [--machine <m>]      busy processes (over the CPU/mem/net thresholds), per machine
+  lstack machine ls|add|rm|rename   watch other Macs (their services show up everywhere)
+  lstack heartbeat [status|key|machine|set|off|test]   healthchecks.io-compatible pings
   lstack daemon run|start|stop|restart|status|logs
   lstack reload                  re-read {}
 
@@ -56,6 +61,20 @@ fn help() -> String {
   lstack remote passwd [--user <name>] [--password-stdin]
   lstack remote 2fa on|off       authenticator-app codes (TOTP) at sign-in
   lstack remote off
+  lstack remote pair             one-time code another Mac uses to watch this one
+  lstack remote peers [rm <id>]  machines that watch this one (revoke access)
+
+{}
+  lstack machine add studio.local --code K7QP-3M9X [--name studio]
+  lstack machine add 100.64.1.2 --user admin     sign in with its dashboard password (+2FA)
+  lstack ls                      services grouped by machine; address them as name@machine
+  lstack logs api@studio -f      lstack restart worker@studio
+
+{}
+  lstack heartbeat key                           healthchecks.io project ping key (stored encrypted)
+  lstack heartbeat set api [--slug api | --url https://hc-ping.com/<uuid>] [--interval 60]
+  lstack heartbeat machine <slug|url>            ping while this Mac + LStack are up
+  lstack heartbeat test [service]
 
 {}
   lstack add api -a -c ~/code/api -- npm run dev
@@ -70,6 +89,8 @@ fn help() -> String {
         paths::services_dir().display(),
         c::bold("Add options"),
         c::bold("Remote access"),
+        c::bold("Other machines"),
+        c::bold("Heartbeats (healthchecks.io)"),
         c::bold("Examples"),
     )
 }
@@ -104,6 +125,10 @@ pub fn main(argv: Vec<String>) -> i32 {
         "setup" => setup::run(&rest),
         "remote" => cmd_remote(&rest),
         "terminal" => cmd_terminal(&rest),
+        "secret" | "secrets" => crate::cli_more::cmd_secret(&rest),
+        "machine" | "machines" => crate::cli_more::cmd_machine(&rest),
+        "ps" | "processes" => crate::cli_more::cmd_ps(&rest),
+        "heartbeat" | "heartbeats" | "hc" => crate::cli_more::cmd_heartbeat(&rest),
         "startup" => cmd_startup(&rest),
         "daemon" => return cmd_daemon(&rest),
         "reload" => (|| {
@@ -134,13 +159,13 @@ pub fn main(argv: Vec<String>) -> i32 {
 // ------------------------------------------------------------------ arg parsing
 
 #[derive(Default)]
-struct Args {
-    pos: Vec<String>,
+pub(crate) struct Args {
+    pub pos: Vec<String>,
     flags: std::collections::HashMap<String, Vec<String>>,
 }
 impl Args {
     /// `spec`: (long, short, takes_value). Everything after `--` is positional.
-    fn parse(args: &[String], spec: &[(&str, &str, bool)]) -> Result<Args, String> {
+    pub(crate) fn parse(args: &[String], spec: &[(&str, &str, bool)]) -> Result<Args, String> {
         let mut out = Args::default();
         let mut i = 0;
         while i < args.len() {
@@ -184,13 +209,13 @@ impl Args {
         }
         Ok(out)
     }
-    fn get(&self, k: &str) -> Option<&str> {
+    pub(crate) fn get(&self, k: &str) -> Option<&str> {
         self.flags.get(k).and_then(|v| v.last()).map(String::as_str)
     }
-    fn all(&self, k: &str) -> Vec<String> {
+    pub(crate) fn all(&self, k: &str) -> Vec<String> {
         self.flags.get(k).cloned().unwrap_or_default()
     }
-    fn has(&self, k: &str) -> bool {
+    pub(crate) fn has(&self, k: &str) -> bool {
         self.flags.contains_key(k)
     }
 }
@@ -205,21 +230,73 @@ fn uptime(s: &ServiceState) -> String {
 
 // ------------------------------------------------------------------ commands
 
+/// First URL of a service, for tables.
+fn url_cell(s: &ServiceState) -> String {
+    match s.urls.first() {
+        None => c::dim("—"),
+        Some(u) => {
+            let more = if s.urls.len() > 1 { c::dim(&format!(" +{}", s.urls.len() - 1)) } else { String::new() };
+            let warn = if u.local_only && s.machine.is_some() { c::yellow(" (local only)") } else { String::new() };
+            format!("{}{warn}{more}", c::cyan(&u.url))
+        }
+    }
+}
+
 fn cmd_list(args: &[String]) -> R {
-    let a = Args::parse(args, &[("json", "", false)])?;
-    let l = client::connect(true)?.list()?;
+    let a = Args::parse(args, &[("json", "", false), ("machine", "m", true), ("local", "", false)])?;
+    let cl = client::connect(true)?;
+    let l = cl.list()?;
+    let machines: serde_json::Value = if a.has("local") { serde_json::Value::Null } else { cl.req("GET", "/api/machines", None).unwrap_or_default() };
+    let local_name = machines["local"]["name"].as_str().unwrap_or("this mac").to_string();
+    let mut groups: Vec<(String, Vec<ServiceState>, String, Option<String>)> = vec![(local_name.clone(), l.services, "online".into(), None)];
+    for m in machines["machines"].as_array().into_iter().flatten() {
+        groups.push((
+            m["name"].as_str().unwrap_or("?").to_string(),
+            serde_json::from_value(m["services"].clone()).unwrap_or_default(),
+            m["status"].as_str().unwrap_or("?").to_string(),
+            m["error"].as_str().map(String::from),
+        ));
+    }
+    if let Some(want) = a.get("machine") {
+        groups.retain(|g| g.0 == want);
+        if groups.is_empty() {
+            return Err(format!("no machine named {want:?}"));
+        }
+    }
     if a.has("json") {
-        println!("{}", serde_json::to_string_pretty(&l.services).unwrap());
+        let all: Vec<&ServiceState> = groups.iter().flat_map(|g| g.1.iter()).collect();
+        println!("{}", serde_json::to_string_pretty(&all).unwrap());
         return Ok(());
     }
-    if l.services.is_empty() {
-        println!("{}", c::dim("No services yet. Add one with: lstack add <name> -- <command>"));
+    let multi = groups.len() > 1;
+    for (name, services, status, err) in &groups {
+        if multi {
+            let st = match status.as_str() {
+                "online" => String::new(),
+                s => c::red(&format!(" ({s})")),
+            };
+            println!("{}{st}", c::bold(&format!("── {name} ")));
+            if let Some(e) = err {
+                println!("{}", c::dim(&format!("   {e}")));
+            }
+        }
+        print_services(services, name == &local_name);
+    }
+    for e in l.config_errors {
+        eprintln!("{}", c::red(&format!("config error: {e}")));
+    }
+    Ok(())
+}
+
+fn print_services(services: &[ServiceState], local: bool) {
+    if services.is_empty() {
+        println!("{}", c::dim(if local { "No services yet. Add one with: lstack add <name> -- <command>" } else { "  no services" }));
     } else {
-        let rows: Vec<Vec<String>> = l
-            .services
+        let with_urls = services.iter().any(|s| !s.urls.is_empty());
+        let rows: Vec<Vec<String>> = services
             .iter()
             .map(|s| {
-                vec![
+                let mut row = vec![
                     format!("{} {}", c::status_dot(&s.status), c::bold(&s.name)),
                     c::dim(&s.kind),
                     if s.restart_at.is_some() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) },
@@ -229,15 +306,19 @@ fn cmd_list(args: &[String]) -> R {
                     uptime(s),
                     s.restarts.to_string(),
                     if s.autostart { c::cyan("✓") } else { c::dim("·") },
-                ]
+                ];
+                if with_urls {
+                    row.push(url_cell(s));
+                }
+                row
             })
             .collect();
-        println!("{}", c::table(&rows, &["NAME", "TYPE", "STATUS", "HEALTH", "CPU", "MEM", "UPTIME", "↺", "BOOT"]));
+        let mut headers = vec!["NAME", "TYPE", "STATUS", "HEALTH", "CPU", "MEM", "UPTIME", "↺", "BOOT"];
+        if with_urls {
+            headers.push("URL");
+        }
+        println!("{}", c::table(&rows, &headers));
     }
-    for e in l.config_errors {
-        eprintln!("{}", c::red(&format!("config error: {e}")));
-    }
-    Ok(())
 }
 
 fn cmd_show(args: &[String]) -> R {
@@ -262,6 +343,23 @@ fn cmd_show(args: &[String]) -> R {
         ("memory", c::bytes(met.map(|m| m.mem))),
         ("network", format!("↓ {}  ↑ {}", c::rate(met.and_then(|m| m.net_rx)), c::rate(met.and_then(|m| m.net_tx)))),
     ];
+    if let Some(m) = &s.machine {
+        kv.insert(0, ("machine", c::bold(m)));
+    }
+    for u in &s.urls {
+        let label = u.label.as_deref().map(|l| format!(" {}", c::dim(l))).unwrap_or_default();
+        let note = if u.local_only { c::dim(if s.machine.is_some() { " (bound to localhost there: not reachable from here)" } else { " (localhost only)" }) } else { String::new() };
+        kv.push(("url", format!("{}{label}{note}", c::cyan(&u.url))));
+    }
+    if let Some(hb) = &s.config.heartbeat {
+        let last = match &s.heartbeat {
+            None => c::dim("no ping yet"),
+            Some(h) if h.ok => c::green(&format!("✓ {} at {}", h.kind, c::local_time(h.last_ping))),
+            Some(h) => c::red(&format!("✗ {} at {}: {}", h.kind, c::local_time(h.last_ping), h.error.as_deref().unwrap_or("?"))),
+        };
+        let on = if hb.enabled == Some(false) { c::dim("off · ") } else { String::new() };
+        kv.push(("heartbeat", format!("{on}every {}s · {last}", hb.interval.unwrap_or(60.0))));
+    }
     if let Some(e) = &s.last_error {
         kv.push(("last error", c::red(e)));
     }
@@ -272,7 +370,11 @@ fn cmd_show(args: &[String]) -> R {
         println!("\n  {}{}", c::dim("cpu 1h  "), c::green(&c::sparkline(&m.iter().map(|x| x.cpu).collect::<Vec<_>>(), 60)));
         println!("  {}{}", c::dim("mem 1h  "), c::blue(&c::sparkline(&m.iter().map(|x| x.mem).collect::<Vec<_>>(), 60)));
     }
-    println!("\n{}\n{}", c::dim(&format!("# {}", config::service_file(&name).display())), config::to_yaml(&s.config).trim_end());
+    let src = match &s.machine {
+        Some(m) => format!("# on {m}"),
+        None => format!("# {}", config::service_file(&name).display()),
+    };
+    println!("\n{}\n{}", c::dim(&src), config::to_yaml(&s.config).trim_end());
     Ok(())
 }
 
@@ -515,7 +617,7 @@ pub fn fmt_line(l: &LogLine) -> String {
 }
 
 fn print_stream(cl: &Client, name: &str, tail: usize) -> R {
-    cl.stream(&format!("/api/services/{}/logs/stream?tail={tail}", client::enc(name)), |ev, v| {
+    cl.stream(&format!("{}/logs/stream?tail={tail}", client::svc_path(name)), |ev, v| {
         if ev != "log" {
             return true;
         }
@@ -589,17 +691,12 @@ pub const DEFAULT_SHELL: [&str; 3] = ["sh", "-c", "command -v bash >/dev/null &&
 
 fn cmd_exec(args: &[String]) -> R {
     let name = need(args.first())?;
-    let s = client::connect(true)?.get(&name)?;
-    let container = exec_container(&s)?;
-    let cmd: Vec<String> = if args.len() > 1 { args[1..].to_vec() } else { DEFAULT_SHELL.iter().map(|s| s.to_string()).collect() };
-    let st = std::process::Command::new(crate::daemon::docker_api::docker_bin())
-        .arg("exec")
-        .arg(if std::io::stdin().is_terminal() { "-it" } else { "-i" })
-        .arg(&container)
-        .args(&cmd)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if st.success() { Ok(()) } else { Err(String::new()) }
+    let cl = client::connect(true)?;
+    // Runs through the daemon so output gets the same secret scrubbing as logs.
+    match crate::daemon::exec::run_client(&cl.info, &name, &args[1..])? {
+        0 => Ok(()),
+        code => std::process::exit(code),
+    }
 }
 
 fn cmd_metrics(args: &[String]) -> R {
@@ -633,7 +730,7 @@ fn cmd_metrics(args: &[String]) -> R {
 }
 
 /// Back-compat alias for `setup` (login items only).
-fn read_password(prompt: &str, stdin_only: bool) -> Result<String, String> {
+pub(crate) fn read_password(prompt: &str, stdin_only: bool) -> Result<String, String> {
     let stdin = std::io::stdin();
     if stdin_only || !stdin.is_terminal() {
         let mut s = String::new();
@@ -712,6 +809,9 @@ fn cmd_remote(args: &[String]) -> R {
     )?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("status");
+    if matches!(sub, "pair" | "peers") {
+        return crate::cli_more::cmd_remote_peers(&cl, sub, &a.pos[1..], a.has("json"));
+    }
     if matches!(sub, "2fa" | "totp" | "otp") {
         return remote_2fa(&cl, a.pos.get(1).map(String::as_str).unwrap_or("status"), a.get("code"));
     }
@@ -830,6 +930,18 @@ fn qr_lines(data: &str) -> Option<String> {
 
 fn cmd_terminal(args: &[String]) -> R {
     let cl = client::connect(true)?;
+    if args.first().map(String::as_str) == Some("cmux") && args.iter().any(|a| a == "--fix") {
+        let v: serde_json::Value = cl.req("POST", "/api/terminal/cmux/enable-password", None)?;
+        println!("{} cmux socket control set to password mode; LStack keeps the password in its secret store", c::green("✓"));
+        if let Some(b) = v["backup"].as_str() {
+            println!("  {:<8} {b}", c::dim("backup"));
+        }
+        if let Some(n) = v["note"].as_str() {
+            println!("  {}", c::yellow(n));
+        }
+        println!("{}", c::dim("  You can change or reset the password any time in cmux Settings → Automation."));
+    }
+    let args: Vec<String> = args.iter().filter(|a| *a != "--fix").cloned().collect();
     let v: serde_json::Value = match args.first() {
         Some(t) => cl.req("PUT", "/api/settings", Some(json!({ "terminal": t })))?,
         None => cl.req("GET", "/api/settings", None)?,
@@ -841,6 +953,13 @@ fn cmd_terminal(args: &[String]) -> R {
         let mark = if id == cur { c::green("●") } else { c::dim("○") };
         let note = if installed { String::new() } else { c::dim("  (not installed)") };
         println!("{mark} {:<9} {}{note}", id, t["name"].as_str().unwrap_or(""));
+    }
+    let cm = &v["cmux"];
+    if cm["installed"].as_bool().unwrap_or(false) {
+        let mode = cm["mode"].as_str().unwrap_or("?");
+        let ok = mode == "allowAll" || (mode == "password" && cm["hasPassword"].as_bool().unwrap_or(false));
+        let note = if ok { c::green("LStack can open workspaces") } else { c::yellow("LStack may be blocked — fix with: lstack terminal cmux --fix") };
+        println!("{}", c::dim(&format!("cmux socket control: {mode}")) + "  " + &note);
     }
     if args.is_empty() {
         println!("{}", c::dim("change with: lstack terminal <id>"));

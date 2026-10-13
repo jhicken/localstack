@@ -25,7 +25,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 pub const DEFAULT_PORT: u16 = 7380;
-const SESSION_TTL_MS: i64 = 12 * 3600_000;
+const SESSION_TTL_MS: i64 = 12 * 3_600_000;
 const COOKIE: &str = "lstack_session";
 const PBKDF2_ROUNDS: u32 = 120_000;
 const MAX_FAILURES: u32 = 5;
@@ -47,6 +47,27 @@ pub struct RemoteConfig {
     pub allow_control: bool,
     /// Base32 TOTP secret; empty = two-factor login off.
     pub totp_secret: String,
+    /// Machines allowed to watch this one through `/peer/api` (bearer tokens, stored hashed).
+    pub peer_tokens: Vec<PeerToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PeerToken {
+    pub id: String,
+    /// Name the host machine gave when pairing.
+    pub name: String,
+    /// sha256 of the token, hex.
+    pub hash: String,
+    pub created_at: i64,
+    pub last_seen: Option<i64>,
+}
+
+const PAIR_CODE_TTL_MS: i64 = 10 * 60_000;
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::Digest;
+    hex(&sha2::Sha256::digest(s.as_bytes()))
 }
 
 impl Default for RemoteConfig {
@@ -59,6 +80,7 @@ impl Default for RemoteConfig {
             password_hash: String::new(),
             allow_control: false,
             totp_secret: String::new(),
+            peer_tokens: vec![],
         }
     }
 }
@@ -137,6 +159,8 @@ pub struct Remote {
     totp_last_step: Mutex<u64>,
     /// Bumped whenever the listener or credentials change; open streams and stale routers stop serving.
     gen: watch::Sender<u64>,
+    /// One-time pairing code shown to the user (code, expires at ms).
+    pair_code: Mutex<Option<(String, i64)>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -161,7 +185,81 @@ impl Remote {
             totp_pending: Mutex::new(None),
             totp_last_step: Mutex::new(0),
             gen: watch::channel(0).0,
+            pair_code: Mutex::new(None),
         })
+    }
+
+    /// New one-time code another machine can use to pair with this one (valid 10 minutes).
+    pub fn new_pair_code(&self) -> Result<Value, ApiErr> {
+        if !self.config().enabled {
+            return Err(ApiErr::new(400, "turn on remote access first (lstack remote on) so other machines can reach this one"));
+        }
+        const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let raw = random_hex(8);
+        let code: String = raw.as_bytes().chunks(2).map(|c| ALPHABET[u8::from_str_radix(std::str::from_utf8(c).unwrap_or("0"), 16).unwrap_or(0) as usize % ALPHABET.len()] as char).collect();
+        let exp = now_ms() + PAIR_CODE_TTL_MS;
+        *self.pair_code.lock().unwrap() = Some((code.clone(), exp));
+        Ok(json!({ "code": format!("{}-{}", &code[..4], &code[4..]), "expiresAt": exp, "urls": self.status()["urls"] }))
+    }
+
+    fn take_pair_code(&self, code: &str) -> bool {
+        let want: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_uppercase();
+        let mut pc = self.pair_code.lock().unwrap();
+        match &*pc {
+            Some((c, exp)) if *exp > now_ms() && ct_eq(c.as_bytes(), want.as_bytes()) => {
+                *pc = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn issue_peer_token(&self, name: &str) -> Result<String, ApiErr> {
+        let token = format!("lsp_{}", random_hex(32));
+        let mut cfg = self.config();
+        cfg.peer_tokens.push(PeerToken {
+            id: random_hex(4),
+            name: name.chars().take(64).collect(),
+            hash: sha256_hex(&token),
+            created_at: now_ms(),
+            last_seen: None,
+        });
+        save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
+        *self.cfg.lock().unwrap() = cfg;
+        Ok(token)
+    }
+
+    /// Which paired machine a bearer token belongs to (updates last-seen at most once a minute).
+    fn peer_for(&self, token: &str) -> Option<String> {
+        let h = sha256_hex(token);
+        let mut cfg = self.cfg.lock().unwrap();
+        let now = now_ms();
+        let p = cfg.peer_tokens.iter_mut().find(|p| ct_eq(p.hash.as_bytes(), h.as_bytes()))?;
+        let name = p.name.clone();
+        if p.last_seen.is_none_or(|t| now - t > 60_000) {
+            p.last_seen = Some(now);
+            let snapshot = cfg.clone();
+            drop(cfg);
+            let _ = save_config(&snapshot);
+        }
+        Some(name)
+    }
+
+    pub fn peer_tokens(&self) -> Value {
+        let cfg = self.config();
+        json!(cfg.peer_tokens.iter().map(|p| json!({ "id": p.id, "name": p.name, "createdAt": p.created_at, "lastSeen": p.last_seen })).collect::<Vec<_>>())
+    }
+
+    pub fn revoke_peer(&self, id: &str) -> Result<(), ApiErr> {
+        let mut cfg = self.config();
+        let before = cfg.peer_tokens.len();
+        cfg.peer_tokens.retain(|p| p.id != id && p.name != id);
+        if cfg.peer_tokens.len() == before {
+            return Err(ApiErr::new(404, format!("no paired machine {id:?}")));
+        }
+        save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
+        *self.cfg.lock().unwrap() = cfg;
+        Ok(())
     }
 
     fn generation(&self) -> u64 {
@@ -435,9 +533,37 @@ fn router(app: AppState, remote: Arc<Remote>, gen: u64) -> Router {
         .route("/api/services/:name/:action", post(action))
         .route("/api/events", get(events))
         .route("/api/logout", post(logout))
+        .route("/api/processes", get(|State(rs): State<RState>| async move { server::processes(State(rs.app)).await.into_response() }))
+        .route("/api/machines", get(|State(rs): State<RState>| async move { server::machines_list(State(rs.app)).await.into_response() }))
+        .route("/api/machines/:m", get(|State(rs): State<RState>, p: Path<String>| async move { server::machine_get(State(rs.app), p).await.into_response() }))
+        .route("/api/machines/:m/services/:name", get(|State(rs): State<RState>, p: Path<(String, String)>| async move { server::m_service(State(rs.app), p).await.into_response() }))
+        .route("/api/machines/:m/services/:name/logs", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_logs(State(rs.app), p, q).await.into_response() }))
+        .route("/api/machines/:m/services/:name/logs/stream", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_log_stream(State(rs.app), p, q).await.into_response() }))
+        .route("/api/machines/:m/services/:name/metrics", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_metrics(State(rs.app), p, q).await.into_response() }))
+        .route(
+            "/api/machines/:m/services/:name/:action",
+            post(|State(rs): State<RState>, p: Path<(String, String, String)>| async move {
+                let allowed = rs.remote.config().allow_control;
+                server::m_action(State(rs.app), p, allowed).await.into_response()
+            }),
+        )
         .layer(middleware::from_fn_with_state(rs.clone(), require_session));
+    let peer = Router::new()
+        .route("/peer/api/info", get(peer_info))
+        .route("/peer/api/services", get(list))
+        .route("/peer/api/services/:name", get(get_one))
+        .route("/peer/api/services/:name/logs", get(logs))
+        .route("/peer/api/services/:name/logs/stream", get(log_stream))
+        .route("/peer/api/services/:name/metrics", get(metrics))
+        .route("/peer/api/services/:name/:action", post(action))
+        .route("/peer/api/system", get(|State(rs): State<RState>| async move { Json(rs.app.sup.system()) }))
+        .route("/peer/api/processes", get(|State(rs): State<RState>| async move { Json(json!({ "processes": *rs.app.sup.processes() })) }))
+        .route("/peer/api/events", get(peer_events))
+        .layer(middleware::from_fn_with_state(rs.clone(), require_peer));
     Router::new()
         .route("/", get(|| async { asset("text/html; charset=utf-8", INDEX_HTML.as_bytes()) }))
+        .route("/peer/pair", post(pair))
+        .merge(peer)
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", APP_JS.as_bytes()) }))
         .route("/app.css", get(|| async { asset("text/css; charset=utf-8", APP_CSS.as_bytes()) }))
         .route("/icon.png", get(|| async { asset("image/png", ICON_PNG) }))
@@ -498,6 +624,81 @@ async fn require_session(State(rs): State<RState>, req: Request, next: Next) -> 
         return ApiErr::new(401, "login required").into_response();
     }
     next.run(req).await
+}
+
+async fn require_peer(State(rs): State<RState>, req: Request, next: Next) -> Response {
+    if bearer(&req).and_then(|t| rs.remote.peer_for(&t)).is_none() {
+        return ApiErr::new(401, "invalid or revoked peer token").into_response();
+    }
+    next.run(req).await
+}
+
+async fn peer_info(State(rs): State<RState>) -> Json<Value> {
+    Json(json!({
+        "hostname": hostname(),
+        "version": VERSION,
+        "allowControl": rs.remote.config().allow_control,
+        "cores": super::procinfo::host_cores(),
+        "memTotal": super::procinfo::host_mem_total(),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairReq {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    totp: Option<String>,
+    host_name: String,
+}
+
+/// Exchange a one-time pairing code, or this machine's dashboard login (+2FA), for a peer token.
+async fn pair(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
+    let ip = peer.ip();
+    let now = now_ms();
+    {
+        let mut f = rs.remote.failures.lock().unwrap();
+        f.retain(|_, (_, last)| now - *last < LOCKOUT_MS);
+        if f.get(&ip).is_some_and(|(n, _)| *n >= MAX_FAILURES) {
+            return ApiErr::new(429, "too many failed attempts, try again in a few minutes").into_response();
+        }
+    }
+    let Ok(r) = serde_json::from_slice::<PairReq>(&body) else {
+        return ApiErr::new(400, "invalid JSON body").into_response();
+    };
+    let ok = if let Some(code) = r.code.as_deref() {
+        rs.remote.take_pair_code(code)
+    } else {
+        let cfg = rs.remote.config();
+        let user_ok = ct_eq(r.username.as_deref().unwrap_or("").as_bytes(), cfg.username.as_bytes());
+        let stored = cfg.password_hash.clone();
+        let password = r.password.clone().unwrap_or_default();
+        let pass_ok = !stored.is_empty() && tokio::task::spawn_blocking(move || verify_password(&password, &stored)).await.unwrap_or(false);
+        user_ok && pass_ok && (cfg.totp_secret.is_empty() || rs.remote.totp_check(&cfg.totp_secret, r.totp.as_deref()))
+    };
+    if !ok {
+        {
+            let mut f = rs.remote.failures.lock().unwrap();
+            let e = f.entry(ip).or_insert((0, now));
+            *e = (e.0 + 1, now);
+        }
+        println!("{} remote: failed pairing attempt from {ip}", paths::iso(now));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        return ApiErr::new(401, "invalid or expired pairing code / credentials").into_response();
+    }
+    rs.remote.failures.lock().unwrap().remove(&ip);
+    match rs.remote.issue_peer_token(&r.host_name) {
+        Ok(token) => {
+            println!("{} remote: paired with {} ({ip})", paths::iso(now), r.host_name);
+            Json(json!({ "token": token, "hostname": hostname(), "version": VERSION })).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -578,11 +779,17 @@ async fn session(State(rs): State<RState>, req: Request) -> Json<Value> {
     }))
 }
 
-/// Environment values often hold secrets; never send them to remote browsers.
-fn redact(mut s: ServiceState) -> ServiceState {
+/// Environment values often hold secrets, and heartbeat ping URLs embed a check UUID or ping key;
+/// never send them to remote browsers or peers.
+pub(super) fn redact(mut s: ServiceState) -> ServiceState {
     if let Some(env) = s.config.env.as_mut() {
         for v in env.values_mut() {
             *v = "••••".into();
+        }
+    }
+    if let Some(hb) = s.config.heartbeat.as_mut() {
+        if hb.url.is_some() {
+            hb.url = Some("••••".into());
         }
     }
     s
@@ -609,7 +816,20 @@ async fn metrics(State(rs): State<RState>, p: Path<String>, q: Q) -> Response {
     server::metrics(State(rs.app), p, q).await.into_response()
 }
 async fn events(State(rs): State<RState>) -> Response {
-    server::events_stream(rs.app, true).await
+    let remote = rs.remote.clone();
+    let gen = rs.gen;
+    server::events_stream(rs.app, true, true, Some(Box::new(move || remote.generation() == gen))).await
+}
+async fn peer_events(State(rs): State<RState>, req: Request) -> Response {
+    let hash = bearer(&req).map(|t| sha256_hex(&t)).unwrap_or_default();
+    let remote = rs.remote.clone();
+    let gen = rs.gen;
+    let alive = move || remote.generation() == gen && remote.config().peer_tokens.iter().any(|p| p.hash == hash);
+    server::events_stream(rs.app, true, false, Some(Box::new(alive))).await
+}
+
+fn bearer(req: &Request) -> Option<String> {
+    req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::to_string)
 }
 
 async fn action(State(rs): State<RState>, Path((name, action)): Path<(String, String)>) -> Result<Json<ServiceState>, ApiErr> {
@@ -645,23 +865,12 @@ mod tests {
     fn redacts_env() {
         let mut cfg = crate::types::ServiceConfig { name: "db".into(), ..Default::default() };
         cfg.env = Some([("PASSWORD".to_string(), "hunter2".to_string())].into());
-        let s = ServiceState {
-            name: "db".into(),
-            kind: "docker".into(),
-            description: None,
-            autostart: false,
-            tags: vec![],
-            status: "running".into(),
-            health: "none".into(),
-            pid: None,
-            started_at: None,
-            exit_code: None,
-            restarts: 0,
-            restart_at: None,
-            last_error: None,
-            metrics: None,
-            config: cfg,
-        };
-        assert_eq!(redact(s).config.env.unwrap()["PASSWORD"], "••••");
+        let s = ServiceState { name: "db".into(), kind: "docker".into(), config: cfg, ..Default::default() };
+        let mut s = redact(s);
+        assert_eq!(s.config.env.take().unwrap()["PASSWORD"], "••••");
+        let mut cfg = crate::types::ServiceConfig { name: "api".into(), ..Default::default() };
+        cfg.heartbeat = Some(crate::types::Heartbeat { url: Some("https://hc-ping.com/abc-uuid".into()), ..Default::default() });
+        let s = ServiceState { name: "api".into(), kind: "process".into(), config: cfg, ..Default::default() };
+        assert_eq!(redact(s).config.heartbeat.unwrap().url.as_deref(), Some("••••"));
     }
 }

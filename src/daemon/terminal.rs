@@ -11,6 +11,48 @@ pub struct Settings {
     /// Terminal app for the dashboard / attach / shell buttons: terminal, iterm, cmux, ghostty.
     /// Empty (or not installed) = Terminal.
     pub terminal: String,
+    /// healthchecks.io-compatible pings (the ping key lives in the secret store).
+    pub healthchecks: Healthchecks,
+    /// Which non-service processes show up in the process breakdown.
+    pub processes: ProcessThresholds,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Healthchecks {
+    /// Ping server, e.g. https://hc-ping.com or a self-hosted Healthchecks instance.
+    pub base_url: String,
+    /// Log lines attached to `/fail` pings.
+    pub log_lines: usize,
+    /// Whole-machine heartbeat (pinged while the daemon runs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<crate::types::Heartbeat>,
+}
+
+impl Default for Healthchecks {
+    fn default() -> Self {
+        Healthchecks { base_url: "https://hc-ping.com".into(), log_lines: 20, machine: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProcessThresholds {
+    pub enabled: bool,
+    /// % of one core.
+    pub cpu: f64,
+    /// % of physical memory.
+    pub mem: f64,
+    /// Bytes/s (rx + tx).
+    pub net: f64,
+    /// Rows per machine.
+    pub max: usize,
+}
+
+impl Default for ProcessThresholds {
+    fn default() -> Self {
+        ProcessThresholds { enabled: true, cpu: 10.0, mem: 10.0, net: 1_048_576.0, max: 15 }
+    }
 }
 
 /// (id, display name, app bundle name)
@@ -76,6 +118,7 @@ pub fn full_disk_access() -> bool {
 }
 
 pub fn status() -> Value {
+    let settings = load();
     let terminals: Vec<Value> = TERMINALS
         .iter()
         .map(|(id, name, bundle)| json!({ "id": id, "name": name, "installed": app_path(bundle).is_some() }))
@@ -85,6 +128,9 @@ pub fn status() -> Value {
         "terminals": terminals,
         "fullDiskAccess": full_disk_access(),
         "helperPath": paths::self_exe(),
+        "cmux": cmux_status(),
+        "healthchecks": super::heartbeat::settings_status(&settings.healthchecks),
+        "processes": settings.processes,
     })
 }
 
@@ -129,8 +175,9 @@ fn osascript(script: &str) -> Result<(), String> {
     spawn(Command::new("/usr/bin/osascript").args(["-e", script]))
 }
 
-/// Open the preferred terminal app running `lstack <args>`.
-pub fn open(args: &[&str]) -> Result<(), String> {
+/// Open the preferred terminal app running `lstack <args>`; `term` overrides the configured app
+/// (e.g. "terminal" as a fallback when cmux refuses LStack).
+pub fn open_with(args: &[&str], term: Option<&str>) -> Result<(), String> {
     let exe = paths::self_exe().to_string_lossy().into_owned();
     let env = lstack_env();
     let mut argv: Vec<&str> = Vec::new();
@@ -142,19 +189,13 @@ pub fn open(args: &[&str]) -> Result<(), String> {
     argv.extend(args.iter().copied());
     let line: Vec<String> = argv.iter().copied().map(shell_quote).collect();
     let line = line.join(" ");
-    let term = current();
+    let term: &str = term.and_then(|t| TERMINALS.iter().find(|x| x.0 == t)).map(|x| x.0).unwrap_or_else(current);
     let res = match term {
         "iterm" => osascript(&format!(
             "tell application \"iTerm\"\n  activate\n  set w to (create window with default profile)\n  tell current session of w to write text {}\nend tell",
             applescript_str(&line)
         )),
-        "cmux" => {
-            let app = app_path("cmux.app").unwrap_or_default();
-            let cli = app.join("Contents/Resources/bin/cmux");
-            let title = format!("lstack {}", args.join(" "));
-            spawn(Command::new(&cli).args(["new-workspace", "--name", title.trim(), "--focus", "true", "--command", &line]))
-                .and_then(|_| spawn(Command::new("/usr/bin/open").arg(&app)))
-        }
+        "cmux" => open_cmux(args, &line),
         "ghostty" => {
             let mut c = Command::new("/usr/bin/open");
             c.args(["-na", "Ghostty", "--args", "-e"]).args(&argv);
@@ -165,7 +206,114 @@ pub fn open(args: &[&str]) -> Result<(), String> {
             applescript_str(&line)
         )),
     };
-    res.map_err(|e| format!("couldn't open {term}: {e}"))
+    res.map_err(|e| if e.starts_with(CMUX_DENIED) { e } else { format!("couldn't open {term}: {e}") })
+}
+
+// ------------------------------------------------------------------ cmux
+
+/// Prefix of the error returned when cmux refuses LStack's socket connection.
+pub const CMUX_DENIED: &str = "cmux-denied";
+/// Internal secret holding the cmux socket password LStack set up.
+pub const CMUX_SECRET: &str = "LSTACK_CMUX_PASSWORD";
+
+fn cmux_cli() -> Option<PathBuf> {
+    app_path("cmux.app").map(|a| a.join("Contents/Resources/bin/cmux")).filter(|p| p.exists())
+}
+
+fn cmux_config_path() -> PathBuf {
+    paths::user_home().join(".config/cmux/cmux.json")
+}
+
+fn cmux_cmd(cli: &PathBuf) -> Command {
+    let mut c = Command::new(cli);
+    if let Some(pw) = super::secrets::internal_get(CMUX_SECRET) {
+        c.env("CMUX_SOCKET_PASSWORD", pw);
+    }
+    c
+}
+
+fn is_denied(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    e.contains("access denied") || e.contains("only processes started inside cmux") || e.contains("password") || e.contains("unauthorized")
+}
+
+fn open_cmux(args: &[&str], line: &str) -> Result<(), String> {
+    let cli = cmux_cli().ok_or("cmux isn't installed")?;
+    let app = app_path("cmux.app").unwrap_or_default();
+    let title = format!("lstack {}", args.join(" "));
+    let create = || spawn(cmux_cmd(&cli).args(["workspace", "create", "--name", title.trim(), "--focus", "true", "--command", line]));
+    let res = match create() {
+        // Not running yet: launch it, give the socket a moment, try once more.
+        Err(e) if !is_denied(&e) => {
+            let _ = spawn(Command::new("/usr/bin/open").arg(&app));
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            create()
+        }
+        r => r,
+    };
+    match res {
+        Ok(()) => spawn(Command::new("/usr/bin/open").arg(&app)),
+        Err(e) if is_denied(&e) => Err(format!(
+            "{CMUX_DENIED}: cmux only accepts connections from processes it started (Settings → Automation → Socket control). \
+             Allow LStack with a socket password, or use another terminal app. ({e})"
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// cmux's socket-control mode and whether LStack holds a password for it.
+pub fn cmux_status() -> Value {
+    let cfg: Value = std::fs::read(cmux_config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    json!({
+        "installed": cmux_cli().is_some(),
+        "mode": cfg["automation"]["socketControlMode"].as_str().unwrap_or("cmuxOnly"),
+        "hasPassword": super::secrets::internal_get(CMUX_SECRET).is_some(),
+        "configPath": cmux_config_path(),
+    })
+}
+
+/// Switch cmux to password socket mode with a random password LStack keeps in its secret store.
+/// Backs up cmux.json first. Returns status plus whether cmux picked up the change live.
+pub fn cmux_enable_password() -> Result<Value, String> {
+    let cli = cmux_cli().ok_or("cmux isn't installed")?;
+    let path = cmux_config_path();
+    let mut cfg: Value = match std::fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| {
+            format!("{} isn't plain JSON ({e}); set Automation → Socket control to “Password” in cmux Settings instead", path.display())
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    if !cfg.is_object() {
+        return Err(format!("{} must contain a JSON object", path.display()));
+    }
+    let mut backup = None;
+    if path.exists() {
+        let b = path.with_file_name(format!("cmux.json.{}.bak", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+        std::fs::copy(&path, &b).map_err(|e| format!("cannot back up {}: {e}", path.display()))?;
+        backup = Some(b);
+    }
+    let pw = super::remote::random_hex(24);
+    super::secrets::set(CMUX_SECRET, &pw)?;
+    if !cfg["automation"].is_object() {
+        cfg["automation"] = json!({});
+    }
+    cfg["automation"]["socketControlMode"] = json!("password");
+    cfg["automation"]["socketPassword"] = json!(pw);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.lstack-tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&cfg).unwrap_or_default()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    let reloaded = spawn(cmux_cmd(&cli).arg("reload-config")).is_ok();
+    let mut st = cmux_status();
+    st["reloaded"] = json!(reloaded);
+    st["backup"] = json!(backup);
+    if !reloaded {
+        st["note"] = json!("Saved. If cmux still refuses, reload its config from the command palette or restart cmux.");
+    }
+    Ok(st)
 }
 
 #[cfg(test)]

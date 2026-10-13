@@ -25,6 +25,10 @@ pub enum Event {
     Removed(String),
     Metrics(String, MetricSample),
     System(SystemSample),
+    /// Processes over the usage thresholds (whole machine, excluding service processes).
+    Processes(Arc<Vec<crate::types::ProcInfo>>),
+    /// Something changed on another machine (see `peers.rs`).
+    Peer(Arc<super::peers::PeerMsg>),
 }
 
 /// ~15 minutes of whole-machine samples at the 3 s cadence.
@@ -131,6 +135,10 @@ pub struct Managed {
     metrics: Option<MetricSample>,
     net: Option<Net>,
     pid_set: Vec<i32>,
+    pub urls: Vec<crate::types::ServiceUrl>,
+    pub heartbeat: Option<crate::types::HeartbeatStatus>,
+    /// Published docker/compose ports: (host port, loopback-only).
+    pub ext_ports: Vec<(u16, bool)>,
 }
 
 impl Managed {
@@ -163,8 +171,11 @@ impl Managed {
             exit_code: self.rt.exit_code,
             restarts: self.restarts,
             restart_at: self.restart_at,
-            last_error: self.rt.last_error.clone(),
+            last_error: self.rt.last_error.clone().map(crate::scrub::scrub_string),
             metrics: self.metrics,
+            urls: if self.rt.status == "running" { self.urls.clone() } else { vec![] },
+            heartbeat: self.heartbeat.clone(),
+            machine: None,
             config: self.pending.clone().unwrap_or_else(|| self.cfg.clone()),
         }
     }
@@ -196,6 +207,12 @@ pub struct Sup {
     host: Mutex<(HostSampler, std::collections::VecDeque<SystemSample>)>,
     docker_prev: Mutex<HashMap<String, (f64, f64)>>,
     loops: Mutex<Vec<AbortHandle>>,
+    /// Listening TCP sockets by pid, from the last `lsof` pass.
+    pub listen: Mutex<HashMap<i32, Vec<procinfo::Listen>>>,
+    all_cpu: Mutex<CpuSampler>,
+    /// pid → (rx+tx cumulative bytes, ts) and the derived rate, from nettop.
+    net_all: Mutex<HashMap<i32, (f64, i64, f64)>>,
+    procs: Mutex<Arc<Vec<crate::types::ProcInfo>>>,
 }
 
 pub struct BusyGuard {
@@ -220,6 +237,10 @@ impl Sup {
             host: Mutex::new((HostSampler::default(), std::collections::VecDeque::new())),
             docker_prev: Mutex::new(HashMap::new()),
             loops: Mutex::new(vec![]),
+            listen: Mutex::new(HashMap::new()),
+            all_cpu: Mutex::new(CpuSampler::default()),
+            net_all: Mutex::new(HashMap::new()),
+            procs: Mutex::new(Arc::new(vec![])),
         }))
     }
 
@@ -307,10 +328,13 @@ impl Sup {
         self.every(3_000, |s| async move {
             s.sample_processes().await;
             s.sample_system();
+            let s2 = s.clone();
+            let _ = tokio::task::spawn_blocking(move || s2.sample_all()).await;
         });
         self.every(5_000, |s| async move { s.sample_docker().await });
         self.every(30_000, |s| async move { s.sample_network().await });
         self.every(4_000, |s| async move { s.refresh_external().await });
+        self.every(5_000, |s| async move { s.sample_ports().await });
         self.every(3_600_000, |s| async move { s.store.prune(now_ms()) });
     }
 
@@ -500,6 +524,26 @@ impl Sup {
     pub fn get_state(&self, name: &str) -> R<ServiceState> {
         self.get(name, |m| m.state())
     }
+    pub fn configs(&self) -> Vec<ServiceConfig> {
+        self.lock().services.values().map(|m| m.cfg.clone()).collect()
+    }
+
+    /// Mask a newly added secret in logs already written (memory + files, including the daemon log).
+    pub fn rescrub_logs(&self) {
+        let stores: Vec<Arc<LogStore>> = self.lock().services.values().map(|m| m.logs.clone()).collect();
+        for l in stores {
+            l.rescrub();
+        }
+        if let Ok(rd) = std::fs::read_dir(paths::logs_dir()) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("_daemon") {
+                    super::logs::rescrub_file(&e.path());
+                }
+            }
+        }
+    }
+
     pub fn logs(&self, name: &str) -> R<Arc<LogStore>> {
         self.get(name, |m| m.logs.clone())
     }
@@ -522,6 +566,9 @@ impl Sup {
             metrics: None,
             net: None,
             pid_set: vec![],
+            urls: vec![],
+            heartbeat: None,
+            ext_ports: vec![],
         }
     }
 
@@ -760,6 +807,23 @@ impl Sup {
         self.write_state();
     }
 
+    /// Refresh listening sockets and recompute every service's URLs (events only on change).
+    async fn sample_ports(self: &Arc<Self>) {
+        let Some(map) = procinfo::listening_ports().await else { return };
+        *self.listen.lock().unwrap() = map;
+        let listen = self.listen.lock().unwrap().clone();
+        let mut g = self.lock();
+        for m in g.services.values_mut() {
+            let urls = service_urls(m, &listen);
+            if urls != m.urls {
+                m.urls = urls;
+                if m.rt.status == "running" {
+                    self.changed(m);
+                }
+            }
+        }
+    }
+
     fn sample_system(&self) {
         let cores = procinfo::host_cores() as f64;
         let (ls_cpu, ls_mem) = self
@@ -779,6 +843,59 @@ impl Sup {
         h.1.push_back(s);
         drop(h);
         let _ = self.events.send(Event::System(s));
+    }
+
+    /// Sample every visible process and publish the ones over the configured thresholds.
+    fn sample_all(&self) {
+        let th = super::terminal::load().processes;
+        if !th.enabled {
+            if !self.procs.lock().unwrap().is_empty() {
+                *self.procs.lock().unwrap() = Arc::new(vec![]);
+                let _ = self.events.send(Event::Processes(Arc::new(vec![])));
+            }
+            return;
+        }
+        let pids = procinfo::all_pids();
+        let groups: Vec<Vec<i32>> = pids.iter().map(|p| vec![*p]).collect();
+        let samples = self.all_cpu.lock().unwrap().sample(&groups);
+        let owned: HashMap<i32, String> = self
+            .lock()
+            .services
+            .values()
+            .flat_map(|m| m.pid_set.iter().map(move |p| (*p, m.cfg.name.clone())))
+            .collect();
+        let me = std::process::id() as i32;
+        let mem_limit = procinfo::host_mem_total() * th.mem / 100.0;
+        let net = self.net_all.lock().unwrap().clone();
+        let mut out: Vec<(f64, crate::types::ProcInfo)> = vec![];
+        for (pid, s) in pids.iter().zip(samples) {
+            if *pid == me || owned.contains_key(pid) || (s.cpu == 0.0 && s.mem == 0.0) {
+                continue;
+            }
+            let rate = net.get(pid).map(|n| n.2);
+            let score = [
+                if th.cpu > 0.0 { s.cpu / th.cpu } else { 0.0 },
+                if mem_limit > 0.0 && th.mem > 0.0 { s.mem / mem_limit } else { 0.0 },
+                if th.net > 0.0 { rate.unwrap_or(0.0) / th.net } else { 0.0 },
+            ]
+            .into_iter()
+            .fold(0.0, f64::max);
+            if score < 1.0 {
+                continue;
+            }
+            let name = procinfo::proc_name(*pid).unwrap_or_else(|| format!("pid {pid}"));
+            out.push((score, crate::types::ProcInfo { pid: *pid, name, cpu: s.cpu, mem: s.mem, net: rate, service: None }));
+        }
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        out.truncate(th.max.max(1));
+        let list: Vec<_> = out.into_iter().map(|x| x.1).collect();
+        let list = Arc::new(list);
+        *self.procs.lock().unwrap() = list.clone();
+        let _ = self.events.send(Event::Processes(list));
+    }
+
+    pub fn processes(&self) -> Arc<Vec<crate::types::ProcInfo>> {
+        self.procs.lock().unwrap().clone()
     }
 
     pub fn system(&self) -> serde_json::Value {
@@ -866,11 +983,25 @@ impl Sup {
             .filter(|m| m.cfg.kind == "process" && m.rt.status == "running")
             .map(|m| (m.cfg.name.clone(), if m.pid_set.is_empty() { m.rt.pid.into_iter().collect() } else { m.pid_set.clone() }))
             .collect();
-        if targets.is_empty() {
+        let breakdown = super::terminal::load().processes.enabled;
+        if targets.is_empty() && !breakdown {
             return;
         }
         let Some(net) = procinfo::network_table().await else { return };
         let now = now_ms();
+        {
+            let mut all = self.net_all.lock().unwrap();
+            let mut next = HashMap::new();
+            for (pid, (rx, tx)) in &net {
+                let total = rx + tx;
+                let rate = match all.get(pid) {
+                    Some(&(prev, ts, _)) if now > ts && total >= prev => (total - prev) / ((now - ts) as f64 / 1000.0),
+                    _ => 0.0,
+                };
+                next.insert(*pid, (total, now, rate));
+            }
+            *all = next;
+        }
         let mut g = self.lock();
         for (name, pids) in targets {
             let (rx, tx) = pids.iter().filter_map(|p| net.get(p)).fold((0.0, 0.0), |a, n| (a.0 + n.0, a.1 + n.1));
@@ -921,6 +1052,78 @@ impl Sup {
     }
 }
 
+/// Configured `urls:` first, then detected ports (unless `detectUrls: false`) as http://localhost:PORT.
+fn service_urls(m: &Managed, listen: &HashMap<i32, Vec<procinfo::Listen>>) -> Vec<crate::types::ServiceUrl> {
+    use crate::types::ServiceUrl;
+    if m.rt.status != "running" {
+        return vec![];
+    }
+    let mut out: Vec<ServiceUrl> = m
+        .cfg
+        .urls
+        .iter()
+        .flatten()
+        .map(|u| ServiceUrl {
+            url: u.url().to_string(),
+            label: u.label().map(String::from),
+            port: url_port(u.url()),
+            source: "config".into(),
+            local_only: false,
+        })
+        .collect();
+    if m.cfg.detect_urls == Some(false) {
+        return out;
+    }
+    let ports = if m.cfg.kind == "process" {
+        let pids: Vec<i32> = if m.pid_set.is_empty() { m.rt.pid.into_iter().collect() } else { m.pid_set.clone() };
+        procinfo::ports_of(pids.iter().filter_map(|p| listen.get(p)).flatten())
+    } else {
+        m.ext_ports.clone()
+    };
+    for (port, local_only) in ports {
+        if let Some(c) = out.iter_mut().find(|u| u.port == Some(port)) {
+            c.local_only = local_only;
+            continue;
+        }
+        out.push(ServiceUrl { url: format!("http://localhost:{port}"), label: None, port: Some(port), source: "detected".into(), local_only });
+    }
+    out
+}
+
+pub fn url_port(url: &str) -> Option<u16> {
+    let rest = url.split_once("://").map(|x| x.1).unwrap_or(url);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    match host.rsplit_once(':') {
+        Some((_, p)) if !p.contains(']') => p.parse().ok(),
+        _ if url.starts_with("https://") => Some(443),
+        _ if url.starts_with("http://") => Some(80),
+        _ => None,
+    }
+}
+
+/// Host ports published by a container (`NetworkSettings.Ports` or a `containers/json` row's `Ports`).
+pub fn docker_ports(v: &serde_json::Value) -> Vec<(u16, bool)> {
+    let mut l: Vec<procinfo::Listen> = vec![];
+    if let Some(map) = v.pointer("/NetworkSettings/Ports").and_then(|x| x.as_object()) {
+        for (k, binds) in map {
+            if !k.ends_with("/tcp") {
+                continue;
+            }
+            for b in binds.as_array().into_iter().flatten() {
+                if let Some(port) = b["HostPort"].as_str().and_then(|p| p.parse().ok()) {
+                    l.push(procinfo::Listen { ip: b["HostIp"].as_str().filter(|s| !s.is_empty()).unwrap_or("0.0.0.0").into(), port });
+                }
+            }
+        }
+    }
+    for p in v["Ports"].as_array().into_iter().flatten() {
+        if let (Some(port), Some("tcp")) = (p["PublicPort"].as_u64(), p["Type"].as_str()) {
+            l.push(procinfo::Listen { ip: p["IP"].as_str().unwrap_or("0.0.0.0").into(), port: port as u16 });
+        }
+    }
+    procinfo::ports_of(&l)
+}
+
 fn update_net(m: &mut Managed, rx: f64, tx: f64, now: i64) {
     let prev = m.net;
     let dt = prev.map(|p| (now - p.ts) as f64 / 1000.0).unwrap_or(0.0);
@@ -939,5 +1142,21 @@ pub fn kill_group(pid: i32, sig: i32) {
         if libc::kill(-pid, sig) != 0 {
             libc::kill(pid, sig);
         }
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn ports_from_urls_and_docker() {
+        assert_eq!(url_port("http://localhost:3000/app"), Some(3000));
+        assert_eq!(url_port("https://example.test"), Some(443));
+        assert_eq!(url_port("http://[::1]:8080"), Some(8080));
+        let v = serde_json::json!({ "NetworkSettings": { "Ports": { "80/tcp": [{ "HostIp": "127.0.0.1", "HostPort": "8080" }], "53/udp": [{ "HostPort": "53" }] } } });
+        assert_eq!(docker_ports(&v), vec![(8080, true)]);
+        let row = serde_json::json!({ "Ports": [{ "IP": "0.0.0.0", "PrivatePort": 5432, "PublicPort": 5432, "Type": "tcp" }, { "PrivatePort": 9000, "Type": "tcp" }] });
+        assert_eq!(docker_ports(&row), vec![(5432, false)]);
     }
 }

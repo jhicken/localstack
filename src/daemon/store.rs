@@ -2,7 +2,7 @@ use crate::types::MetricSample;
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
-const RETENTION_MS: i64 = 7 * 24 * 3600_000;
+const RETENTION_MS: i64 = 7 * 24 * 3_600_000;
 
 /// Historical metrics in SQLite (`~/.localstack/metrics.db`).
 pub struct MetricsStore {

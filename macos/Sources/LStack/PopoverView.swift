@@ -15,14 +15,18 @@ struct PopoverView: View {
                     .padding(.bottom, 8)
             }
             diskAccessBanner
+            cmuxBanner
             Divider().opacity(0.5)
             if !store.connected {
                 disconnected
-            } else if store.services.isEmpty {
+            } else if store.services.isEmpty, store.machines.isEmpty {
                 empty
             } else {
                 ScrollView {
                     VStack(spacing: 4) {
+                        if !store.machines.isEmpty {
+                            MachineHeader(name: store.localName ?? "This Mac", status: "online", detail: "this Mac")
+                        }
                         ForEach(store.services) { s in
                             ServiceRow(service: s)
                         }
@@ -32,6 +36,19 @@ struct PopoverView: View {
                                 .foregroundStyle(.orange)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(8)
+                        }
+                        ProcessList(processes: store.processes)
+                        ForEach(store.machines) { m in
+                            MachineHeader(name: m.name, status: m.status, detail: m.online ? (m.canControl ? nil : "read-only") : (m.error ?? m.status))
+                                .padding(.top, 6)
+                            ForEach(m.services ?? []) { s in
+                                ServiceRow(service: s)
+                            }
+                            if m.online, (m.services ?? []).isEmpty {
+                                Text("No services").font(.system(size: 11)).foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
+                            }
+                            ProcessList(processes: m.processes ?? [])
                         }
                     }
                     .padding(8)
@@ -59,6 +76,7 @@ struct PopoverView: View {
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
         .background(MenuWindowSizer(height: contentHeight))
         .animation(.snappy(duration: 0.25), value: store.toast)
+        .animation(.snappy(duration: 0.25), value: store.cmuxDenied)
         .onAppear { Task { await store.refreshSettings() } }
     }
 
@@ -94,8 +112,20 @@ struct PopoverView: View {
         }
     }
 
+    @ViewBuilder private var cmuxBanner: some View {
+        if let d = store.cmuxDenied {
+            CmuxBanner(denial: d)
+        }
+    }
+
     private var subtitle: String {
         guard store.connected else { return "daemon offline" }
+        if !store.machines.isEmpty {
+            let all = store.allServices
+            let r = all.filter(\.isRunning).count
+            let online = store.machines.filter(\.online).count + 1
+            return "\(r)/\(all.count) running · \(online)/\(store.machines.count + 1) Macs online"
+        }
         let r = store.running.count
         let f = store.failedCount
         var parts = ["\(r) running"]
@@ -148,8 +178,14 @@ struct PopoverView: View {
 
     private var footer: some View {
         HStack(spacing: 2) {
-            FooterButton(icon: "rectangle.split.2x1", title: "Dashboard") { store.openDashboard() }
+            // Two dashboards side by side: the terminal UI, and the web one when remote access is on.
+            FooterButton(icon: "terminal", title: "Terminal") { store.openDashboard() }
                 .disabled(!store.connected)
+                .help("Open the terminal dashboard (lstack top)")
+            if store.webAvailable {
+                FooterButton(icon: "globe", title: "Web") { store.openWeb() }
+                    .help("Open the web dashboard in your browser")
+            }
             FooterButton(icon: "folder", title: "Config") { store.revealConfig() }
             Spacer()
             FooterButton(icon: "gearshape", title: "Settings") {
@@ -206,5 +242,127 @@ private struct FooterButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .onHover { hover = $0 }
+    }
+}
+
+/// cmux refused LStack (its socket only trusts processes started inside cmux).
+private struct CmuxBanner: View {
+    @Environment(AppStore.self) private var store
+    let denial: CmuxDenial
+    @State private var busy = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "hand.raised.fill").foregroundStyle(.orange).font(.system(size: 14))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("cmux blocked LStack").font(.system(size: 11, weight: .semibold))
+                    Text("cmux only accepts commands from its own terminals. Allow LStack with a socket password (kept in LStack's secret store; you can change it in cmux Settings any time).")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let error { Text(error).font(.system(size: 10)).foregroundStyle(.red) }
+                }
+                Spacer(minLength: 0)
+                Button { store.cmuxDenied = nil } label: {
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            HStack(spacing: 6) {
+                Spacer()
+                Button("Use Terminal") { store.useTerminalInstead() }
+                Button {
+                    busy = true
+                    Task {
+                        error = await store.fixCmux()
+                        busy = false
+                    }
+                } label: {
+                    if busy { ProgressView().controlSize(.mini) } else { Text("Allow LStack") }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(busy)
+            }
+            .controlSize(.small)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.orange.opacity(0.12)))
+        .padding(.horizontal, 8)
+        .padding(.bottom, 8)
+    }
+}
+
+struct MachineHeader: View {
+    let name: String
+    let status: String
+    let detail: String?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Image(systemName: "desktopcomputer").font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(name).font(.system(size: 11, weight: .semibold))
+            if let detail { Text(detail).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail) }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
+        .help("\(name): \(status)")
+    }
+
+    private var color: Color {
+        switch status {
+        case "online": return .green
+        case "connecting": return .yellow
+        case "unauthorized": return .red
+        default: return .gray
+        }
+    }
+}
+
+/// Busy processes that aren't LStack services (over the thresholds in Settings → Monitoring).
+struct ProcessList: View {
+    let processes: [ProcInfo]
+    @State private var open = true
+    @State private var all = false
+    private static let collapsed = 5
+
+    var body: some View {
+        if !processes.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Button { withAnimation(.snappy(duration: 0.2)) { open.toggle() } } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: open ? "chevron.down" : "chevron.right").font(.system(size: 8, weight: .bold))
+                        Text("Other busy processes").font(.system(size: 10, weight: .semibold)).textCase(.uppercase)
+                        Text("\(processes.count)").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        Spacer()
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if open {
+                    ForEach(all ? processes : Array(processes.prefix(Self.collapsed))) { p in
+                        HStack(spacing: 8) {
+                            Text(p.name).font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
+                            Text(verbatim: String(p.pid)).font(.system(size: 9)).foregroundStyle(.tertiary).monospacedDigit()
+                            Spacer()
+                            Text(Fmt.pct(p.cpu)).frame(width: 46, alignment: .trailing)
+                            Text(Fmt.bytes(p.mem)).frame(width: 64, alignment: .trailing).foregroundStyle(.secondary)
+                            Text((p.net ?? 0) > 0 ? Fmt.rate(p.net) : "")
+                                .frame(width: 62, alignment: .trailing).foregroundStyle(.secondary)
+                        }
+                        .font(.system(size: 10.5)).monospacedDigit()
+                    }
+                    if processes.count > Self.collapsed {
+                        Button(all ? "Show fewer" : "Show all \(processes.count)") { withAnimation(.snappy(duration: 0.2)) { all.toggle() } }
+                            .buttonStyle(.link).font(.system(size: 10))
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+        }
     }
 }

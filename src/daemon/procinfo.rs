@@ -228,3 +228,118 @@ mod tests {
         assert_eq!(m[&1], (0.0, 0.0));
     }
 }
+
+/// One listening TCP socket: bound address and port.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Listen {
+    pub ip: String,
+    pub port: u16,
+}
+
+impl Listen {
+    pub fn loopback(&self) -> bool {
+        self.ip.starts_with("127.") || self.ip == "::1" || self.ip == "localhost"
+    }
+}
+
+/// Listening TCP sockets of every process we can see, by pid (one `lsof` run).
+pub async fn listening_ports() -> Option<HashMap<i32, Vec<Listen>>> {
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
+}
+
+pub fn parse_lsof(text: &str) -> HashMap<i32, Vec<Listen>> {
+    let mut m: HashMap<i32, Vec<Listen>> = HashMap::new();
+    let mut pid = 0;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p.parse().unwrap_or(0);
+        } else if let Some(n) = line.strip_prefix('n') {
+            let Some((ip, port)) = n.rsplit_once(':') else { continue };
+            let Ok(port) = port.parse::<u16>() else { continue };
+            let ip = ip.trim_start_matches('[').trim_end_matches(']');
+            let ip = if ip == "*" { "0.0.0.0" } else { ip }.to_string();
+            let v = m.entry(pid).or_default();
+            let l = Listen { ip, port };
+            if pid > 0 && !v.contains(&l) {
+                v.push(l);
+            }
+        }
+    }
+    m
+}
+
+/// Ports a set of listeners serves on → (port, loopback-only), sorted and de-duplicated.
+pub fn ports_of<'a>(listens: impl IntoIterator<Item = &'a Listen>) -> Vec<(u16, bool)> {
+    let mut by: std::collections::BTreeMap<u16, bool> = std::collections::BTreeMap::new();
+    for l in listens {
+        let e = by.entry(l.port).or_insert(true);
+        *e = *e && l.loopback();
+    }
+    by.into_iter().collect()
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    #[test]
+    fn lsof_parsing() {
+        let m = parse_lsof("p100\nf5\nn*:3000\nf6\nn[::1]:3000\np200\nf3\nn127.0.0.1:5432\nf4\nn[::1]:5432\n");
+        assert_eq!(ports_of(&m[&100]), vec![(3000, false)]);
+        assert_eq!(ports_of(&m[&200]), vec![(5432, true)]);
+    }
+
+    #[tokio::test]
+    async fn finds_own_listener() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let Some(m) = listening_ports().await else { return };
+        let mine = m.get(&(std::process::id() as i32)).cloned().unwrap_or_default();
+        assert!(mine.iter().any(|x| x.port == port && x.loopback()), "{mine:?}");
+    }
+}
+
+/// Every pid on the machine.
+pub fn all_pids() -> Vec<i32> {
+    let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return vec![];
+    }
+    let mut buf = vec![0i32; n as usize + 64];
+    let got = unsafe { libc::proc_listallpids(buf.as_mut_ptr() as *mut libc::c_void, (buf.len() * 4) as libc::c_int) };
+    if got <= 0 {
+        return vec![];
+    }
+    buf.truncate((got as usize).min(buf.len()));
+    buf.retain(|p| *p > 0);
+    buf
+}
+
+/// Short process name (as in Activity Monitor), or None if we can't see the process.
+pub fn proc_name(pid: i32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+#[cfg(test)]
+mod pid_tests {
+    #[test]
+    fn sees_self() {
+        let me = std::process::id() as i32;
+        assert!(super::all_pids().contains(&me));
+        assert!(super::proc_name(me).is_some());
+    }
+}

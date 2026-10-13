@@ -7,8 +7,9 @@ struct ServiceRow: View {
     @State private var hover = false
     @State private var confirmRemove = false
 
-    private var expanded: Bool { store.expanded == service.name }
-    private var samples: [MetricSample] { store.history[service.name] ?? [] }
+    private var expanded: Bool { store.expanded == service.id }
+    private var samples: [MetricSample] { store.history[service.id] ?? [] }
+    private var canControl: Bool { store.canControl(service) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,9 +17,9 @@ struct ServiceRow: View {
                 .contentShape(Rectangle())
                 .onTapGesture {
                     withAnimation(.snappy(duration: 0.25)) {
-                        store.expanded = expanded ? nil : service.name
+                        store.expanded = expanded ? nil : service.id
                     }
-                    if !expanded { Task { await store.loadHistory(service.name) } }
+                    if !expanded { Task { await store.loadHistory(service) } }
                 }
             if expanded {
                 detail
@@ -60,6 +61,10 @@ struct ServiceRow: View {
                             .help("Starts at login")
                     }
                     healthIcon
+                    if let hb = service.heartbeat, !hb.ok {
+                        Image(systemName: "waveform.path.ecg").font(.system(size: 9)).foregroundStyle(.orange)
+                            .help("Heartbeat ping failed: \(hb.error ?? "unknown error")")
+                    }
                 }
                 Text(subtitle)
                     .font(.system(size: 11))
@@ -80,9 +85,12 @@ struct ServiceRow: View {
                             .textCase(.uppercase)
                             .monospacedDigit()
                     }
-                    IconButton(icon: "stop.fill", help: "Stop — cancel the pending restart", tint: .red) { store.perform(service.name, "stop") }
+                    IconButton(icon: "stop.fill", help: "Stop — cancel the pending restart", tint: .red) { store.perform(service, "stop") }
                 }
             } else if service.isRunning {
+                if let u = service.links.first {
+                    IconButton(icon: "globe", help: "Open \(u.url)") { store.open(u) }
+                }
                 VStack(alignment: .trailing, spacing: 1) {
                     Text(Fmt.pct(service.metrics?.cpu)).font(.system(size: 11, weight: .medium)).monospacedDigit()
                     Text(Fmt.bytes(service.metrics?.mem)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
@@ -121,16 +129,25 @@ struct ServiceRow: View {
 
     private var controls: some View {
         HStack(spacing: 0) {
-            if service.isStoppable {
-                IconButton(icon: "stop.fill", help: service.isRestarting ? "Stop — cancel the pending restart" : "Stop", tint: .red) { store.perform(service.name, "stop") }
-            } else {
-                IconButton(icon: "play.fill", help: "Start", tint: .green) { store.perform(service.name, "start") }
+            if let u = service.links.first {
+                IconButton(icon: "globe", help: "Open \(u.url)") { store.open(u) }
             }
-            IconButton(icon: "arrow.clockwise", help: "Restart") { store.perform(service.name, "restart") }
+            controlButtons.disabled(!canControl)
             IconButton(icon: "text.alignleft", help: "Logs") {
-                openWindow(id: "logs", value: service.name)
+                openWindow(id: "logs", value: service.id)
                 bringToFront()
             }
+        }
+    }
+
+    @ViewBuilder private var controlButtons: some View {
+        HStack(spacing: 0) {
+            if service.isStoppable {
+                IconButton(icon: "stop.fill", help: service.isRestarting ? "Stop — cancel the pending restart" : "Stop", tint: .red) { store.perform(service, "stop") }
+            } else {
+                IconButton(icon: "play.fill", help: "Start", tint: .green) { store.perform(service, "start") }
+            }
+            IconButton(icon: "arrow.clockwise", help: canControl ? "Restart" : "\(service.machine ?? "That Mac") doesn't allow control") { store.perform(service, "restart") }
         }
     }
 
@@ -162,6 +179,51 @@ struct ServiceRow: View {
             if let e = service.lastError, !service.isRunning {
                 Label(e, systemImage: "xmark.octagon.fill").font(.system(size: 11)).foregroundStyle(.red)
             }
+            if !service.links.isEmpty { links }
+            if let hb = service.heartbeat { heartbeatLine(hb) }
+            if let names = service.config.secrets?.names, !names.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "key.fill").font(.system(size: 9)).foregroundStyle(.secondary)
+                    ForEach(names, id: \.self) { n in
+                        Text(n).font(.system(size: 10, design: .monospaced))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Capsule().fill(Color.primary.opacity(0.07)))
+                    }
+                }
+                .help("Secrets passed in as environment variables")
+            }
+            if service.isRemote {
+                if !canControl {
+                    Label("\(service.machine ?? "That Mac") is read-only (turn on “Allow control” there).", systemImage: "lock")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            } else {
+                localActions
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 10)
+    }
+
+    private var links: some View {
+        FlowLinks(urls: service.links, open: store.open)
+    }
+
+    private func heartbeatLine(_ hb: HeartbeatStatus) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "waveform.path.ecg").font(.system(size: 10)).foregroundStyle(hb.ok ? .green : .orange)
+            Text(hb.ok ? "Heartbeat \(hb.kind) " : "Heartbeat failed ")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            + Text(hb.date, style: .relative).font(.system(size: 10)).foregroundStyle(.secondary)
+            + Text(" ago").font(.system(size: 10)).foregroundStyle(.secondary)
+            if let e = hb.error, !hb.ok {
+                Text("· \(e)").font(.system(size: 10)).foregroundStyle(.orange).lineLimit(1).truncationMode(.tail)
+            }
+        }
+    }
+
+    @ViewBuilder private var localActions: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Toggle(isOn: Binding(get: { service.autostart }, set: { store.setAutostart(service.name, $0) })) {
                     Text("Start at login").font(.system(size: 11))
@@ -207,8 +269,6 @@ struct ServiceRow: View {
                 .transition(.opacity)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.bottom, 10)
     }
 
     private func stat(_ label: String, _ value: String) -> some View {
@@ -216,5 +276,37 @@ struct ServiceRow: View {
             Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
             Text(value).font(.system(size: 11, weight: .medium)).monospacedDigit()
         }
+    }
+}
+
+/// Clickable chips for a service's web addresses.
+struct FlowLinks: View {
+    let urls: [ServiceURL]
+    let open: (ServiceURL) -> Void
+
+    var body: some View {
+        // A wrapping row: a few chips fit per line in the 400 pt popover.
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(stride(from: 0, to: urls.count, by: 3)), id: \.self) { i in
+                HStack(spacing: 4) {
+                    ForEach(urls[i..<min(i + 3, urls.count)], id: \.self) { u in chip(u) }
+                }
+            }
+        }
+    }
+
+    private func chip(_ u: ServiceURL) -> some View {
+        Button { open(u) } label: {
+            HStack(spacing: 3) {
+                Image(systemName: u.localOnly == true ? "exclamationmark.triangle.fill" : "link")
+                    .font(.system(size: 9))
+                    .foregroundStyle(u.localOnly == true ? .orange : .accentColor)
+                Text(u.display).font(.system(size: 10, weight: .medium)).lineLimit(1)
+            }
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+        .help(u.localOnly == true ? "\(u.url) — bound to localhost on that Mac, so it may not be reachable from here" : u.url)
     }
 }

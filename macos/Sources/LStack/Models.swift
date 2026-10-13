@@ -51,6 +51,195 @@ struct ServiceConfig: Codable, Hashable {
     var composeFile: String?
     var project: String?
     var healthcheck: HealthCheck?
+    var secrets: SecretRefs?
+    var heartbeat: HeartbeatConfig?
+}
+
+/// `secrets:` in a service definition: `[NAME, …]` or `{ENV_VAR: SECRET_NAME}`.
+enum SecretRefs: Codable, Hashable {
+    case list([String])
+    case map([String: String])
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let l = try? c.decode([String].self) { self = .list(l) }
+        else if let m = try? c.decode([String: String].self) { self = .map(m) }
+        else { self = .list([]) }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case let .list(l): try c.encode(l)
+        case let .map(m): try c.encode(m)
+        }
+    }
+
+    /// Secret names (not values — those never leave the daemon).
+    var names: [String] {
+        switch self {
+        case let .list(l): return l
+        case let .map(m): return Array(Set(m.values)).sorted()
+        }
+    }
+}
+
+/// healthchecks.io-style pings for a service.
+struct HeartbeatConfig: Codable, Hashable {
+    var url: String?
+    var slug: String?
+    var interval: Double?
+    var start: Bool?
+    var fail: Bool?
+    var logs: Bool?
+    var enabled: Bool?
+}
+
+struct HeartbeatStatus: Codable, Hashable {
+    let lastPing: Double
+    let kind: String
+    let ok: Bool
+    let error: String?
+
+    var date: Date { Date(timeIntervalSince1970: lastPing / 1000) }
+}
+
+/// A web address a service serves (detected listening port or `urls:` from its definition).
+struct ServiceURL: Codable, Hashable {
+    let url: String
+    let label: String?
+    let port: Int?
+    let source: String
+    let localOnly: Bool?
+
+    var display: String {
+        if let label, !label.isEmpty { return label }
+        return url.replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: "https://", with: "")
+    }
+}
+
+/// A busy process (over the CPU / memory / network thresholds).
+struct ProcInfo: Codable, Hashable, Identifiable {
+    var id: Int { pid }
+    let pid: Int
+    let name: String
+    let cpu: Double
+    let mem: Double
+    let net: Double?
+}
+
+struct ProcessThresholds: Codable, Equatable {
+    var enabled: Bool
+    var cpu: Double
+    var mem: Double
+    var net: Double
+    var max: Int
+}
+
+/// Another Mac this one watches (`/api/machines`, SSE "machines"/"peer").
+struct Machine: Codable, Identifiable, Equatable {
+    var id: String { name }
+    var name: String
+    var url: String?
+    var status: String
+    var error: String?
+    var hostname: String?
+    var version: String?
+    var allowControl: Bool?
+    var lastSeen: Double?
+    var services: [ServiceState]?
+    var processes: [ProcInfo]?
+    var configErrors: [String]?
+
+    var online: Bool { status == "online" }
+    var canControl: Bool { allowControl ?? false }
+}
+
+struct MachinesEvent: Decodable {
+    let local: String
+    let machines: [Machine]
+}
+
+/// SSE "peer": something changed on another machine.
+struct PeerEvent: Decodable {
+    let machine: String
+    let event: String
+    let data: RawJSON
+}
+
+/// Keeps a JSON sub-document undecoded so it can be decoded later by event type.
+struct RawJSON: Decodable {
+    let data: Data
+    init(from decoder: Decoder) throws {
+        let v = try decoder.singleValueContainer().decode(JSONValue.self)
+        data = (try? JSONEncoder().encode(v)) ?? Data()
+    }
+}
+
+indirect enum JSONValue: Codable {
+    case null, bool(Bool), number(Double), string(String), array([JSONValue]), object([String: JSONValue])
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let b = try? c.decode(Bool.self) { self = .bool(b) }
+        else if let n = try? c.decode(Double.self) { self = .number(n) }
+        else if let s = try? c.decode(String.self) { self = .string(s) }
+        else if let a = try? c.decode([JSONValue].self) { self = .array(a) }
+        else { self = .object(try c.decode([String: JSONValue].self)) }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .null: try c.encodeNil()
+        case let .bool(b): try c.encode(b)
+        case let .number(n): try c.encode(n)
+        case let .string(s): try c.encode(s)
+        case let .array(a): try c.encode(a)
+        case let .object(o): try c.encode(o)
+        }
+    }
+}
+
+struct ProcessesEvent: Decodable {
+    let processes: [ProcInfo]
+}
+
+struct SecretInfo: Decodable, Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let setAt: Double?
+    let usedBy: [String]
+    let isInternal: Bool?
+    let missing: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case name, setAt, usedBy, missing
+        case isInternal = "internal"
+    }
+
+    var isSet: Bool { !(missing ?? false) }
+}
+
+struct SecretsStatus: Decodable {
+    let locked: Bool
+    let error: String?
+    let storage: String
+    let secrets: [SecretInfo]
+}
+
+struct PairCode: Decodable {
+    let code: String
+    let expiresAt: Double
+    let urls: [String]
+}
+
+struct PeerToken: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let createdAt: Double
+    let lastSeen: Double?
 }
 
 /// Result of `POST /api/split-command`: leading `cd`/env/`source` steps peeled off a command.
@@ -68,7 +257,8 @@ struct CommandSplit: Decodable {
 }
 
 struct ServiceState: Codable, Identifiable, Hashable {
-    var id: String { name }
+    /// Unique across machines (names can repeat on different Macs).
+    var id: String { machine.map { "\(name)@\($0)" } ?? name }
     let name: String
     let type: String
     let description: String?
@@ -84,7 +274,14 @@ struct ServiceState: Codable, Identifiable, Hashable {
     let restartAt: Double?
     let lastError: String?
     var metrics: MetricSample?
+    let urls: [ServiceURL]?
+    let heartbeat: HeartbeatStatus?
+    /// nil = this Mac; otherwise the paired machine's name.
+    let machine: String?
     let config: ServiceConfig
+
+    var links: [ServiceURL] { urls ?? [] }
+    var isRemote: Bool { machine != nil }
 
     var isRunning: Bool { status == "running" }
     var isTransitioning: Bool { status == "starting" || status == "stopping" }
@@ -133,6 +330,7 @@ struct DaemonInfo: Codable {
 struct Snapshot: Codable {
     let services: [ServiceState]
     let configErrors: [String]
+    var machine: String?
 }
 
 struct MetricsEvent: Codable {
@@ -218,4 +416,36 @@ struct DaemonSettings: Decodable, Equatable {
     var terminals: [TerminalApp]
     var fullDiskAccess: Bool
     var helperPath: String
+    var cmux: CmuxStatus?
+    var healthchecks: HealthchecksStatus?
+    var processes: ProcessThresholds?
+}
+
+struct CmuxStatus: Decodable, Equatable {
+    var installed: Bool
+    var mode: String
+    var hasPassword: Bool
+    /// cmux only lets LStack (started outside cmux) open workspaces in password / allowAll mode.
+    var allowsLStack: Bool { mode == "password" ? hasPassword : mode == "allowAll" }
+}
+
+struct HealthchecksStatus: Decodable, Equatable {
+    var baseUrl: String
+    var logLines: Int?
+    var machine: HeartbeatConfig?
+    var hasPingKey: Bool
+    var machineStatus: HeartbeatStatus?
+}
+
+/// `open-dashboard` / `open-terminal`: cmux refusal comes back as 200 + `cmuxDenied`.
+struct OpenResult: Decodable {
+    let ok: Bool?
+    let cmuxDenied: Bool?
+    let error: String?
+}
+
+struct CmuxFixResult: Decodable {
+    let reloaded: Bool?
+    let backup: String?
+    let note: String?
 }

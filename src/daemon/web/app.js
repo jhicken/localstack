@@ -9,8 +9,13 @@
     session: null,
     services: new Map(),
     configErrors: [],
-    history: new Map(), // name -> [{ts,cpu,mem}]
-    selected: localStorage.getItem("lstack.sel") || null,
+    history: new Map(), // service key -> [{ts,cpu,mem}]
+    selected: null, // service key (see keyOf)
+    shown: null, // key the detail pane currently shows
+    local: "", // this machine's name
+    machines: new Map(), // peer name -> {info, services: Map, configErrors, processes, system}
+    processes: [],
+    thresholds: null,
     range: "15m",
     logs: [],
     filter: "",
@@ -46,6 +51,28 @@
   const looping = (s) => !!s.restartAt;
   const statusLabel = (s) => looping(s) ? `restarting ${Math.max(0, Math.ceil((s.restartAt - Date.now()) / 1000))}s` : s.status;
   const enc = encodeURIComponent;
+  const ago = (ts) => {
+    const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (s < 60) return `${s}s ago`; if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    return s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
+  };
+
+  // Services are keyed by machine + name: names can repeat across machines. Local machine = "".
+  const keyOf = (m, n) => JSON.stringify([m || "", n]);
+  const parseKey = (k) => { try { const [m, n] = JSON.parse(k); return { m, n }; } catch { return { m: "", n: k }; } };
+  const svcKey = (s) => keyOf(s._m, s.name);
+  const tagged = (m, s) => { s._m = m || ""; return s; };
+  const svcMap = (m) => (m ? S.machines.get(m)?.services : S.services);
+  const getSvc = (k) => { if (!k) return null; const { m, n } = parseKey(k); return svcMap(m)?.get(n) || null; };
+  const selSvc = () => getSvc(S.selected);
+  const svcPath = (s) => (s._m ? `/api/machines/${enc(s._m)}/services/${enc(s.name)}` : `/api/services/${enc(s.name)}`);
+  const sortedSvcs = (map) => [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const sortedPeers = () => [...S.machines.values()].sort((a, b) => a.info.name.localeCompare(b.info.name));
+  const canControl = (s) => !!S.session?.allowControl && (!s._m || !!S.machines.get(s._m)?.info.allowControl);
+  {
+    const v = localStorage.getItem("lstack.sel");
+    S.selected = v ? (v.startsWith("[") ? v : keyOf("", v)) : null;
+  }
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -138,6 +165,7 @@
       showLogin();
     };
     openEvents();
+    loadProcesses();
     clearInterval(S.tickTimer);
     S.tickTimer = setInterval(() => { renderList(); renderTiles(); }, 1000);
   }
@@ -153,13 +181,119 @@
     if (el) { el.classList.toggle("off", !on); el.textContent = on ? "live" : "reconnecting"; }
   }
 
-  function pushHistory(name, m) {
+  function pushHistory(key, m) {
     if (!m) return;
-    const arr = S.history.get(name) || [];
+    const arr = S.history.get(key) || [];
     if (arr.length && arr[arr.length - 1].ts >= m.ts) return;
     arr.push({ ts: m.ts, cpu: m.cpu, mem: m.mem });
     while (arr.length > HISTORY) arr.shift();
-    S.history.set(name, arr);
+    S.history.set(key, arr);
+  }
+
+  function trackHistory(s) {
+    const k = svcKey(s);
+    if (!S.history.has(k)) seedHistory(s);
+    pushHistory(k, s.metrics);
+  }
+
+  function firstKey() {
+    const local = sortedSvcs(S.services)[0];
+    if (local) return svcKey(local);
+    for (const M of sortedPeers()) { const s = sortedSvcs(M.services)[0]; if (s) return svcKey(s); }
+    return null;
+  }
+
+  function ensureSelection() {
+    if (!getSvc(S.selected)) S.selected = firstKey();
+  }
+
+  // Re-render the detail pane only when the selected service changed; otherwise refresh its header.
+  function refreshDetail() {
+    if (S.shown !== S.selected || !selSvc()) renderDetail(); else renderHead();
+  }
+
+  async function loadProcesses() {
+    try {
+      const d = await api("/api/processes");
+      S.processes = d.processes || [];
+      S.thresholds = d.thresholds || null;
+      renderList();
+    } catch { /* ignore */ }
+  }
+
+  function machineEntry(m) {
+    const { services = [], configErrors = [], processes = [], system = null, ...info } = m;
+    const M = { info, services: new Map(), configErrors, processes, system };
+    services.forEach((s) => { M.services.set(s.name, tagged(m.name, s)); trackHistory(s); });
+    return M;
+  }
+
+  function dropHistory(machine) {
+    for (const k of [...S.history.keys()]) if (parseKey(k).m === machine) S.history.delete(k);
+  }
+
+  function onService(m, s) {
+    const map = svcMap(m);
+    if (!map) return;
+    tagged(m, s);
+    const prev = map.get(s.name);
+    map.set(s.name, s);
+    if (!prev) seedHistory(s);
+    if (!S.selected) S.selected = svcKey(s);
+    renderList();
+    if (svcKey(s) !== S.selected) return;
+    if (S.shown !== S.selected) renderDetail();
+    else if (prev && prev.status === s.status && prev.restartAt === s.restartAt && prev.health === s.health && prev.lastError === s.lastError) renderTiles();
+    else renderHead();
+  }
+
+  function onRemoved(m, name) {
+    const map = svcMap(m);
+    if (!map) return;
+    const k = keyOf(m, name);
+    map.delete(name); S.history.delete(k);
+    if (S.selected === k) { S.selected = firstKey(); renderDetail(); }
+    renderList();
+  }
+
+  function onMetrics(m, name, metrics) {
+    const s = svcMap(m)?.get(name);
+    if (s) s.metrics = metrics;
+    const k = keyOf(m, name);
+    pushHistory(k, metrics);
+    renderList();
+    if (k === S.selected) { renderTiles(); if (S.range === "15m") appendChartPoint(metrics); }
+  }
+
+  function onPeer(name, event, data) {
+    if (event === "removed-machine") {
+      const gone = data?.name || name;
+      S.machines.delete(gone); dropHistory(gone);
+      ensureSelection(); renderList(); refreshDetail();
+      return;
+    }
+    let M = S.machines.get(name);
+    if (!M) { M = machineEntry({ name, local: false, status: "connecting" }); S.machines.set(name, M); }
+    const onSel = () => S.selected && parseKey(S.selected).m === name;
+    switch (event) {
+      case "machine":
+        Object.assign(M.info, data || {});
+        renderList();
+        if (onSel()) renderHead();
+        break;
+      case "snapshot":
+        M.services = new Map();
+        (data.services || []).forEach((s) => { M.services.set(s.name, tagged(name, s)); trackHistory(s); });
+        M.configErrors = data.configErrors || [];
+        ensureSelection(); renderList();
+        if (onSel() || S.shown !== S.selected) refreshDetail();
+        break;
+      case "service": onService(name, data); break;
+      case "removed": onRemoved(name, data.name); break;
+      case "metrics": onMetrics(name, data.name, data.metrics); break;
+      case "processes": M.processes = data.processes || []; renderList(); break;
+      case "system": if (M.system) M.system.samples = [...(M.system.samples || []).slice(-(HISTORY - 1)), data]; break;
+    }
   }
 
   function openEvents() {
@@ -173,46 +307,41 @@
     };
     es.addEventListener("snapshot", (e) => {
       const d = JSON.parse(e.data);
-      S.services = new Map(d.services.map((s) => [s.name, s]));
+      if (d.machine) S.local = d.machine;
+      S.services = new Map(d.services.map((s) => [s.name, tagged("", s)]));
       S.configErrors = d.configErrors || [];
-      d.services.forEach((s) => { if (!S.history.has(s.name)) seedHistory(s.name); pushHistory(s.name, s.metrics); });
-      if (!S.selected || !S.services.has(S.selected)) S.selected = [...S.services.keys()].sort()[0] || null;
-      renderList(); renderDetail();
-    });
-    es.addEventListener("service", (e) => {
-      const s = JSON.parse(e.data);
-      const prev = S.services.get(s.name);
-      S.services.set(s.name, s);
-      if (!prev) seedHistory(s.name);
-      if (!S.selected) S.selected = s.name;
+      d.services.forEach(trackHistory);
+      // A peer selection is resolved by the `machines` event that follows.
+      const peerSel = S.selected && parseKey(S.selected).m;
+      if (!peerSel || S.machines.size) ensureSelection();
       renderList();
-      if (s.name === S.selected) {
-        if (prev && prev.status === s.status && prev.restartAt === s.restartAt && prev.health === s.health && prev.lastError === s.lastError) renderTiles();
-        else renderHead();
-      }
+      if (!peerSel || selSvc()) renderDetail();
     });
-    es.addEventListener("removed", (e) => {
-      const { name } = JSON.parse(e.data);
-      S.services.delete(name); S.history.delete(name);
-      if (S.selected === name) { S.selected = [...S.services.keys()].sort()[0] || null; renderDetail(); }
-      renderList();
+    es.addEventListener("machines", (e) => {
+      const d = JSON.parse(e.data);
+      if (d.local) S.local = d.local;
+      const names = new Set((d.machines || []).map((m) => m.name));
+      for (const old of S.machines.keys()) if (!names.has(old)) dropHistory(old);
+      S.machines = new Map((d.machines || []).map((m) => [m.name, machineEntry(m)]));
+      ensureSelection(); renderList(); refreshDetail();
     });
-    es.addEventListener("metrics", (e) => {
-      const { name, metrics } = JSON.parse(e.data);
-      const s = S.services.get(name);
-      if (s) s.metrics = metrics;
-      pushHistory(name, metrics);
-      renderList();
-      if (name === S.selected) { renderTiles(); if (S.range === "15m") appendChartPoint(metrics); }
+    es.addEventListener("peer", (e) => {
+      const { machine, event, data } = JSON.parse(e.data);
+      onPeer(machine, event, data);
     });
+    es.addEventListener("service", (e) => onService("", JSON.parse(e.data)));
+    es.addEventListener("removed", (e) => onRemoved("", JSON.parse(e.data).name));
+    es.addEventListener("metrics", (e) => { const { name, metrics } = JSON.parse(e.data); onMetrics("", name, metrics); });
+    es.addEventListener("processes", (e) => { S.processes = JSON.parse(e.data).processes || []; renderList(); });
   }
 
-  async function seedHistory(name) {
+  async function seedHistory(s) {
+    const k = svcKey(s);
     try {
-      const { samples } = await api(`/api/services/${enc(name)}/metrics?range=5m&points=${HISTORY}`);
+      const { samples } = await api(`${svcPath(s)}/metrics?range=5m&points=${HISTORY}`);
       const last = samples.length ? samples[samples.length - 1].ts : 0;
-      const cur = (S.history.get(name) || []).filter((c) => c.ts > last);
-      S.history.set(name, [...samples.map((m) => ({ ts: m.ts, cpu: m.cpu, mem: m.mem })), ...cur].slice(-HISTORY));
+      const cur = (S.history.get(k) || []).filter((c) => c.ts > last);
+      S.history.set(k, [...samples.map((m) => ({ ts: m.ts, cpu: m.cpu, mem: m.mem })), ...cur].slice(-HISTORY));
       renderList();
     } catch { /* ignore */ }
   }
@@ -225,38 +354,99 @@
     return `<svg class="spark" width="${w}" height="${hgt}" viewBox="0 0 ${w} ${hgt}"><polyline points="${pts.join(" ")}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" opacity="0.9"/></svg>`;
   }
 
+  const LOCAL_ONLY_TIP = "bound to localhost on that machine – not reachable from here";
+
+  function urlChips(s, max) {
+    const urls = s.urls || [];
+    const shown = max ? urls.slice(0, max) : urls;
+    const more = urls.length - shown.length;
+    return shown.map((u) => {
+      const warn = !!s._m && u.localOnly;
+      const text = u.label || String(u.url || "").replace(/^https?:\/\//i, "").replace(/\/$/, "");
+      const inner = `${warn ? `<span class="lwarn" title="${esc(LOCAL_ONLY_TIP)}">⚠</span>` : ""}${esc(text)}`;
+      const cls = `link${warn ? " warn" : ""}`;
+      if (!/^https?:\/\//i.test(u.url || "")) return `<span class="${cls}" title="${esc(u.url)}">${inner}</span>`;
+      return `<a class="${cls}" href="${esc(u.url)}" target="_blank" rel="noopener noreferrer" title="${esc(u.url)}">${inner}</a>`;
+    }).join("") + (more > 0 ? `<span class="link more" title="${esc(urls.slice(max).map((u) => u.url).join("\n"))}">+${more}</span>` : "");
+  }
+
+  function svcRow(s) {
+    const m = live(s) ? s.metrics : null;
+    const k = svcKey(s);
+    const hist = (S.history.get(k) || []).map((p) => p.cpu);
+    const uptime = live(s) && s.startedAt ? dur(Date.now() - s.startedAt) : statusLabel(s);
+    const health = s.health && !["none", "unknown"].includes(s.health) ? `<span class="h-${esc(s.health)}">● ${esc(s.health)}</span>` : "";
+    const links = s.urls?.length ? `<span class="links">${urlChips(s, 3)}</span>` : "";
+    return `<div class="svc ${k === S.selected ? "sel" : ""}" data-key="${esc(k)}">
+        <span class="dot ${esc(looping(s) ? "starting" : s.status)}"></span>
+        <span class="name">${esc(s.name)}</span>
+        <span class="nums"><b>${m ? pct(m.cpu) : "—"}</b> · ${m ? bytes(m.mem) : "—"}</span>
+        <span class="meta"><span class="badge ${esc(s.type)}">${esc(s.type)}</span>${esc(uptime)} ${health}</span>
+        ${sparkline(live(s) ? hist : [])}
+        ${links}
+      </div>`;
+  }
+
+  function svcSection(list, errors, empty) {
+    const errs = errors?.length ? `<div class="config-errors">${errors.map(esc).join("<br>")}</div>` : "";
+    return errs + (list.map(svcRow).join("") || empty);
+  }
+
+  function procPanel(procs, t) {
+    procs = procs || [];
+    const note = t ? (t.enabled ? `over CPU ${+t.cpu}% · mem ${+t.mem}% · net ${rate(t.net)}` : "process breakdown is off") : "";
+    const rows = procs.map((p) => `<tr>
+        <td class="pn" title="${esc(p.name)}">${esc(p.name)}</td><td>${esc(p.pid)}</td>
+        <td>${pct(p.cpu)}</td><td>${bytes(p.mem)}</td><td>${p.net != null ? rate(p.net) : "—"}</td></tr>`).join("");
+    const body = rows
+      ? `<table class="ptable"><thead><tr><th>Name</th><th>PID</th><th>CPU</th><th>MEM</th><th>NET</th></tr></thead><tbody>${rows}</tbody></table>`
+      : t && !t.enabled ? "" : '<div class="pnote">nothing busy</div>';
+    return `<div class="procs"><div class="list-head"><span>Other processes</span><span>${procs.length || ""}</span></div>${body}${note ? `<div class="pnote">${esc(note)}</div>` : ""}</div>`;
+  }
+
+  function machHead(i, count) {
+    const st = i.status || "offline";
+    const tip = [i.hostname, i.version && `v${i.version}`, i.url, !i.local && st !== "online" && i.lastSeen ? `last seen ${ago(i.lastSeen)}` : ""].filter(Boolean).join(" · ");
+    const sub = i.local ? "this machine" : st !== "online" ? st : "";
+    const ro = !i.local && !i.allowControl ? '<span class="badge ro" title="Control is disabled on that machine">read-only</span>' : "";
+    const err = !i.local && st !== "online" && i.error ? `<div class="m-err">${esc(i.error)}</div>` : "";
+    return `<div class="mach" title="${esc(tip)}"><span class="mdot ${esc(st)}"></span><b>${esc(i.name)}</b>${sub ? `<span class="m-sub">${esc(sub)}</span>` : ""}${ro}<span class="m-n">${count}</span></div>${err}`;
+  }
+
   function renderList() {
     const el = document.getElementById("list");
     if (!el) return;
-    const all = [...S.services.values()].sort((a, b) => a.name.localeCompare(b.name));
+    const all = sortedSvcs(S.services);
     const up = all.filter(live);
     const cpu = up.reduce((a, s) => a + (s.metrics?.cpu || 0), 0);
     const mem = up.reduce((a, s) => a + (s.metrics?.mem || 0), 0);
     document.getElementById("sum").textContent = `${up.length} running · ${all.length - up.length} stopped`;
     document.getElementById("tcpu").textContent = `CPU ${pct(cpu)}`;
     document.getElementById("tmem").textContent = `MEM ${bytes(mem)}`;
-    const rows = all.map((s) => {
-      const m = live(s) ? s.metrics : null;
-      const hist = (S.history.get(s.name) || []).map((p) => p.cpu);
-      const uptime = live(s) && s.startedAt ? dur(Date.now() - s.startedAt) : statusLabel(s);
-      const health = s.health && !["none", "unknown"].includes(s.health) ? `<span class="h-${esc(s.health)}">● ${esc(s.health)}</span>` : "";
-      return `<div class="svc ${s.name === S.selected ? "sel" : ""}" data-name="${esc(s.name)}">
-        <span class="dot ${esc(looping(s) ? "starting" : s.status)}"></span>
-        <span class="name">${esc(s.name)}</span>
-        <span class="nums"><b>${m ? pct(m.cpu) : "—"}</b> · ${m ? bytes(m.mem) : "—"}</span>
-        <span class="meta"><span class="badge ${esc(s.type)}">${esc(s.type)}</span>${esc(uptime)} ${health}</span>
-        ${sparkline(live(s) ? hist : [])}
-      </div>`;
-    });
-    const errors = S.configErrors.length ? `<div class="config-errors">${S.configErrors.map(esc).join("<br>")}</div>` : "";
-    el.innerHTML = `<div class="list-head"><span>Services</span><span>${all.length}</span></div>${errors}${rows.join("") || '<div class="empty">No services defined yet.<br>Add one with <code>lstack add</code>.</div>'}`;
-    el.querySelectorAll(".svc").forEach((row) => row.addEventListener("click", () => select(row.dataset.name)));
+    // Don't swap the DOM out from under a pressed row or link (the click would be lost); the 1 s tick catches up.
+    if (el.querySelector(":active")) return;
+    const peers = sortedPeers();
+    const total = all.length + peers.reduce((a, M) => a + M.services.size, 0);
+    const localBody = svcSection(all, S.configErrors, '<div class="empty">No services defined yet.<br>Add one with <code>lstack add</code>.</div>') + procPanel(S.processes, S.thresholds);
+    let html = `<div class="list-head"><span>Services</span><span>${total}</span></div>`;
+    if (!peers.length) html += localBody;
+    else {
+      html += `<div class="machine">${machHead({ name: S.local || S.session?.hostname || "this machine", local: true, status: "online", hostname: S.session?.hostname, version: S.session?.version }, all.length)}${localBody}</div>`;
+      for (const M of peers) {
+        html += `<div class="machine ${M.info.status === "online" ? "" : "stale"}">${machHead(M.info, M.services.size)}${svcSection(sortedSvcs(M.services), M.configErrors, '<div class="empty sm">No services.</div>')}${procPanel(M.processes)}</div>`;
+      }
+    }
+    el.innerHTML = html;
+    el.querySelectorAll(".svc").forEach((row) => row.addEventListener("click", (e) => {
+      if (e.target.closest("a")) return;
+      select(row.dataset.key);
+    }));
   }
 
-  function select(name) {
-    if (name === S.selected) return;
-    S.selected = name;
-    localStorage.setItem("lstack.sel", name);
+  function select(key) {
+    if (key === S.selected) return;
+    S.selected = key;
+    localStorage.setItem("lstack.sel", key);
     renderList(); renderDetail();
   }
 
@@ -266,7 +456,8 @@
     if (!el) return;
     S.logStream?.close(); S.logStream = null;
     clearInterval(S.chartTimer);
-    const s = S.services.get(S.selected);
+    const s = selSvc();
+    S.shown = s ? S.selected : null;
     if (!s) { el.innerHTML = '<div class="empty">Select a service.</div>'; return; }
     el.innerHTML = `
       <div id="head"></div>
@@ -317,16 +508,17 @@
     renderHead();
     loadCharts();
     S.chartTimer = setInterval(() => { if (S.range !== "15m") loadCharts(); }, 30000);
-    openLogs(s.name);
+    openLogs(s);
   }
 
   function renderHead() {
     const el = document.getElementById("head");
-    const s = S.services.get(S.selected);
+    const s = selSvc();
     if (!el || !s) return;
     const c = s.config || {};
     const what = c.command || c.image || c.container || c.composeFile || c.manifest || "";
-    const ctl = S.session.allowControl
+    const where = s._m ? `<span class="on-m">on ${esc(s._m)}</span>${what || c.cwd ? " · " : ""}` : "";
+    const ctl = canControl(s)
       ? `<div class="d-actions">
           <button class="btn go" data-act="start" ${live(s) ? "disabled" : ""}>▶ Start</button>
           <button class="btn re" data-act="restart">↻ Restart</button>
@@ -339,19 +531,21 @@
         <div class="d-icon ${esc(s.type)}">${ICONS[s.type] || ICONS.process}</div>
         <div class="d-title">
           <h2>${esc(s.name)} <span class="pill ${esc(looping(s) ? "starting" : s.status)}">${esc(statusLabel(s))}</span> ${health} ${s.autostart ? '<span class="pill atboot">starts at login</span>' : ""}</h2>
-          <div class="sub">${esc(what)}${c.cwd ? ` · ${esc(c.cwd)}` : ""}</div>
+          <div class="sub">${where}${esc(what)}${c.cwd ? ` · ${esc(c.cwd)}` : ""}</div>
         </div>
         ${ctl}
       </div>
-      ${s.lastError ? `<div class="lasterr">${esc(s.lastError)}</div>` : ""}`;
-    el.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", () => act(s.name, b.dataset.act, b)));
+      ${s.lastError ? `<div class="lasterr">${esc(s.lastError)}</div>` : ""}
+      <div class="d-info" id="info" hidden></div>`;
+    el.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", () => act(s, b.dataset.act, b)));
     renderTiles();
   }
 
   function renderTiles() {
     const el = document.getElementById("tiles");
-    const s = S.services.get(S.selected);
+    const s = selSvc();
     if (!el || !s) return;
+    renderInfo(s);
     const m = live(s) ? s.metrics || {} : {};
     const tiles = [
       ["CPU", pct(m.cpu)], ["Memory", bytes(m.mem)],
@@ -366,12 +560,43 @@
     if (mv) mv.textContent = bytes(m.mem);
   }
 
-  async function act(name, action, btn) {
+  const secretNames = (sec) =>
+    Array.isArray(sec) ? sec.map((n) => [n, n]) : sec && typeof sec === "object" ? Object.entries(sec) : [];
+
+  function heartbeatHtml(cfg, st) {
+    if (cfg.enabled === false) return '<span class="hb off">disabled</span>';
+    if (!st || !st.lastPing) return '<span class="hb off">no ping yet</span>';
+    const good = st.ok && st.kind !== "fail";
+    const icon = !good ? "✗" : st.kind === "start" ? "▶" : "✓";
+    return `<span class="hb ${good ? "ok" : "bad"}" title="${esc(new Date(st.lastPing).toLocaleString())}">${icon} ${esc(st.kind)} ping ${esc(ago(st.lastPing))}${st.error ? `: ${esc(st.error)}` : ""}</span>`;
+  }
+
+  // URLs, heartbeat and secret names. Only rewritten when changed so links stay clickable.
+  function renderInfo(s) {
+    const el = document.getElementById("info");
+    if (!el || el.querySelector(":active")) return;
+    const c = s.config || {};
+    const rows = [];
+    if (s.urls?.length) rows.push(`<div class="irow"><span class="k">URLs</span><span class="links">${urlChips(s)}</span></div>`);
+    if (c.heartbeat) rows.push(`<div class="irow"><span class="k">Heartbeat</span>${heartbeatHtml(c.heartbeat, s.heartbeat)}</div>`);
+    const secrets = secretNames(c.secrets);
+    if (secrets.length) {
+      const badges = secrets.map(([env, name]) => `<span class="secret" title="${esc(env === name ? `$${env}` : `$${env} ← ${name}`)}">🔒 ${esc(name)}</span>`).join("");
+      rows.push(`<div class="irow"><span class="k">Secrets</span><span class="secrets">${badges}</span></div>`);
+    }
+    const html = rows.join("");
+    if (el._html === html) return;
+    el._html = html;
+    el.innerHTML = html;
+    el.hidden = !html;
+  }
+
+  async function act(svc, action, btn) {
     btn.disabled = true;
     try {
-      const s = await api(`/api/services/${enc(name)}/${action}`, { method: "POST" });
-      S.services.set(s.name, s);
-      toast(`${action} ${name} → ${s.status}`);
+      const s = tagged(svc._m, await api(`${svcPath(svc)}/${action}`, { method: "POST" }));
+      svcMap(svc._m)?.set(s.name, s);
+      toast(`${action} ${svc.name}${svc._m ? ` on ${svc._m}` : ""} → ${s.status}`);
     } catch (e) { toast(e.message, true); }
     renderHead(); renderList();
   }
@@ -379,10 +604,11 @@
   // ------------------------------------------------------------------ charts
   let chartData = [];
   async function loadCharts() {
-    const name = S.selected;
+    const key = S.selected, s = selSvc();
+    if (!s) return;
     try {
-      const { samples } = await api(`/api/services/${enc(name)}/metrics?range=${S.range}&points=120`);
-      if (name !== S.selected) return;
+      const { samples } = await api(`${svcPath(s)}/metrics?range=${S.range}&points=120`);
+      if (key !== S.selected) return;
       chartData = samples;
       drawCharts();
     } catch { /* ignore */ }
@@ -435,10 +661,11 @@
   }
 
   // ------------------------------------------------------------------ logs
-  function openLogs(name) {
+  function openLogs(s) {
     S.logs = [];
     renderLogs();
-    const es = new EventSource(`/api/services/${enc(name)}/logs/stream?tail=500`);
+    const key = svcKey(s);
+    const es = new EventSource(`${svcPath(s)}/logs/stream?tail=500`);
     S.logStream = es;
     const state = (t) => { const el = document.getElementById("logstate"); if (el) el.textContent = t; };
     es.onopen = () => state("● streaming");
@@ -450,7 +677,7 @@
       raf = requestAnimationFrame(() => {
         raf = 0;
         const batch = pending; pending = [];
-        if (name !== S.selected || es !== S.logStream) return;
+        if (key !== S.selected || es !== S.logStream) return;
         S.logs.push(...batch);
         if (S.logs.length > MAX_LOG_LINES) S.logs.splice(0, S.logs.length - MAX_LOG_LINES);
         if (!S.paused) appendLogs(batch);

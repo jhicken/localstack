@@ -27,6 +27,22 @@ pub fn enc(s: &str) -> String {
     crate::daemon::docker_api::enc(s)
 }
 
+/// `api` → this machine; `api@studio` → the paired machine "studio".
+pub fn split_machine(name: &str) -> (&str, Option<&str>) {
+    match name.rsplit_once('@') {
+        Some((n, m)) if !n.is_empty() && !m.is_empty() => (n, Some(m)),
+        _ => (name, None),
+    }
+}
+
+/// API path of a service, honouring `name@machine`.
+pub fn svc_path(name: &str) -> String {
+    match split_machine(name) {
+        (n, Some(m)) => format!("/api/machines/{}/services/{}", enc(m), enc(n)),
+        (n, None) => format!("/api/services/{}", enc(n)),
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub info: DaemonInfo,
@@ -79,7 +95,7 @@ impl Client {
         self.req("GET", "/api/services", None)
     }
     pub fn get(&self, name: &str) -> Res<ServiceState> {
-        self.req("GET", &format!("/api/services/{}", enc(name)), None)
+        self.req("GET", &svc_path(name), None)
     }
     pub fn create(&self, cfg: &ServiceConfig, start: bool) -> Res<ServiceState> {
         let q = if start { "?start=1" } else { "" };
@@ -92,20 +108,20 @@ impl Client {
         self.req("DELETE", &format!("/api/services/{}", enc(name)), None)
     }
     pub fn action(&self, name: &str, action: &str) -> Res<ServiceState> {
-        self.req("POST", &format!("/api/services/{}/{action}", enc(name)), None)
+        self.req("POST", &format!("{}/{action}", svc_path(name)), None)
     }
     pub fn stdin(&self, name: &str, data: &str) -> Res<Value> {
         self.req("POST", &format!("/api/services/{}/stdin", enc(name)), Some(json!({ "data": data })))
     }
     pub fn logs(&self, name: &str, tail: usize) -> Res<Vec<LogLine>> {
-        let v: Value = self.req("GET", &format!("/api/services/{}/logs?tail={tail}", enc(name)), None)?;
+        let v: Value = self.req("GET", &format!("{}/logs?tail={tail}", svc_path(name)), None)?;
         serde_json::from_value(v["lines"].clone()).map_err(|e| e.to_string())
     }
     pub fn clear_logs(&self, name: &str) -> Res<Value> {
         self.req("DELETE", &format!("/api/services/{}/logs", enc(name)), None)
     }
     pub fn metrics(&self, name: &str, range: &str, points: usize) -> Res<Vec<MetricSample>> {
-        let v: Value = self.req("GET", &format!("/api/services/{}/metrics?range={range}&points={points}", enc(name)), None)?;
+        let v: Value = self.req("GET", &format!("{}/metrics?range={range}&points={points}", svc_path(name)), None)?;
         serde_json::from_value(v["samples"].clone()).map_err(|e| e.to_string())
     }
     pub fn reload(&self) -> Res<ReloadResp> {

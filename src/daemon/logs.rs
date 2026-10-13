@@ -40,6 +40,8 @@ impl LogStore {
     }
 
     pub fn push(&self, stream: &str, line: String) {
+        // Secrets never reach the ring buffer, the log file or any stream.
+        let line = crate::scrub::scrub_string(line);
         let l = LogLine { ts: paths::now_ms(), stream: stream.to_string(), line };
         let mut g = self.inner.lock().unwrap();
         g.lines.push_back(l.clone());
@@ -90,8 +92,39 @@ impl LogStore {
         let _ = OpenOptions::new().write(true).truncate(true).open(&self.file);
     }
 
+    /// Re-scrub what's already stored (after a secret was added or changed).
+    pub fn rescrub(&self) {
+        if !crate::scrub::active() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for l in g.lines.iter_mut() {
+            if let std::borrow::Cow::Owned(s) = crate::scrub::scrub(&l.line) {
+                l.line = s;
+            }
+        }
+        g.fd = None;
+        let mut rotated = self.file.clone().into_os_string();
+        rotated.push(".1");
+        for f in [self.file.clone(), PathBuf::from(rotated)] {
+            rescrub_file(&f);
+        }
+    }
+
     pub fn close(&self) {
         self.inner.lock().unwrap().fd = None;
+    }
+}
+
+/// Rewrite a log file with secrets masked (only if something changed).
+pub fn rescrub_file(f: &PathBuf) {
+    let Ok(bytes) = std::fs::read(f) else { return };
+    let text = String::from_utf8_lossy(&bytes);
+    if let std::borrow::Cow::Owned(clean) = crate::scrub::scrub(&text) {
+        let tmp = f.with_extension("scrub.tmp");
+        if std::fs::write(&tmp, clean).is_ok() {
+            let _ = std::fs::rename(tmp, f);
+        }
     }
 }
 

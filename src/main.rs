@@ -1,4 +1,5 @@
 mod cli;
+mod cli_more;
 mod cmdline;
 mod client;
 mod config;
@@ -6,6 +7,7 @@ mod daemon;
 mod fmt;
 mod launchd;
 mod paths;
+mod scrub;
 mod setup;
 mod tui;
 mod types;

@@ -19,22 +19,40 @@ struct SetupView: View {
     @State private var rError: String?
     @State private var totpSetup: TotpSetup?
     @State private var totpCode = ""
+    @State private var tab: SettingsTab = .general
+    @State private var cmuxBusy = false
+    @State private var cmuxError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
-            if Helper.isBundled && !Helper.inApplications { moveCard }
-            VStack(spacing: 0) {
-                loginRow
-                Divider().padding(.leading, 52)
-                cliRow
-                Divider().padding(.leading, 52)
-                daemonRow
+            if !onboarding && store.connected {
+                Picker("", selection: $tab) {
+                    ForEach(SettingsTab.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(.background.secondary))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.separator.opacity(0.6)))
-            if !onboarding && store.connected { generalCard }
-            if !onboarding && store.connected { remoteCard }
+            if tab == .general || onboarding || !store.connected {
+                if Helper.isBundled && !Helper.inApplications { moveCard }
+                VStack(spacing: 0) {
+                    loginRow
+                    Divider().padding(.leading, 52)
+                    cliRow
+                    Divider().padding(.leading, 52)
+                    daemonRow
+                }
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(.background.secondary))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.separator.opacity(0.6)))
+                if !onboarding && store.connected { generalCard }
+                if !onboarding && store.connected { remoteCard }
+            } else if tab == .secrets {
+                SecretsSettings()
+            } else if tab == .machines {
+                MachinesSettings()
+            } else if tab == .monitoring {
+                MonitoringSettings()
+            }
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11))
@@ -46,6 +64,13 @@ struct SetupView: View {
         }
         .padding(24)
         .frame(width: 520)
+        .onAppear {
+            // Snapshot/dev helper: LSTACK_SNAPSHOT_TAB=secrets|machines|monitoring|general.
+            if let t = ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_TAB"], let tab = SettingsTab.allCases.first(where: { $0.title.lowercased() == t }) {
+                onboarding = false
+                self.tab = tab
+            }
+        }
         .task {
             await store.refreshSetup()
             await store.refreshRemote()
@@ -147,6 +172,10 @@ struct SetupView: View {
     private var generalCard: some View {
         VStack(spacing: 0) {
             terminalRow
+            if let c = store.settings?.cmux, c.installed, store.settings?.terminal == "cmux" || store.cmuxDenied != nil {
+                Divider().padding(.leading, 52)
+                cmuxRow(c)
+            }
             Divider().padding(.leading, 52)
             diskAccessRow
         }
@@ -165,6 +194,30 @@ struct SetupView: View {
             .labelsHidden()
             .fixedSize()
             .disabled(st == nil)
+        }
+    }
+
+    private func cmuxRow(_ c: CmuxStatus) -> some View {
+        let ok = c.allowsLStack
+        let detail = ok
+            ? "LStack can open cmux workspaces (socket mode: \(c.mode))."
+            : (cmuxError ?? "cmux only accepts commands from its own terminals (mode: \(c.mode)). Allow switches it to password mode with a random password kept in LStack's secret store; your cmux.json is backed up first.")
+        return SetupRow(icon: "rectangle.split.3x1.fill", tint: ok ? .green : .orange, title: "cmux access", detail: detail) {
+            if ok {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            } else {
+                Button {
+                    cmuxBusy = true
+                    Task {
+                        cmuxError = await store.fixCmux(retry: false)
+                        cmuxBusy = false
+                    }
+                } label: {
+                    if cmuxBusy { ProgressView().controlSize(.small) } else { Text("Allow LStack") }
+                }
+                .controlSize(.small)
+                .disabled(cmuxBusy)
+            }
         }
     }
 
@@ -431,7 +484,7 @@ struct SetupView: View {
     }
 }
 
-private struct SetupRow<Accessory: View>: View {
+struct SetupRow<Accessory: View>: View {
     let icon: String
     let tint: Color
     let title: String

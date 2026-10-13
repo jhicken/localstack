@@ -50,6 +50,26 @@ pub fn validate(mut c: ServiceConfig) -> Result<ServiceConfig, String> {
             _ => return Err(format!("{}: healthcheck type must be http | tcp", c.name)),
         }
     }
+    for (env, secret) in c.secret_refs() {
+        if !crate::daemon::secrets::valid_name(&env) || !crate::daemon::secrets::valid_name(&secret) {
+            return Err(format!("{}: invalid secret reference {env:?} → {secret:?} (letters, digits and _)", c.name));
+        }
+    }
+    for u in c.urls.iter().flatten() {
+        if !(u.url().starts_with("http://") || u.url().starts_with("https://")) {
+            return Err(format!("{}: url {:?} must start with http:// or https://", c.name, u.url()));
+        }
+    }
+    if let Some(h) = &c.heartbeat {
+        if let Some(u) = &h.url {
+            if !(u.starts_with("http://") || u.starts_with("https://")) {
+                return Err(format!("{}: heartbeat url must start with http:// or https://", c.name));
+            }
+        }
+        if h.interval.is_some_and(|i| !(5.0..=86_400.0).contains(&i)) {
+            return Err(format!("{}: heartbeat interval must be between 5 and 86400 seconds", c.name));
+        }
+    }
     Ok(c)
 }
 
@@ -155,6 +175,19 @@ mod tests {
         assert!(parse_yaml("name: a\ntype: nope\ncommand: x\n").unwrap_err().contains("unknown type"));
         assert!(parse_yaml("name: a\ncommand: x\nrestart: sometimes\n").is_err());
         assert!(parse_yaml("name: a\ncommand: x\nhealthcheck: {type: tcp}\n").is_err());
+    }
+
+    #[test]
+    fn new_fields() {
+        let c = parse_yaml("name: a\ncommand: x\nsecrets: [GH_TOKEN]\nurls: [http://localhost:3000, {url: 'http://localhost:9229', label: debugger}]\nheartbeat: {slug: a-svc, interval: 30}\n").unwrap();
+        assert_eq!(c.secret_refs(), vec![("GH_TOKEN".to_string(), "GH_TOKEN".to_string())]);
+        assert_eq!(c.urls.as_ref().unwrap()[1].label(), Some("debugger"));
+        assert_eq!(parse_yaml(&to_yaml(&c)).unwrap(), c);
+        let m = parse_yaml("name: a\ncommand: x\nsecrets: {DB_PASSWORD: PROD_DB}\n").unwrap();
+        assert_eq!(m.secret_refs(), vec![("DB_PASSWORD".to_string(), "PROD_DB".to_string())]);
+        assert!(parse_yaml("name: a\ncommand: x\nsecrets: [bad-name]\n").is_err());
+        assert!(parse_yaml("name: a\ncommand: x\nurls: [localhost:3000]\n").is_err());
+        assert!(parse_yaml("name: a\ncommand: x\nheartbeat: {interval: 1}\n").is_err());
     }
 
     #[test]

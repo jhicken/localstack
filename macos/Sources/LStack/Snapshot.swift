@@ -11,7 +11,7 @@ enum SnapshotRenderer {
         let logs = ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_LOGS"]
         Task {
             try? await Task.sleep(for: .seconds(4))
-            if let expand { store.expanded = expand; await store.loadHistory(expand) }
+            if let expand, let s = store.service(id: expand) { store.expanded = expand; await store.loadHistory(s) }
             try? await Task.sleep(for: .seconds(1))
             render(PopoverView().environment(store), size: nil, to: path)
             if ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_SETUP"] != nil {

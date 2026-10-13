@@ -46,6 +46,67 @@ pub struct HealthCheck {
     pub timeout: Option<f64>,
 }
 
+/// `secrets: [NAME, …]` (env var = secret name) or `secrets: { ENV_VAR: SECRET_NAME }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SecretRefs {
+    List(Vec<String>),
+    Map(BTreeMap<String, String>),
+}
+
+/// A web address a service serves: a plain string or `{ url, label }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UrlSpec {
+    Url(String),
+    Labeled {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        label: Option<String>,
+    },
+}
+
+impl UrlSpec {
+    pub fn url(&self) -> &str {
+        match self {
+            UrlSpec::Url(u) | UrlSpec::Labeled { url: u, .. } => u,
+        }
+    }
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            UrlSpec::Url(_) => None,
+            UrlSpec::Labeled { label, .. } => label.as_deref(),
+        }
+    }
+}
+
+/// healthchecks.io-compatible pings for one service.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Heartbeat {
+    /// Full ping URL (e.g. https://hc-ping.com/<uuid>). Otherwise built from the ping key + slug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Slug used with the ping key (default: the service name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// Seconds between success pings (default 60).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<f64>,
+    /// Send `/start` when the service starts (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<bool>,
+    /// Send `/fail` on crash / unhealthy (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail: Option<bool>,
+    /// Attach the last log lines (scrubbed) to `/fail` pings (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<bool>,
+    /// Set to false to keep the config but stop pinging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
 /// On-disk service definition (`~/.localstack/services/<name>.yaml`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +127,17 @@ pub struct ServiceConfig {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthCheck>,
+    /// Secrets from the LStack secret store, passed as environment variables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretRefs>,
+    /// Web addresses to show for this service, in addition to detected listening ports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<UrlSpec>>,
+    /// `false` = only show `urls`, don't add auto-detected ports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detect_urls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<Heartbeat>,
     // process
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -116,6 +188,60 @@ impl ServiceConfig {
     pub fn autostart(&self) -> bool {
         self.autostart.unwrap_or(false)
     }
+    /// (env var, secret name) pairs.
+    pub fn secret_refs(&self) -> Vec<(String, String)> {
+        match &self.secrets {
+            None => vec![],
+            Some(SecretRefs::List(v)) => v.iter().map(|s| (s.clone(), s.clone())).collect(),
+            Some(SecretRefs::Map(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+}
+
+/// A web address shown for a running service.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub port: Option<u16>,
+    /// "detected" (listening socket / docker port) or "config" (`urls:` in YAML).
+    pub source: String,
+    /// Bound to loopback only: reachable from this machine but not from other machines.
+    #[serde(default)]
+    pub local_only: bool,
+}
+
+/// Outcome of the latest healthchecks.io ping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatStatus {
+    pub last_ping: i64,
+    /// "success" | "start" | "fail"
+    pub kind: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
+}
+
+/// A process on the machine that crosses a usage threshold (or belongs to a service).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcInfo {
+    pub pid: i32,
+    pub name: String,
+    /// % of one core.
+    pub cpu: f64,
+    /// Resident bytes.
+    pub mem: f64,
+    /// Network bytes/s (rx + tx), when known.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub net: Option<f64>,
+    /// The LStack service this process belongs to, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub service: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -145,7 +271,7 @@ pub struct SystemSample {
     pub ls_mem: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceState {
     pub name: String,
@@ -173,6 +299,13 @@ pub struct ServiceState {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub metrics: Option<MetricSample>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub urls: Vec<ServiceUrl>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub heartbeat: Option<HeartbeatStatus>,
+    /// Which machine runs it: None = this machine, else the paired machine's name.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub machine: Option<String>,
     pub config: ServiceConfig,
 }
 

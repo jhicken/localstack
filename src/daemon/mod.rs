@@ -1,10 +1,14 @@
 //! The long-running daemon (`lstack daemon run`), normally started by launchd at login.
 pub mod docker_api;
 mod drivers;
+pub mod exec;
 pub mod health;
+pub mod heartbeat;
+pub mod peers;
 pub mod logs;
 pub mod procinfo;
 pub mod remote;
+pub mod secrets;
 pub mod server;
 pub mod store;
 pub mod supervisor;
@@ -19,7 +23,7 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 
 fn log(msg: &str) {
-    println!("{} {msg}", paths::iso(now_ms()));
+    println!("{} {}", paths::iso(now_ms()), crate::scrub::scrub(msg));
 }
 
 fn token() -> String {
@@ -59,6 +63,9 @@ pub fn run() -> i32 {
 }
 
 async fn serve() -> i32 {
+    if let Some(e) = secrets::init() {
+        log(&format!("secret store: {e}"));
+    }
     let sup = match supervisor::Sup::new() {
         Ok(s) => s,
         Err(e) => {
@@ -81,7 +88,8 @@ async fn serve() -> i32 {
     let token = token();
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let remote = remote::Remote::new();
-    let state = server::AppState { sup: sup.clone(), token: Arc::new(token.clone()), shutdown: shutdown.clone(), remote: remote.clone() };
+    let peers = peers::Peers::new(sup.clone());
+    let state = server::AppState { sup: sup.clone(), token: Arc::new(token.clone()), shutdown: shutdown.clone(), remote: remote.clone(), peers: peers.clone() };
     let remote_state = state.clone();
     let state_remote_stop = remote.clone();
     let info = DaemonInfo {
@@ -107,6 +115,7 @@ async fn serve() -> i32 {
         signal(SignalKind::hangup()).unwrap(),
     );
     let s2 = sup.clone();
+    heartbeat::start(&sup);
     tokio::spawn(async move {
         s2.boot().await;
         for e in s2.config_errors() {
@@ -124,6 +133,7 @@ async fn serve() -> i32 {
     }
     log("shutting down…");
     state_remote_stop.stop();
+    peers.shutdown();
     sup.shutdown().await;
     if let Some(mut i) = crate::client::read_info() {
         if i.pid == info.pid {

@@ -111,7 +111,10 @@ lstack metrics api --range 24h
 lstack enable api / lstack disable api
 lstack rm api
 lstack terminal iterm  # app used by Dashboard/Attach: terminal | iterm | cmux | ghostty
+lstack ps              # other busy processes (over the CPU / memory / network thresholds)
 ```
+
+The menu bar footer has two dashboard buttons: **Terminal** opens `lstack top` in your terminal app, and **Web** opens the web dashboard in your browser. Web appears only when the remote dashboard is on.
 
 Run `lstack help` for everything.
 
@@ -141,6 +144,95 @@ Then open `http://<this-mac>:7380` and sign in.
 - **Controls.** Start/stop/restart buttons appear only when **Allow start / stop / restart** is enabled (`--allow-control`, the default). Use `--read-only` for view-only access.
 - **Secrets.** Environment variable values are redacted (`••••`). Responses send a strict CSP, `X-Frame-Options: DENY` and CSRF header checks.
 - **Plain HTTP.** Use it on a trusted network, or over a VPN such as Tailscale. macOS may ask you once to allow incoming connections.
+
+## Secrets
+
+LStack has a write-only secret store for tokens and passwords that your scripts need. Once you store a value, nothing can read it back: no API, no CLI command and no UI shows it. Each service gets only the secrets you give it, as environment variables.
+
+```sh
+lstack secret set GITHUB_TOKEN          # hidden prompt (or: … --stdin)
+lstack secret ls                        # names, when they were set, which services use them
+lstack secret rm GITHUB_TOKEN
+lstack secret rotate-key                # re-encrypt everything under a new key
+```
+
+```yaml
+secrets: [GITHUB_TOKEN, NPM_TOKEN]       # env var = secret name
+secrets: { GH_TOKEN: GITHUB_TOKEN }      # or rename: ENV_VAR: SECRET_NAME
+```
+
+In the app, use **Settings → Secrets** to add, replace or delete secrets and to choose which services get each one.
+
+- **At rest.** Secrets are encrypted with ChaCha20-Poly1305 in `secrets.enc`. The 256-bit key is never stored whole. It is split into two XOR shares: one is a Keychain item (`dev.lstack.secrets`, created via `/usr/bin/security` so app updates don't cause new prompts), the other a `0600` file. The daemon reads the Keychain once at boot and keeps the key only in memory, zeroed when dropped. If the Keychain is locked, the store stays locked: services that need secrets fail with a clear error, and `lstack secret unlock` (or **Unlock** in Settings) retries.
+- **Logs are scrubbed.** Every secret value, plus its base64, URL-encoded and hex forms, is replaced with `••••[NAME]`. This applies to log files, live streams, the TUI and web views, crash messages, heartbeat `/fail` bodies, logs sent to other machines and `lstack exec` sessions. The daemon runs `docker exec` on a pseudo-terminal and scrubs the output before it reaches your terminal. Existing log files are scrubbed again when you add a secret.
+- **Only on this Mac.** Secrets can't be set or read over the remote dashboard or by other machines.
+- **Limitations.**
+  - Docker stores container env, so anyone with Docker access can see it via `docker inspect`. A container keeps its old env until it is recreated.
+  - A secret embedded in a larger string and then base64-encoded isn't scrubbed.
+  - In `lstack exec`, a secret printed one character at a time can show its first two characters before the rest is masked, and any of it can show if the pauses are longer than 0.3 s. Running `docker exec` directly bypasses LStack entirely.
+
+## Service URLs
+
+When a service starts a web server, LStack finds its listening TCP ports (for scripts, any process in the service's process tree; for containers, their published ports). Each one becomes a clickable link: chips in the menu bar, `o` in `lstack top`, a URL column in `lstack ls`, and links in the web dashboard. To add your own links or label them:
+
+```yaml
+urls:
+  - http://localhost:3000
+  - { url: http://localhost:3000/admin, label: Admin }
+detectUrls: false        # show only the urls above
+```
+
+On other machines, `localhost` is rewritten to that machine's address. Ports bound only to 127.0.0.1 are marked **local only**, because they usually can't be reached from another machine.
+
+## Heartbeats (healthchecks.io)
+
+LStack can ping [healthchecks.io](https://healthchecks.io), or any compatible server such as a self-hosted Healthchecks, so you get alerted when a service or the whole Mac goes down.
+
+```sh
+lstack heartbeat key                                  # project ping key (stored in the secret store)
+lstack heartbeat set api                              # pings <server>/<key>/api (check created on first ping)
+lstack heartbeat set api --url https://hc-ping.com/<uuid> --interval 120
+lstack heartbeat machine mac-mini                     # ping while this Mac and LStack are up
+lstack heartbeat test api
+lstack heartbeat                                      # last ping per service
+```
+
+```yaml
+heartbeat:
+  url: https://hc-ping.com/<uuid>   # or `slug: api` with a ping key; default slug = service name
+  interval: 60                      # success ping while running and healthy
+  start: true                       # /start when it (re)starts
+  fail: true                        # /fail on crash, unhealthy or giving up
+  logs: true                        # attach the last 20 (scrubbed) log lines to /fail
+```
+
+You can also manage this in **Settings → Monitoring**, where you set the ping key and server, turn on the machine heartbeat, and use a one-click per-service toggle and Test button. The last ping result appears in each service's details in every interface. Ping URLs are hidden from the remote dashboard.
+
+## Other machines
+
+A Mac can watch other Macs that run LStack. Their services and busy processes then appear, grouped by machine, in the menu bar, `lstack ls`, `lstack top` and the web dashboard.
+
+1. On the Mac to be watched, turn on the remote dashboard, then run `lstack remote pair`, or click **Settings → Machines → Pair this Mac → Show Code**. You get a one-time code, valid for 10 minutes.
+2. On your Mac, run `lstack machine add <address> --code XXXX-XXXX`, or use **Settings → Machines**. You can also sign in with the other Mac's dashboard login (`--user`, plus 2FA if it is on).
+
+```sh
+lstack machine ls                 # status, service counts, access
+lstack ls --machine studio        # or --local
+lstack logs api@studio -f         # name@machine works for logs/show/start/stop/restart/metrics
+lstack ps --machine studio
+lstack machine rename studio mini
+lstack machine rm mini
+lstack remote peers               # on the watched Mac: who's watching; `rm <id>` revokes
+```
+
+- **Control.** Start, stop and restart are allowed only when the watched Mac's remote dashboard has **Allow start / stop / restart** turned on. Otherwise its services are read-only.
+- **Auth.** Each pairing gets its own long-lived bearer token. The watched Mac stores it only as a SHA-256 hash in `remote.json`. Revoking it cuts off that machine's live streams immediately.
+- **No secrets cross.** Secret values are never sent, env values and ping URLs are redacted, and logs are scrubbed on the watched Mac before they're sent.
+- **Plain HTTP.** As with the dashboard, use a trusted network or a VPN such as Tailscale.
+
+## Busy processes
+
+Under each machine's services, LStack lists other processes that cross a threshold. The defaults are CPU over 10% of a core, memory over 10% of RAM, or network over 1 MB/s, with at most 15 per machine. LStack services always show, whatever their usage. You can change the thresholds in **Settings → Monitoring**, or with `PUT /api/settings {"processes": {…}}`. The same list is available from `lstack ps` and `GET /api/processes`. Only your own processes' network use and ports can be read without root.
 
 ### Shell environment
 
@@ -213,6 +305,7 @@ autostart: true
 - **Machine load.** The top of the menu bar panel shows whole-Mac CPU and memory with ~15 minutes of sparkline history. Each is split into **LStack** (your services) and **Other** (every other app), so you can tell when the machine itself is overloaded. The same data is at `GET /api/system`. Machine CPU is a share of all cores, while per-service CPU is a share of one core, as in Activity Monitor.
 - **Crash loops.** Crashed scripts restart with exponential backoff (1 s → 30 s, up to `maxRestarts`). While a script waits to restart, the menu bar shows **RESTART IN Ns** with a red stop button. `lstack ls` and `lstack top` show `restarting Ns`. Stopping it cancels the pending restart, and stop waits for a start that's already in progress.
 - **Terminal app.** Dashboard, Attach and Shell open in the app chosen under **Settings → Terminal app** (or `lstack terminal <id>`): Terminal, iTerm, cmux or Ghostty. macOS asks once to allow LStack to control iTerm or Terminal.
+- **cmux.** By default, cmux only accepts commands from processes started inside cmux, so the daemon gets "Access denied". When that happens, the menu bar offers **Allow LStack** or **Use Terminal**. You'll find the same switch under **Settings → cmux access**, and in the CLI as `lstack terminal cmux --fix`. Allowing it backs up `~/.config/cmux/cmux.json`, switches `automation.socketControlMode` to `password` with a random password kept in LStack's secret store, and reloads cmux. You can change or undo this anytime in cmux's settings.
 - The API binds to 127.0.0.1 only and requires the token in `daemon.json`.
 
 ## Development

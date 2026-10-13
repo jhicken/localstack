@@ -14,6 +14,13 @@ final class AppStore {
     var startingDaemon = false
     var expanded: String?
     var system: SystemInfo?
+    /// This Mac's busy processes (over the thresholds in Settings).
+    var processes: [ProcInfo] = []
+    /// Other Macs this one watches.
+    var machines: [Machine] = []
+    var localName: String?
+    /// Set when cmux refused to open a workspace; the popover offers the fix or Terminal instead.
+    var cmuxDenied: CmuxDenial?
 
     private var client: DaemonClient?
     private var toastTask: Task<Void, Never>?
@@ -55,11 +62,24 @@ final class AppStore {
             guard let snap = try? dec.decode(Snapshot.self, from: data) else { return }
             services = snap.services.sorted { $0.name < $1.name }
             configErrors = snap.configErrors
-            for s in services where s.isRunning { Task { await loadHistory(s.name) } }
+            if let m = snap.machine { localName = m }
+            for s in services where s.isRunning { Task { await loadHistory(s) } }
             Task {
                 await loadSystem()
                 await refreshSettings()
+                await refreshRemote()
+                await loadProcesses()
             }
+        case "processes":
+            guard let e = try? dec.decode(ProcessesEvent.self, from: data) else { return }
+            processes = e.processes
+        case "machines":
+            guard let e = try? dec.decode(MachinesEvent.self, from: data) else { return }
+            localName = e.local
+            machines = e.machines.map { var m = $0; m.services = m.services?.sorted { $0.name < $1.name }; return m }
+        case "peer":
+            guard let e = try? dec.decode(PeerEvent.self, from: data) else { return }
+            handlePeer(e.machine, e.event, e.data.data)
         case "service":
             guard let s = try? dec.decode(ServiceState.self, from: data) else { return }
             if let i = services.firstIndex(where: { $0.name == s.name }) {
@@ -90,21 +110,121 @@ final class AppStore {
         }
     }
 
+    private func handlePeer(_ name: String, _ event: String, _ data: Data) {
+        let dec = JSONDecoder()
+        if event == "removed-machine" {
+            machines.removeAll { $0.name == name }
+            return
+        }
+        if event == "machine" {
+            guard var m = try? dec.decode(Machine.self, from: data) else { return }
+            if let i = machines.firstIndex(where: { $0.name == name }) {
+                m.services = machines[i].services
+                m.processes = machines[i].processes
+                m.configErrors = machines[i].configErrors
+                machines[i] = m
+            } else {
+                machines.append(m)
+                machines.sort { $0.name < $1.name }
+            }
+            return
+        }
+        guard let i = machines.firstIndex(where: { $0.name == name }) else { return }
+        switch event {
+        case "snapshot":
+            guard let snap = try? dec.decode(Snapshot.self, from: data) else { return }
+            machines[i].services = snap.services.sorted { $0.name < $1.name }
+            machines[i].configErrors = snap.configErrors
+        case "service":
+            guard var s = try? dec.decode(ServiceState.self, from: data) else { return }
+            var list = machines[i].services ?? []
+            if let j = list.firstIndex(where: { $0.name == s.name }) {
+                if s.metrics == nil, s.isRunning { s.metrics = list[j].metrics }
+                list[j] = s
+            } else {
+                list.append(s)
+                list.sort { $0.name < $1.name }
+            }
+            machines[i].services = list
+        case "removed":
+            guard let e = try? dec.decode(NameEvent.self, from: data) else { return }
+            machines[i].services?.removeAll { $0.name == e.name }
+        case "metrics":
+            guard let e = try? dec.decode(MetricsEvent.self, from: data) else { return }
+            if let j = machines[i].services?.firstIndex(where: { $0.name == e.name }) { machines[i].services?[j].metrics = e.metrics }
+            let key = "\(e.name)@\(name)"
+            var h = history[key] ?? []
+            h.append(e.metrics)
+            if h.count > Self.historyLimit { h.removeFirst(h.count - Self.historyLimit) }
+            history[key] = h
+        case "processes":
+            guard let e = try? dec.decode(ProcessesEvent.self, from: data) else { return }
+            machines[i].processes = e.processes
+        default:
+            break
+        }
+    }
+
+    /// Every service on every machine (for counts in the menu bar).
+    var allServices: [ServiceState] { services + machines.flatMap { $0.services ?? [] } }
+
+    /// API path of a service on this Mac or on a paired machine.
+    func path(_ s: ServiceState) -> String { Self.path(name: s.name, machine: s.machine) }
+
+    static func path(name: String, machine: String?) -> String {
+        if let machine { return "/api/machines/\(machine.urlPath)/services/\(name.urlPath)" }
+        return "/api/services/\(name.urlPath)"
+    }
+
+    /// `name` or `name@machine` (the logs window's id).
+    static func split(_ id: String) -> (name: String, machine: String?) {
+        guard let at = id.lastIndex(of: "@"), at != id.startIndex, id.index(after: at) != id.endIndex else { return (id, nil) }
+        return (String(id[..<at]), String(id[id.index(after: at)...]))
+    }
+
+    func service(id: String) -> ServiceState? { allServices.first { $0.id == id } }
+
+    func machine(_ name: String?) -> Machine? { name.flatMap { n in machines.first { $0.name == n } } }
+
+    /// Whether start/stop/restart are possible (always on this Mac; per the other Mac's setting otherwise).
+    func canControl(_ s: ServiceState) -> Bool {
+        guard let m = machine(s.machine) else { return true }
+        return m.online && m.canControl
+    }
+
+    func loadProcesses() async {
+        struct R: Decodable { let processes: [ProcInfo] }
+        if let r = try? await client?.send("GET", "/api/processes", as: R.self) { processes = r.processes }
+    }
+
     func loadSystem() async {
         if let s = try? await client?.send("GET", "/api/system", as: SystemInfo.self) { system = s }
     }
 
-    func loadHistory(_ name: String) async {
-        guard let client, let samples = try? await client.metrics(name, range: "15m", points: 120) else { return }
-        history[name] = samples
+    func loadHistory(_ s: ServiceState) async {
+        struct R: Decodable { let samples: [MetricSample] }
+        guard let client, let r = try? await client.send("GET", "\(path(s))/metrics?range=15m&points=120", as: R.self) else { return }
+        history[s.id] = r.samples
     }
 
     // MARK: actions
 
     func perform(_ name: String, _ action: String) {
+        if let s = service(id: name) { perform(s, action); return }
         Task {
             do { try await client?.action(name, action) } catch { flash(error.localizedDescription) }
         }
+    }
+
+    func perform(_ s: ServiceState, _ action: String) {
+        Task {
+            do { try await client?.send("POST", "\(path(s))/\(action)", as: ServiceState.self) } catch { flash(error.localizedDescription) }
+        }
+    }
+
+    /// Open a service URL in the default browser.
+    func open(_ u: ServiceURL) {
+        if let url = URL(string: u.url) { NSWorkspace.shared.open(url) }
     }
 
     func setAutostart(_ name: String, _ on: Bool) {
@@ -130,16 +250,61 @@ final class AppStore {
         try? await client?.send("POST", "/api/split-command", body: ["command": command, "cwd": cwd], as: CommandSplit.self)
     }
 
-    func openTerminal(_ name: String) {
+    func openTerminal(_ name: String, terminal: String? = nil) {
+        openInTerminal("/api/services/\(name.urlPath)/open-terminal", terminal: terminal)
+    }
+
+    /// The terminal dashboard (`lstack top`) in the preferred terminal app.
+    func openDashboard(terminal: String? = nil) {
+        openInTerminal("/api/open-dashboard", terminal: terminal)
+    }
+
+    private func openInTerminal(_ path: String, terminal: String?) {
         Task {
-            do { try await client?.send("POST", "/api/services/\(name.urlPath)/open-terminal") } catch { flash(error.localizedDescription) }
+            do {
+                let q = terminal.map { "?terminal=\($0)" } ?? ""
+                let r = try await client?.send("POST", path + q, as: OpenResult.self)
+                if r?.cmuxDenied == true {
+                    cmuxDenied = CmuxDenial(path: path, message: r?.error ?? "cmux refused the connection")
+                } else if r?.ok == false {
+                    flash(r?.error ?? "Couldn't open the terminal")
+                } else {
+                    cmuxDenied = nil
+                }
+            } catch { flash(error.localizedDescription) }
         }
     }
 
-    func openDashboard() {
-        Task {
-            do { try await client?.send("POST", "/api/open-dashboard") } catch { flash(error.localizedDescription) }
-        }
+    /// The web dashboard (remote access) in the browser.
+    func openWeb() {
+        guard let u = remote?.urls.first, let url = URL(string: u) else { flash("Turn on the remote dashboard in Settings first"); return }
+        NSWorkspace.shared.open(url)
+    }
+
+    var webAvailable: Bool { remote?.running == true && !(remote?.urls.isEmpty ?? true) }
+
+    /// Switch cmux to password mode for LStack, then retry what was refused.
+    func fixCmux(retry: Bool = true) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            let r = try await client.send("POST", "/api/terminal/cmux/enable-password", as: CmuxFixResult.self)
+            await refreshSettings()
+            let pending = cmuxDenied
+            cmuxDenied = nil
+            if retry, let pending {
+                try? await Task.sleep(for: .milliseconds(600))
+                openInTerminal(pending.path, terminal: nil)
+            }
+            if let note = r.note { flash(note) }
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    /// Retry what cmux refused in Terminal instead.
+    func useTerminalInstead() {
+        guard let pending = cmuxDenied else { return }
+        cmuxDenied = nil
+        openInTerminal(pending.path, terminal: "terminal")
     }
 
     func revealConfig(_ name: String? = nil) {
@@ -297,6 +462,141 @@ final class AppStore {
         }
     }
 
+    // MARK: secrets (write-only: values go in, never come back out)
+
+    var secrets: SecretsStatus?
+
+    func refreshSecrets() async {
+        secrets = try? await client?.send("GET", "/api/secrets", as: SecretsStatus.self)
+    }
+
+    func setSecret(_ name: String, _ value: String) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            try await client.send("PUT", "/api/secrets/\(name.urlPath)", body: ["value": value])
+            await refreshSecrets()
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func removeSecret(_ name: String) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            try await client.send("DELETE", "/api/secrets/\(name.urlPath)")
+            await refreshSecrets()
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func unlockSecrets() async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            secrets = try await client.send("POST", "/api/secrets/unlock", as: SecretsStatus.self)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    /// Which secrets a service receives (env var name = secret name).
+    func setServiceSecrets(_ name: String, _ names: [String]) async -> String? {
+        let e = await patchService(name, ["secrets": names.isEmpty ? NSNull() : names])
+        await refreshSecrets()
+        return e
+    }
+
+    // MARK: settings patches (heartbeats, process thresholds)
+
+    /// Send a free-form JSON object (NSNull clears a key). Throws DaemonError.http on failure.
+    private func sendJSON(_ method: String, _ path: String, _ object: [String: Any]) async throws -> Data {
+        guard let client else { throw DaemonError.notRunning }
+        var req = client.request(method, path)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: object)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code >= 400 {
+            throw DaemonError.http(code, (try? JSONDecoder().decode([String: String].self, from: data))?["error"] ?? "")
+        }
+        return data
+    }
+
+    /// PUT /api/settings with a partial JSON object. Returns an error message, or nil.
+    func updateSettings(_ patch: [String: Any]) async -> String? {
+        do {
+            let data = try await sendJSON("PUT", "/api/settings", patch)
+            settings = try? JSONDecoder().decode(DaemonSettings.self, from: data)
+            if settings == nil { await refreshSettings() }
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    /// PATCH a service definition (JSON merge patch; NSNull removes a key).
+    func patchService(_ name: String, _ patch: [String: Any]) async -> String? {
+        do {
+            _ = try await sendJSON("PATCH", "/api/services/\(name.urlPath)", patch)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func testHeartbeat(_ service: String? = nil) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            let st = try await client.send("POST", "/api/heartbeat/test", body: service.map { ["name": $0] } ?? [:], as: HeartbeatStatus.self)
+            await refreshSettings()
+            return st.ok ? nil : (st.error ?? "ping failed")
+        } catch { return error.localizedDescription }
+    }
+
+    // MARK: machines
+
+    func addMachine(url: String, code: String?, username: String?, password: String?, totp: String?, name: String?) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        var body: [String: String] = ["url": url]
+        if let code, !code.isEmpty { body["code"] = code }
+        if let username, !username.isEmpty { body["username"] = username }
+        if let password, !password.isEmpty { body["password"] = password }
+        if let totp, !totp.isEmpty { body["totp"] = totp }
+        if let name, !name.isEmpty { body["name"] = name }
+        do {
+            let m = try await client.send("POST", "/api/machines", body: body, as: Machine.self)
+            if !machines.contains(where: { $0.name == m.name }) { machines.append(m); machines.sort { $0.name < $1.name } }
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func removeMachine(_ name: String) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            try await client.send("DELETE", "/api/machines/\(name.urlPath)")
+            machines.removeAll { $0.name == name }
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func renameMachine(_ name: String, to: String) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            try await client.send("PATCH", "/api/machines/\(name.urlPath)", body: ["name": to], as: Machine.self)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func pairCode() async throws -> PairCode {
+        guard let client else { throw DaemonError.notRunning }
+        return try await client.send("POST", "/api/remote/pair-code", as: PairCode.self)
+    }
+
+    func peerTokens() async -> [PeerToken] {
+        (try? await client?.send("GET", "/api/remote/peers", as: [PeerToken].self)) ?? []
+    }
+
+    func revokePeer(_ id: String) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            try await client.send("DELETE", "/api/remote/peers/\(id.urlPath)")
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
     func flash(_ msg: String) {
         toast = msg
         toastTask?.cancel()
@@ -306,8 +606,9 @@ final class AppStore {
         }
     }
 
-    func logStream(_ name: String) -> AsyncThrowingStream<(String, Data), Error>? {
-        client?.events("/api/services/\(name.urlPath)/logs/stream?tail=1000")
+    func logStream(_ id: String) -> AsyncThrowingStream<(String, Data), Error>? {
+        let (name, machine) = Self.split(id)
+        return client?.events("\(Self.path(name: name, machine: machine))/logs/stream?tail=1000")
     }
 
     func sendInput(_ name: String, _ text: String) {
@@ -321,4 +622,10 @@ final class AppStore {
     func clearLogs(_ name: String) {
         Task { try? await client?.send("DELETE", "/api/services/\(name.urlPath)/logs") }
     }
+}
+
+struct CmuxDenial: Equatable {
+    /// The open-terminal / open-dashboard request to retry.
+    let path: String
+    let message: String
 }

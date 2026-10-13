@@ -59,6 +59,18 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | System load | Whole-machine CPU/memory sampled from Mach host stats every 3 s (`/api/system`, SSE `system`), shown in the menu bar panel as sparklines plus an LStack vs. other-apps breakdown. The panel also shrinks back when content gets shorter. |
 | Full Disk Access | Settings detects whether the helper has Full Disk Access (needed by `op` and similar tools under launchd) and links to the System Settings pane |
 
+## Phase 1.7 — Secrets, machines, URLs, heartbeats ✅ (done)
+
+| Area | Delivered |
+|---|---|
+| Footer | Menu bar footer has **Terminal** (`lstack top`) and **Web** (remote dashboard; shown only when it's on) side by side |
+| cmux | Uses `cmux workspace create` with `CMUX_SOCKET_PASSWORD`. "Access denied" comes back as `cmuxDenied`, and the app offers one-click **Allow LStack** (backs up `cmux.json`, sets password mode, `reload-config`) or **Use Terminal**. Also in Settings and `lstack terminal cmux --fix`. |
+| Secrets | Write-only store (`lstack secret`, Settings → Secrets). ChaCha20-Poly1305 file plus a key split into two XOR shares (Keychain via `/usr/bin/security`, and a 0600 file), read once at boot. Explicit per-service `secrets:` injected as env. Every log path scrubs values and their base64/URL/hex variants. `lstack exec` goes through the daemon (an HTTP upgrade to a PTY running `docker exec`) and its output is scrubbed as a stream. |
+| Service URLs | Listening ports from libproc (process tree) and Docker published ports, plus `urls:` / `detectUrls:` in YAML. Shown as chips/links in the menu bar, TUI (`o`), CLI and web. Peer URLs are rewritten to the peer host, with a local-only flag. |
+| Heartbeats | healthchecks.io-compatible pings per service (`/start`, success interval, `/fail` with scrubbed logs) and a machine heartbeat. Ping key kept in the secret store. `lstack heartbeat`, Settings → Monitoring. |
+| Busy processes | All-process CPU/mem/net sampling with thresholds (default 10% CPU, 10% RAM, 1 MB/s, 15 rows). SSE `processes`, `/api/processes`, `lstack ps`, shown per machine in every UI. |
+| Machines | Pair other Macs (one-time code or dashboard login + 2FA). The host keeps an SSE subscription per peer (`peers.json`), and `/api/machines/:m/…` proxies logs/metrics/control (gated by the peer's allowControl). `name@machine` in the CLI, grouped by machine in the menu bar, TUI, CLI and web. Peer tokens are hashed and revocable (`lstack remote peers`). |
+
 ## Phase 2 — Daily-driver polish
 
 **Interaction**

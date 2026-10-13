@@ -17,7 +17,9 @@ struct LogView: View {
         let text: String
     }
 
-    private var service: ServiceState? { store.services.first { $0.name == name } }
+    /// `name` = this Mac's service; `name@machine` = a paired Mac's.
+    private var service: ServiceState? { store.service(id: name) }
+    private var isRemote: Bool { AppStore.split(name).machine != nil }
     private var visible: [IndexedLine] {
         filter.isEmpty ? lines : lines.filter { $0.text.localizedCaseInsensitiveContains(filter) }
     }
@@ -42,7 +44,7 @@ struct LogView: View {
                     if follow, let last = visible.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
-            if service?.type == "process" {
+            if service?.type == "process", !isRemote {
                 Divider()
                 HStack(spacing: 8) {
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
@@ -74,19 +76,26 @@ struct LogView: View {
             }
             ToolbarItemGroup {
                 if let s = service {
-                    if s.isRunning {
-                        Button { store.perform(name, "stop") } label: { Label("Stop", systemImage: "stop.fill") }
-                    } else {
-                        Button { store.perform(name, "start") } label: { Label("Start", systemImage: "play.fill") }
+                    Group {
+                        if s.isRunning {
+                            Button { store.perform(s, "stop") } label: { Label("Stop", systemImage: "stop.fill") }
+                        } else {
+                            Button { store.perform(s, "start") } label: { Label("Start", systemImage: "play.fill") }
+                        }
+                        Button { store.perform(s, "restart") } label: { Label("Restart", systemImage: "arrow.clockwise") }
                     }
-                    Button { store.perform(name, "restart") } label: { Label("Restart", systemImage: "arrow.clockwise") }
-                    Button { store.openTerminal(name) } label: { Label("Terminal", systemImage: "apple.terminal") }
-                        .disabled(!s.isRunning)
+                    .disabled(!store.canControl(s))
+                    if !isRemote {
+                        Button { store.openTerminal(name) } label: { Label("Terminal", systemImage: "apple.terminal") }
+                            .disabled(!s.isRunning)
+                    }
                 }
-                Button {
-                    store.clearLogs(name)
-                    lines = []
-                } label: { Label("Clear", systemImage: "trash") }
+                if !isRemote {
+                    Button {
+                        store.clearLogs(name)
+                        lines = []
+                    } label: { Label("Clear", systemImage: "trash") }
+                }
                 Toggle(isOn: $follow) { Label("Follow", systemImage: "arrow.down.to.line") }
                     .help("Auto-scroll to newest")
             }

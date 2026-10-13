@@ -106,6 +106,10 @@ impl Sup {
         if !std::path::Path::new(&cwd).is_dir() {
             return self.fail(name, gen, &format!("cwd does not exist: {cwd}"));
         }
+        let secret_env = match super::secrets::env_for(&cfg) {
+            Ok(e) => e,
+            Err(e) => return self.fail(name, gen, &e),
+        };
         let shell = cfg.shell.clone().filter(|s| !s.is_empty()).unwrap_or_else(crate::cmdline::user_shell);
         let command = cfg.command.clone().unwrap_or_default();
         self.with(name, Some(gen), |m| {
@@ -120,6 +124,7 @@ impl Sup {
             .current_dir(&cwd)
             .env("SHELL", &shell)
             .envs(cfg.env.clone().unwrap_or_default())
+            .envs(secret_env)
             .env("LSTACK_SERVICE", name)
             .env("LSTACK_COMMAND", &command)
             .stdin(Stdio::piped())
@@ -286,6 +291,15 @@ impl Sup {
             for (k, v) in cfg.env.iter().flatten() {
                 args.extend(["-e".into(), format!("{k}={v}")]);
             }
+            // `-e NAME` without a value: docker reads it from its own environment, so secret
+            // values never appear on a command line or in the logged command.
+            let secret_env = match super::secrets::env_for(&cfg) {
+                Ok(e) => e,
+                Err(e) => return self.fail(name, gen, &e),
+            };
+            for (k, _) in &secret_env {
+                args.extend(["-e".into(), k.clone()]);
+            }
             args.extend(cfg.args.iter().flatten().cloned());
             args.push(image.clone());
             if let Some(c) = &cfg.command {
@@ -294,7 +308,7 @@ impl Sup {
             self.system_log(name, &format!("$ docker {}", args.join(" ")));
             let logs = self.with(name, None, |m| m.logs.clone()).unwrap();
             let bin = docker_api::docker_bin();
-            let run = stream_cmd(logs, &bin, &args, None, &[]);
+            let run = stream_cmd(logs, &bin, &args, None, &secret_env);
             match tokio::time::timeout(Duration::from_secs(15 * 60), run).await {
                 Ok((0, _)) => {}
                 Ok((code, err)) => {
@@ -378,6 +392,7 @@ impl Sup {
                     m.rt.started_at = Some(t);
                 }
                 m.rt.ids = v["Id"].as_str().map(|s| vec![s.to_string()]).unwrap_or_default();
+                m.ext_ports = super::supervisor::docker_ports(v);
                 if m.rt.status != "running" {
                     self.set_status(m, "running");
                 } else {
@@ -434,7 +449,11 @@ impl Sup {
         args.extend(["up".into(), "-d".into()]);
         args.extend(cfg.args.iter().flatten().cloned());
         self.system_log(name, &format!("$ docker {}", args.join(" ")));
-        let env: Vec<(String, String)> = cfg.env.clone().unwrap_or_default().into_iter().collect();
+        let mut env: Vec<(String, String)> = cfg.env.clone().unwrap_or_default().into_iter().collect();
+        match super::secrets::env_for(&cfg) {
+            Ok(e) => env.extend(e),
+            Err(e) => return self.fail(name, gen, &e),
+        }
         let (code, _) = stream_cmd(logs, &docker_api::docker_bin(), &args, Some(&cwd), &env).await;
         if code != 0 {
             return self.fail(name, gen, &format!("docker compose up exited with {code}"));
@@ -460,7 +479,8 @@ impl Sup {
         let (_, mut args, cwd) = Self::compose_base(&cfg);
         args.push("stop".into());
         self.system_log(name, &format!("$ docker {}", args.join(" ")));
-        let env: Vec<(String, String)> = cfg.env.clone().unwrap_or_default().into_iter().collect();
+        let mut env: Vec<(String, String)> = cfg.env.clone().unwrap_or_default().into_iter().collect();
+        env.extend(super::secrets::env_for(&cfg).unwrap_or_default());
         stream_cmd(logs, &docker_api::docker_bin(), &args, Some(&cwd), &env).await;
         self.with(name, None, |m| {
             m.rt.dispose();
@@ -511,6 +531,10 @@ impl Sup {
             }
             let running: Vec<&&Value> = rows.iter().filter(|c| matches!(c["State"].as_str(), Some("running" | "restarting"))).collect();
             m.rt.ids = running.iter().filter_map(|c| c["Id"].as_str().map(String::from)).collect();
+            let mut ports: Vec<(u16, bool)> = running.iter().flat_map(|c| super::supervisor::docker_ports(c)).collect();
+            ports.sort();
+            ports.dedup_by_key(|p| p.0);
+            m.ext_ports = ports;
             m.rt.labels = rows
                 .iter()
                 .filter_map(|c| Some((c["Id"].as_str()?.to_string(), c.pointer("/Labels/com.docker.compose.service")?.as_str()?.to_string())))
