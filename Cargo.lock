@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "lstack"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "axum",
  "chacha20poly1305",
