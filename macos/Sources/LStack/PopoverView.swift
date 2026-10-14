@@ -84,6 +84,7 @@ struct PopoverView: View {
         .fixedSize(horizontal: false, vertical: true)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
         .background(MenuWindowSizer(height: contentHeight))
+        .background(LiveWindowReporter(store: store))
         .animation(.snappy(duration: 0.25), value: store.toast)
         .animation(.snappy(duration: 0.25), value: store.cmuxDenied)
         .onAppear { Task { await store.refreshSettings() } }

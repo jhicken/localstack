@@ -53,7 +53,9 @@ pub fn descendants(roots: &[i32]) -> Vec<i32> {
     out
 }
 
-/// (total cpu time in ns, resident bytes)
+/// (total cpu time in ns, memory bytes). Memory is the physical footprint — Activity Monitor's
+/// "Memory" column — rather than RSS, which counts shared pages (libraries, forked parents' pages)
+/// in every process and so inflates a process tree's sum. Falls back to RSS if unavailable.
 pub fn task_info(pid: i32) -> Option<(u64, u64)> {
     let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
@@ -63,7 +65,14 @@ pub fn task_info(pid: i32) -> Option<(u64, u64)> {
     }
     let (numer, denom) = timebase();
     let ticks = ti.pti_total_user + ti.pti_total_system;
-    Some(((ticks as u128 * numer as u128 / denom as u128) as u64, ti.pti_resident_size))
+    let mem = phys_footprint(pid).unwrap_or(ti.pti_resident_size);
+    Some(((ticks as u128 * numer as u128 / denom as u128) as u64, mem))
+}
+
+fn phys_footprint(pid: i32) -> Option<u64> {
+    let mut ri: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, &mut ri as *mut _ as *mut libc::rusage_info_t) };
+    (rc == 0 && ri.ri_phys_footprint > 0).then_some(ri.ri_phys_footprint)
 }
 
 /// Process start time (ms since epoch).
@@ -101,9 +110,9 @@ impl CpuSampler {
             .map(|pids| {
                 let mut s = Sample { cpu: 0.0, mem: 0.0 };
                 for &pid in pids {
-                    let Some((cpu_ns, rss)) = task_info(pid) else { continue };
+                    let Some((cpu_ns, mem)) = task_info(pid) else { continue };
                     let st = start_time(pid).unwrap_or(0) as u64;
-                    s.mem += rss as f64;
+                    s.mem += mem as f64;
                     if let Some(&(prev, pst)) = self.prev.get(&pid) {
                         if pst == st && dt_ns > 0.0 && cpu_ns >= prev {
                             s.cpu += (cpu_ns - prev) as f64 / dt_ns * 100.0;

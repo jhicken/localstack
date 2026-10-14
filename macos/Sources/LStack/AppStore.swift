@@ -25,6 +25,97 @@ final class AppStore {
     private var client: DaemonClient?
     private var toastTask: Task<Void, Never>?
     private static let historyLimit = 200
+    private static let systemLimit = 300
+
+    // MARK: live views
+
+    /// Windows on screen that show live load (the menu bar panel, log windows). The panel's view tree
+    /// stays alive after it closes, so applying a sample every few seconds would re-render it (charts
+    /// and all) unseen. While nothing is showing, samples are parked here and applied on the next open.
+    @ObservationIgnored private var liveViews = Set<ObjectIdentifier>()
+    @ObservationIgnored private var parked = Parked()
+    private var isLive: Bool { !liveViews.isEmpty || ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT"] != nil }
+
+    private struct Parked {
+        /// History key (`name` or `name@machine`) → samples not yet applied.
+        var metrics: [String: (machine: String?, name: String, samples: [MetricSample])] = [:]
+        /// Keyed by machine name; "" is this Mac.
+        var system: [String: [SystemSample]] = [:]
+        var processes: [String: [ProcInfo]] = [:]
+    }
+
+    func setLive(_ id: ObjectIdentifier, _ on: Bool) {
+        let was = isLive
+        if on { liveViews.insert(id) } else { liveViews.remove(id) }
+        if isLive, !was { flushParked() }
+    }
+
+    private func flushParked() {
+        let p = parked
+        parked = Parked()
+        for m in p.metrics.values { applyMetrics(machine: m.machine, name: m.name, m.samples) }
+        for (machine, samples) in p.system { applySystem(machine: machine.isEmpty ? nil : machine, samples) }
+        for (machine, list) in p.processes { applyProcesses(machine: machine.isEmpty ? nil : machine, list) }
+    }
+
+    private func park(metrics s: MetricSample, name: String, machine: String?) {
+        let key = machine.map { "\(name)@\($0)" } ?? name
+        var e = parked.metrics[key] ?? (machine, name, [])
+        e.samples.append(s)
+        if e.samples.count > Self.historyLimit { e.samples.removeFirst(e.samples.count - Self.historyLimit) }
+        parked.metrics[key] = e
+    }
+
+    private func park(system s: SystemSample, machine: String?) {
+        var list = parked.system[machine ?? ""] ?? []
+        list.append(s)
+        if list.count > Self.systemLimit { list.removeFirst(list.count - Self.systemLimit) }
+        parked.system[machine ?? ""] = list
+    }
+
+    private func applyMetrics(machine: String?, name: String, _ samples: [MetricSample]) {
+        guard let last = samples.last else { return }
+        let key: String
+        if let machine {
+            guard let i = machines.firstIndex(where: { $0.name == machine }) else { return }
+            if let j = machines[i].services?.firstIndex(where: { $0.name == name }) { machines[i].services?[j].metrics = last }
+            key = "\(name)@\(machine)"
+        } else {
+            if let i = services.firstIndex(where: { $0.name == name }) { services[i].metrics = last }
+            key = name
+        }
+        var h = history[key] ?? []
+        let after = h.last?.ts ?? -.infinity
+        h.append(contentsOf: samples.filter { $0.ts > after })
+        if h.count > Self.historyLimit { h.removeFirst(h.count - Self.historyLimit) }
+        history[key] = h
+    }
+
+    private func applySystem(machine: String?, _ samples: [SystemSample]) {
+        if let machine {
+            guard let i = machines.firstIndex(where: { $0.name == machine }) else { return }
+            var sys = machines[i].system ?? MachineSystem()
+            var list = sys.samples ?? []
+            let after = list.last?.ts ?? -.infinity
+            list.append(contentsOf: samples.filter { $0.ts > after })
+            if list.count > Self.systemLimit { list.removeFirst(list.count - Self.systemLimit) }
+            sys.samples = list
+            machines[i].system = sys
+        } else {
+            guard system != nil else { return }
+            let after = system!.samples.last?.ts ?? -.infinity
+            system!.samples.append(contentsOf: samples.filter { $0.ts > after })
+            if system!.samples.count > Self.systemLimit { system!.samples.removeFirst(system!.samples.count - Self.systemLimit) }
+        }
+    }
+
+    private func applyProcesses(machine: String?, _ list: [ProcInfo]) {
+        if let machine {
+            if let i = machines.firstIndex(where: { $0.name == machine }) { machines[i].processes = list }
+        } else {
+            processes = list
+        }
+    }
 
     init() {
         Task { await eventLoop() }
@@ -72,7 +163,7 @@ final class AppStore {
             }
         case "processes":
             guard let e = try? dec.decode(ProcessesEvent.self, from: data) else { return }
-            processes = e.processes
+            if isLive { processes = e.processes } else { parked.processes[""] = e.processes }
         case "machines":
             guard let e = try? dec.decode(MachinesEvent.self, from: data) else { return }
             localName = e.local
@@ -94,17 +185,13 @@ final class AppStore {
             guard let e = try? dec.decode(NameEvent.self, from: data) else { return }
             services.removeAll { $0.name == e.name }
             history[e.name] = nil
+            parked.metrics[e.name] = nil
         case "metrics":
             guard let e = try? dec.decode(MetricsEvent.self, from: data) else { return }
-            if let i = services.firstIndex(where: { $0.name == e.name }) { services[i].metrics = e.metrics }
-            var h = history[e.name] ?? []
-            h.append(e.metrics)
-            if h.count > Self.historyLimit { h.removeFirst(h.count - Self.historyLimit) }
-            history[e.name] = h
+            if isLive { applyMetrics(machine: nil, name: e.name, [e.metrics]) } else { park(metrics: e.metrics, name: e.name, machine: nil) }
         case "system":
-            guard let s = try? dec.decode(SystemSample.self, from: data), system != nil else { return }
-            system!.samples.append(s)
-            if system!.samples.count > 300 { system!.samples.removeFirst(system!.samples.count - 300) }
+            guard let s = try? dec.decode(SystemSample.self, from: data) else { return }
+            if isLive { applySystem(machine: nil, [s]) } else { park(system: s, machine: nil) }
         default:
             break
         }
@@ -152,23 +239,13 @@ final class AppStore {
             machines[i].services?.removeAll { $0.name == e.name }
         case "metrics":
             guard let e = try? dec.decode(MetricsEvent.self, from: data) else { return }
-            if let j = machines[i].services?.firstIndex(where: { $0.name == e.name }) { machines[i].services?[j].metrics = e.metrics }
-            let key = "\(e.name)@\(name)"
-            var h = history[key] ?? []
-            h.append(e.metrics)
-            if h.count > Self.historyLimit { h.removeFirst(h.count - Self.historyLimit) }
-            history[key] = h
+            if isLive { applyMetrics(machine: name, name: e.name, [e.metrics]) } else { park(metrics: e.metrics, name: e.name, machine: name) }
         case "processes":
             guard let e = try? dec.decode(ProcessesEvent.self, from: data) else { return }
-            machines[i].processes = e.processes
+            if isLive { machines[i].processes = e.processes } else { parked.processes[name] = e.processes }
         case "system":
             guard let x = try? dec.decode(SystemSample.self, from: data) else { return }
-            var sys = machines[i].system ?? MachineSystem()
-            var list = sys.samples ?? []
-            list.append(x)
-            if list.count > 300 { list.removeFirst(list.count - 300) }
-            sys.samples = list
-            machines[i].system = sys
+            if isLive { applySystem(machine: name, [x]) } else { park(system: x, machine: name) }
         default:
             break
         }
@@ -466,16 +543,17 @@ final class AppStore {
     var diskAccessJustGranted = false
     private var diskAccessPoll: Task<Void, Never>?
 
-    /// macOS has no prompt for Full Disk Access, so take the user straight to the pane with the
-    /// helper revealed in Finder (and its path on the clipboard for ⌘⇧G), then watch for the grant.
+    /// macOS has no prompt for Full Disk Access, so take the user straight to the pane, then watch for
+    /// the grant. Granting LStack.app covers the daemon too (it runs from inside the app bundle), so
+    /// there's no separate helper to add.
     func requestDiskAccess() {
-        guard let helper = settings?.helperPath else { flash("Daemon isn't running"); return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(helper, forType: .string)
+        guard settings != nil else { flash("Daemon isn't running"); return }
+        // Touching a protected file makes macOS list LStack in the pane (switched off), ready to enable.
+        _ = FileManager.default.isReadableFile(atPath: NSHomeDirectory() + "/Library/Safari/Bookmarks.plist")
+        _ = try? FileHandle(forReadingFrom: URL(fileURLWithPath: "/Library/Application Support/com.apple.TCC/TCC.db")).close()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
             NSWorkspace.shared.open(url)
         }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: helper)])
         diskAccessPoll?.cancel()
         diskAccessPoll = Task {
             for _ in 0..<150 {

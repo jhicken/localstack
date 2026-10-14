@@ -106,6 +106,7 @@ struct LogView: View {
                 Text(e).font(.caption).padding(6).background(.red.opacity(0.8), in: Capsule()).foregroundStyle(.white).padding()
             }
         }
+        .background(LiveWindowReporter(store: store))
         .task(id: name) { await stream() }
     }
 

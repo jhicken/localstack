@@ -34,7 +34,6 @@ enum Theme {
 struct StatusDot: View {
     let status: String
     var size: CGFloat = 8
-    @State private var pulse = false
 
     var body: some View {
         let color = Theme.statusColor(status)
@@ -42,13 +41,23 @@ struct StatusDot: View {
             .fill(color)
             .frame(width: size, height: size)
             .shadow(color: status == "running" ? color.opacity(0.8) : .clear, radius: 3)
-            .overlay(
-                Circle()
-                    .stroke(color.opacity(0.5), lineWidth: 2)
-                    .scaleEffect(pulse ? 2.2 : 1)
-                    .opacity(pulse ? 0 : 1)
-                    .opacity(status == "starting" || status == "stopping" ? 1 : 0)
-            )
+            .overlay {
+                // Only transitional states pulse. A repeating animation redraws every frame for as long
+                // as it exists (even invisible, even in the closed menu bar panel), so don't create it otherwise.
+                if status == "starting" || status == "stopping" { PulseRing(color: color) }
+            }
+    }
+}
+
+private struct PulseRing: View {
+    let color: Color
+    @State private var pulse = false
+
+    var body: some View {
+        Circle()
+            .stroke(color.opacity(0.5), lineWidth: 2)
+            .scaleEffect(pulse ? 2.2 : 1)
+            .opacity(pulse ? 0 : 1)
             .onAppear {
                 withAnimation(.easeOut(duration: 1.2).repeatForever(autoreverses: false)) { pulse = true }
             }

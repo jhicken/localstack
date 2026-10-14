@@ -59,7 +59,7 @@ private struct LoadTile: View {
             chart.frame(height: 30)
             bar.frame(height: 5)
             HStack(spacing: 8) {
-                legend(color, "LStack", last.map { format($0[keyPath: ours]) } ?? "—")
+                legend(color, "Services", last.map { format($0[keyPath: ours]) } ?? "—")
                 legend(.gray, "Other", last.map { format(max($0[keyPath: total] - $0[keyPath: ours], 0)) } ?? "—")
             }
             .lineLimit(1)
@@ -67,7 +67,8 @@ private struct LoadTile: View {
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.05)))
-        .help(title == "CPU" ? "Share of all \(detail ?? "") on this Mac. Per-service CPU below is % of one core." : "Memory in use (app + wired + compressed), as Activity Monitor reports it.")
+        .help((title == "CPU" ? "Share of all \(detail ?? "") on this Mac. Per-service CPU below is % of one core." : "Memory in use (app + wired + compressed), as Activity Monitor reports it.")
+              + " “Services” is everything LStack runs — each service's whole process tree and its containers — not LStack itself.")
     }
 
     /// CPU zooms to recent peaks so light load is still readable; memory is shown against total RAM.
@@ -139,5 +140,48 @@ struct MenuWindowSizer: NSViewRepresentable {
             f.size.height = target
             w.setFrame(f, display: true)
         }
+    }
+}
+
+/// Tells the store whether the window it's in is on screen, so live samples are only applied while
+/// something can show them (see `AppStore.setLive`).
+struct LiveWindowReporter: NSViewRepresentable {
+    let store: AppStore
+
+    func makeNSView(context: Context) -> ReporterView { ReporterView(store: store) }
+    func updateNSView(_ view: ReporterView, context: Context) {}
+    static func dismantleNSView(_ view: ReporterView, coordinator: ()) { view.stop() }
+
+    final class ReporterView: NSView {
+        private let store: AppStore
+        private var observers: [NSObjectProtocol] = []
+
+        init(store: AppStore) {
+            self.store = store
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            guard let w = window else { report(false); return }
+            for name in [NSWindow.didChangeOcclusionStateNotification, NSWindow.willCloseNotification] {
+                observers.append(NotificationCenter.default.addObserver(forName: name, object: w, queue: .main) { [weak self] n in
+                    MainActor.assumeIsolated { self?.report(n.name == NSWindow.willCloseNotification ? false : w.occlusionState.contains(.visible)) }
+                })
+            }
+            report(w.occlusionState.contains(.visible))
+        }
+
+        func stop() {
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            report(false)
+        }
+
+        private func report(_ visible: Bool) { store.setLive(ObjectIdentifier(self), visible) }
     }
 }

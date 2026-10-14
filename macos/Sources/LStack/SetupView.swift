@@ -226,7 +226,7 @@ struct SetupView: View {
         let granted = store.settings?.fullDiskAccess ?? false
         let detail = granted
             ? "Granted. Scripts can use tools that read other apps' data, such as the 1Password CLI (`op`)."
-            : "Scripts run by the daemon can't reach other apps' data, so tools like the 1Password CLI (`op`) can't see your accounts. Click Grant, then drag **lstack** from the Finder window into the list (or click +, press ⌘⇧G and paste, its path is copied) and turn it on."
+            : "Scripts run by the daemon can't reach other apps' data, so tools like the 1Password CLI (`op`) can't see your accounts. Click Grant, then turn on **LStack** in the list (if it's missing, click + and pick LStack from Applications). The background service is covered too."
         return SetupRow(icon: "lock.shield.fill", tint: granted ? .green : .orange, title: "Full Disk Access", detail: detail) {
             if granted {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)

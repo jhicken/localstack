@@ -301,7 +301,7 @@ lstack add web -- 'cd ~/code/web && export PORT=3000 && source .env && bun run d
 - **What isn't split.** Anything that needs runtime expansion (`$VAR`, `$(…)`, globs) is left alone, as is everything after a pipe or subshell. Pass `--no-split` to keep the command exactly as typed.
 - **In the app.** The Add Service window shows a **Split Out** suggestion as you type.
 
-**1Password CLI (`op`) and other tools that read app data.** macOS privacy rules apply to scripts launched by the LStack daemon. Without permission, `op` can't read 1Password's settings, so it reports "No accounts configured" and never shows the Touch ID prompt. To fix this, grant **Full Disk Access** to the helper. Click **Grant Access…** in the menu bar banner (or **Settings → Full Disk Access → Grant…**). It copies the helper's path, reveals `LStack.app/Contents/Helpers/lstack` and opens the matching System Settings pane. Drag `lstack` into the list, or click +, press ⌘⇧G and paste, then turn it on. LStack detects the grant and offers to restart your scripts. If it stops working after an update, remove the entry and add it again.
+**1Password CLI (`op`) and other tools that read app data.** macOS privacy rules apply to scripts launched by the LStack daemon. Without permission, `op` can't read 1Password's settings, so it reports "No accounts configured" and never shows the Touch ID prompt. To fix this, grant **Full Disk Access** to LStack. Click **Grant Access…** in the menu bar banner (or **Settings → Full Disk Access → Grant…**). It opens the matching System Settings pane; turn on **LStack** (if it isn't listed, click + and choose LStack from Applications). The background daemon runs from inside the app bundle, so it's covered by the app's grant; there's no separate helper to add. LStack detects the grant and offers to restart your scripts. If it stops working after an update, remove the entry and add it again.
 
 ### Service YAML
 
@@ -381,13 +381,13 @@ To cut a release, commit your work, then run:
 ```sh
 macos/release.sh                  # patch bump: 0.3.3 → 0.3.4 (or: minor | major | 1.2.3 | current)
 macos/release.sh minor --dry-run  # run the checks and show the new version, change nothing
-macos/release.sh --local [--draft]  # build on this Mac and upload with the GitHub CLI (gh auth login)
+macos/release.sh --draft          # publish the release as a draft
+macos/release.sh current --skip-build  # retry a failed upload of what's already in dist/
 ```
 
-The script requires a clean tree that is up to date with origin. It runs `cargo test` and `cargo clippy -D warnings`, bumps `version` in `Cargo.toml` and `Cargo.lock`, and commits `chore: release vX.Y.Z`. Then it tags the commit and pushes the branch and tag together. If anything fails before the push, it removes the bump commit and tag, leaving the tree as it was.
+Everything runs on this Mac; GitHub Actions isn't used. The script requires a clean tree that is up to date with origin and the GitHub CLI (`gh auth login`). It runs `cargo test` and `cargo clippy -D warnings`, bumps `version` in `Cargo.toml` and `Cargo.lock`, commits `chore: release vX.Y.Z` and tags it. Then it builds the dmg, zip and checksums with `macos/build.sh`, pushes the branch and tag together, and creates the GitHub release with those files (or replaces the assets if it already exists). If the checks or the build fail, it removes the bump commit and tag, leaving the tree as it was.
 
-- **The CI workflow** (`.github/workflows/release.yml`) runs on a macOS runner. It checks that the tag matches `Cargo.toml`, runs the tests, builds with `macos/build.sh`, and then creates the release, or replaces the assets if the release already exists.
-- **Rebuilding an existing tag.** Run the workflow manually from the Actions tab.
+- **Building on GitHub instead.** `macos/release.sh --ci` pushes without building and starts the release workflow (`.github/workflows/release.yml`), which builds on a macOS runner. The workflow only runs when started this way or from the Actions tab (for example, to rebuild an existing tag); pushing a tag doesn't trigger it.
 - **Code signing.** Builds are ad-hoc signed. The first time you open a downloaded copy, right-click the app and choose **Open**.
 
 See [docs/PLAN.md](docs/PLAN.md) for the roadmap.

@@ -737,7 +737,7 @@
     const up = svcs.filter(live).length;
     const tiles = [
       ["CPU", pct(last.cpu)], ["Memory used", bytes(last.mem)], ["RAM", bytes(total)], ["Cores", sys.cores ?? "—"],
-      ["LStack CPU", pct(last.lsCpu)], ["LStack memory", bytes(last.lsMem)], ["Running", `${up} / ${svcs.length}`],
+      ["Services CPU", pct(last.lsCpu)], ["Services memory", bytes(last.lsMem)], ["Running", `${up} / ${svcs.length}`],
     ];
     document.getElementById("mtiles").innerHTML = tiles.map(([k, v]) => `<div class="tile"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
     document.getElementById("mcpuv").textContent = pct(last.cpu);

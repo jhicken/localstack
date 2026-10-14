@@ -1,10 +1,9 @@
 # Builds LStack.app on a macOS runner and publishes the .dmg / .zip / checksums to GitHub Releases.
-# Triggered by pushing a version tag (macos/release.sh does that), or manually for an existing tag.
+# Manual only: releases are normally built locally by macos/release.sh. `release.sh --ci` starts this
+# instead, or run it from the Actions tab to rebuild an existing tag.
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -15,17 +14,17 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.event.inputs.tag }}
 
 jobs:
   release:
     runs-on: macos-15
     env:
-      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      TAG: ${{ github.event.inputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
 
