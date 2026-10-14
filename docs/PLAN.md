@@ -139,6 +139,7 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 - [ ] Import from PM2 `ecosystem.config.js`, Procfile, and existing compose files; `lstack export`.
 - [ ] Config profiles/workspaces (switch "client-A stack" vs "personal").
 - [ ] Linux support (systemd user units) since the daemon/CLI are portable.
+- [ ] Tailscale integration for machine links: tailnet discovery, several addresses per Mac, fast reconnect after wake or a network change, a Tailscale-only link bind, and an optional tailnet identity check. See [TAILSCALE.md](TAILSCALE.md).
 - [ ] Remote dashboard: built-in HTTPS (self-signed or user-supplied cert), multiple users/roles, an optional Tailscale-only bind, and log streaming for several services at once.
 
 ---
