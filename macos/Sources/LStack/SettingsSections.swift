@@ -1,14 +1,16 @@
 import AppKit
+import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 enum SettingsTab: CaseIterable {
-    case general, secrets, machines, monitoring
+    case general, secrets, machines, security, monitoring
 
     var title: String {
         switch self {
         case .general: return "General"
         case .secrets: return "Secrets"
         case .machines: return "Machines"
+        case .security: return "Security"
         case .monitoring: return "Monitoring"
         }
     }
@@ -182,14 +184,113 @@ struct SecretsSettings: View {
     }
 }
 
+// MARK: - Security
+
+/// Two-factor authentication: asked for when a new Mac pairs with this one and at web dashboard sign-in.
+struct SecuritySettings: View {
+    @Environment(AppStore.self) private var store
+    @State private var setup: TotpSetup?
+    @State private var code = ""
+    @State private var busy = false
+    @State private var error: String?
+
+    private var on: Bool { store.remote?.totp == true }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SettingsCard {
+                SetupRow(icon: on ? "checkmark.shield.fill" : "shield", tint: on ? .green : .secondary, title: "Two-factor authentication", detail: detail) {
+                    if on {
+                        Button("Turn Off") {
+                            Task { busy = true; error = await store.totpDisable(); busy = false }
+                        }
+                        .controlSize(.small).disabled(busy)
+                    } else if setup == nil {
+                        Button("Set Up…") {
+                            Task {
+                                do { setup = try await store.totpBegin(); code = ""; error = nil } catch { self.error = error.localizedDescription }
+                            }
+                        }
+                        .controlSize(.small).disabled(store.remote == nil)
+                    }
+                }
+                if let setup, !on {
+                    Divider().padding(.leading, 52)
+                    panel(setup).padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
+                }
+            }
+            ErrorText(text: error)
+        }
+        .task { await store.refreshRemote() }
+    }
+
+    private var detail: String {
+        if on {
+            return "On. Pairing a new Mac with this one needs a 6-digit code from your authenticator app as well as the one-time pairing code. Web dashboard sign-in asks for it too. Macs already paired aren't affected."
+        }
+        return "Ask for a code from an authenticator app (1Password, Google Authenticator, Authy…) when another Mac pairs with this one — on top of the one-time pairing code — and at web dashboard sign-in."
+    }
+
+    private func panel(_ t: TotpSetup) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            if let img = Self.qrImage(t.uri) {
+                Image(nsImage: img)
+                    .interpolation(.none)
+                    .resizable()
+                    .frame(width: 132, height: 132)
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(.white))
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Scan with an authenticator app, then enter the 6-digit code it shows.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(t.secret.chunked(4))
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .help("Setup key, for manual entry")
+                HStack(spacing: 6) {
+                    TextField("123456", text: $code)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 13, design: .monospaced))
+                        .frame(width: 90)
+                        .onSubmit(confirm)
+                    Button("Confirm", action: confirm)
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(code.filter(\.isNumber).count != 6)
+                    Button("Cancel") { setup = nil; error = nil }.controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private func confirm() {
+        let c = code.filter(\.isNumber)
+        guard c.count == 6 else { return }
+        Task {
+            error = await store.totpConfirm(c)
+            if error == nil { setup = nil; code = "" }
+        }
+    }
+
+    static func qrImage(_ text: String) -> NSImage? {
+        let f = CIFilter.qrCodeGenerator()
+        f.message = Data(text.utf8)
+        f.correctionLevel = "M"
+        guard let out = f.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else { return nil }
+        let rep = NSCIImageRep(ciImage: out)
+        let img = NSImage(size: rep.size)
+        img.addRepresentation(rep)
+        return img
+    }
+}
+
 // MARK: - Machines
 
 struct MachinesSettings: View {
     @Environment(AppStore.self) private var store
     @State private var address = ""
     @State private var code = ""
-    @State private var user = "admin"
-    @State private var pass = ""
     @State private var totp = ""
     @State private var label = ""
     @State private var busy = false
@@ -205,7 +306,7 @@ struct MachinesSettings: View {
         VStack(alignment: .leading, spacing: 12) {
             SettingsCard {
                 SetupRow(icon: "desktopcomputer", tint: .blue, title: "Watch another Mac",
-                         detail: "See its services and busy processes here, in the CLI and the web dashboard, and reach its web servers on localhost through an encrypted link. On the other Mac turn on “Share this Mac”, show a pairing code, then enter it here with that Mac's dashboard login.") {
+                         detail: "See its services and busy processes here, in the CLI and the web dashboard, and reach its web servers on localhost through an encrypted link. On the other Mac turn on “Share this Mac” and show a pairing code, then enter it here (plus a 2FA code if that Mac uses two-factor authentication).") {
                     EmptyView()
                 }
                 Divider().padding(.leading, 52)
@@ -265,7 +366,7 @@ struct MachinesSettings: View {
                             }
                         }
                         .controlSize(.small)
-                        .disabled(!r.running)
+                        .disabled((r.shareUrls ?? []).isEmpty)
                     }
                     .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
                 }
@@ -276,7 +377,7 @@ struct MachinesSettings: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Expires ") + Text(Date(timeIntervalSince1970: pair.expiresAt / 1000), style: .relative)
                             if let u = pair.urls.first { Text("Address: \(u)").textSelection(.enabled) }
-                            Text(pair.totp == true ? "Also needs this Mac's dashboard login and a 2FA code." : "Also needs this Mac's dashboard login.")
+                            if pair.totp == true { Text("Also needs a 2FA code from this Mac's authenticator app.") }
                         }
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     }
@@ -319,10 +420,11 @@ struct MachinesSettings: View {
 
     private var pairDetail: String {
         if !sharing {
-            return "Let other Macs watch this one and reach the services you allow. Needs the web dashboard's login (Settings → General) — pairing asks for it plus a one-time code. Paired Macs never see secrets."
+            return "Let other Macs watch this one and reach the services you allow. Pairing needs a one-time code shown here (+ a 2FA code if two-factor authentication is on in Settings → Security). The web dashboard doesn't need to be on. Paired Macs never see secrets."
         }
         let port = store.remote?.linkPort.map { " (port \($0))" } ?? ""
-        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below and this Mac's dashboard login. Everything between paired Macs is end-to-end encrypted\(port) and tied to each Mac's own key."
+        let tfa = store.remote?.totp == true ? " and a 2FA code from your authenticator app" : ""
+        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below\(tfa). Everything between paired Macs is end-to-end encrypted\(port) and tied to each Mac's own key."
     }
 
     private func sectionTitle(_ t: String) -> some View {
@@ -337,18 +439,16 @@ struct MachinesSettings: View {
             }
             HStack(spacing: 6) {
                 TextField("Code XXXX-XXXX", text: $code).font(.system(size: 12, design: .monospaced)).frame(width: 120)
-                TextField("Username", text: $user).frame(width: 90)
-                SecureField("Password", text: $pass).frame(width: 110)
-                TextField("2FA", text: $totp).frame(width: 60)
+                TextField("2FA code", text: $totp).font(.system(size: 12, design: .monospaced)).frame(width: 80)
                 Spacer()
                 Button {
                     add()
                 } label: {
                     if busy { ProgressView().controlSize(.small) } else { Text("Pair") }
                 }
-                .disabled(busy || address.isEmpty || code.isEmpty || pass.isEmpty)
+                .disabled(busy || address.isEmpty || code.isEmpty)
             }
-            Text("Leave 2FA empty if that Mac doesn't use it.").font(.system(size: 10)).foregroundStyle(.tertiary)
+            Text("Leave 2FA empty if that Mac doesn't use two-factor authentication.").font(.system(size: 10)).foregroundStyle(.tertiary)
         }
         .textFieldStyle(.roundedBorder)
         .controlSize(.small)
@@ -512,14 +612,13 @@ struct MachinesSettings: View {
         error = nil
         paired = nil
         Task {
-            switch await store.addMachine(address: address, code: code, username: user, password: pass, totp: totp, name: label) {
+            switch await store.addMachine(address: address, code: code, totp: totp, name: label) {
             case .success(let r):
                 paired = r
                 address = ""; code = ""; totp = ""; label = ""
             case .failure(let e):
                 error = e.localizedDescription
             }
-            pass = ""
             busy = false
             await reload()
         }
@@ -722,5 +821,14 @@ struct MonitoringSettings: View {
             try? await Task.sleep(for: .seconds(2))
             if note == s { note = nil }
         }
+    }
+}
+
+private extension String {
+    func chunked(_ n: Int) -> String {
+        stride(from: 0, to: count, by: n).map { i -> String in
+            let a = index(startIndex, offsetBy: i)
+            return String(self[a..<(index(a, offsetBy: n, limitedBy: endIndex) ?? endIndex)])
+        }.joined(separator: " ")
     }
 }

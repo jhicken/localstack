@@ -481,14 +481,15 @@ impl Peers {
         self.inner.lock().unwrap().get(name).map(full).ok_or_else(|| ApiErr::new(404, format!("no machine named {name:?}")))
     }
 
-    /// Pair with the Mac at `addr`: its one-time code plus its dashboard login (+2FA), all inside the
-    /// code-authenticated (SPAKE2) exchange. Pins its install key; replaces an older pairing with it.
-    pub async fn pair(self: &Arc<Self>, addr: &str, code: &str, login: Value, name: Option<&str>) -> Result<Value, ApiErr> {
+    /// Pair with the Mac at `addr`: its one-time code, plus its 2FA code (in `auth`) if it uses two-factor
+    /// authentication, inside the code-authenticated (SPAKE2) exchange. Pins its install key; replaces an
+    /// older pairing with it.
+    pub async fn pair(self: &Arc<Self>, addr: &str, code: &str, auth: Value, name: Option<&str>) -> Result<Value, ApiErr> {
         let addr = normalize_addr(addr).map_err(|e| ApiErr::new(400, e))?;
         if code.trim().is_empty() {
             return Err(ApiErr::new(400, "pairing code required (Share this Mac → Show pairing code on the other Mac)"));
         }
-        let paired = link::pair_client(&addr, code, login, &local_name()).await.map_err(|e| ApiErr::new(403, e))?;
+        let paired = link::pair_client(&addr, code, auth, &local_name()).await.map_err(|e| ApiErr::new(403, e))?;
         let key = link::key_hex(&paired.public);
         let host = host_of(&addr);
         let old: Vec<PeerCfg> = load().into_iter().filter(|c| c.public_key == key || c.address() == addr || (c.legacy() && host_of(&c.address()) == host)).collect();

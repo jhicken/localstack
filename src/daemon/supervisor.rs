@@ -312,11 +312,12 @@ impl Sup {
             });
         }
         while set.join_next().await.is_some() {}
+        let resume = take_resume();
         let auto: Vec<String> = self
             .lock()
             .services
             .values()
-            .filter(|m| m.cfg.autostart() && m.rt.status != "running")
+            .filter(|m| (m.cfg.autostart() || (m.cfg.kind == "process" && resume.contains(&m.cfg.name))) && m.rt.status != "running")
             .map(|m| m.cfg.name.clone())
             .collect();
         for name in auto {
@@ -1050,6 +1051,19 @@ impl Sup {
         }
         let _ = std::fs::remove_file(paths::state_file());
     }
+}
+
+/// Scripts the previous daemon was running when it was restarted (see `setup::remember_running`).
+/// Ignored if stale, so a later plain `daemon start` doesn't bring back old state.
+fn take_resume() -> Vec<String> {
+    let path = paths::resume_file();
+    let Ok(text) = std::fs::read_to_string(&path) else { return vec![] };
+    let _ = std::fs::remove_file(&path);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    if now_ms() - v["at"].as_i64().unwrap_or(0) > 5 * 60_000 {
+        return vec![];
+    }
+    v["services"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect()
 }
 
 /// Configured `urls:` first, then detected ports (unless `detectUrls: false`) as http://localhost:PORT.

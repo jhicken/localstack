@@ -3,7 +3,8 @@
 //!   Available on this Mac only, or to other devices too when `webRemote` is set. Start/stop/restart from
 //!   the dashboard need `allowControl`.
 //! - **sharing** (`sharing`, link port 7381): paired Macs connect over the encrypted link (see `link.rs`,
-//!   `share.rs`). Each paired Mac has its own grants (control, tunnels).
+//!   `share.rs`). Each paired Mac has its own grants (control, tunnels). Independent of the dashboard:
+//!   pairing needs a one-time code (+ a 2FA code when two-factor authentication is set up), no login.
 use super::server::{self, ApiErr, AppState};
 use super::totp;
 use crate::paths::{self, now_ms, VERSION};
@@ -26,7 +27,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use zeroize::Zeroizing;
 
 pub const DEFAULT_PORT: u16 = 7380;
 const SESSION_TTL_MS: i64 = 12 * 3_600_000;
@@ -54,7 +54,8 @@ pub struct RemoteConfig {
     pub username: String,
     pub password_hash: String,
     pub allow_control: bool,
-    /// Base32 TOTP secret; empty = two-factor login off.
+    /// Base32 TOTP secret (Settings → Security); empty = 2FA off. Asked for when a new Mac pairs and at
+    /// web dashboard sign-in.
     pub totp_secret: String,
     /// Port of the encrypted machine link (sharing).
     pub link_port: u16,
@@ -104,7 +105,7 @@ impl Grants {
 }
 
 const PAIR_CODE_TTL_MS: i64 = 10 * 60_000;
-/// Wrong attempts (code, then login) before a pairing code is burned.
+/// Wrong attempts (code, then 2FA) before a pairing code is burned.
 const PAIR_CODE_TRIES: u32 = 3;
 
 impl Default for RemoteConfig {
@@ -309,9 +310,6 @@ impl Remote {
         if !cfg.sharing() {
             return Err(ApiErr::new(400, "turn on sharing first (lstack remote share on) so other Macs can reach this one"));
         }
-        if cfg.password_hash.is_empty() {
-            return Err(ApiErr::new(400, "set a dashboard password first (lstack remote password) — pairing asks for it"));
-        }
         super::link::identity().map_err(|e| ApiErr::new(500, e))?;
         const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         let raw = random_hex(8);
@@ -367,17 +365,21 @@ impl Remote {
         self.failures.lock().unwrap().remove(&ip);
     }
 
-    /// Check the dashboard login (+2FA) a pairing Mac sent inside the encrypted exchange.
-    pub(super) async fn check_login(&self, username: &str, password: &str, code: Option<&str>) -> bool {
+    /// Whether two-factor authentication (Settings → Security) is set up.
+    pub fn totp_enabled(&self) -> bool {
+        !self.config().totp_secret.is_empty()
+    }
+
+    /// Check the 2FA code a pairing Mac sent inside the code-authenticated exchange (always ok when 2FA is off).
+    pub(super) fn check_pair_totp(&self, code: Option<&str>) -> bool {
         let cfg = self.config();
-        if cfg.password_hash.is_empty() {
-            return false;
-        }
-        let user_ok = ct_eq(username.as_bytes(), cfg.username.as_bytes());
-        let stored = cfg.password_hash.clone();
-        let password = Zeroizing::new(password.to_string());
-        let pass_ok = tokio::task::spawn_blocking(move || verify_password(&password, &stored)).await.unwrap_or(false);
-        user_ok && pass_ok && (cfg.totp_secret.is_empty() || self.totp_check(&cfg.totp_secret, code))
+        cfg.totp_secret.is_empty() || self.totp_check(&cfg.totp_secret, code)
+    }
+
+    /// Seconds until a locked-out address may try again.
+    pub(super) fn lockout_left_secs(&self, ip: IpAddr) -> i64 {
+        let f = self.failures.lock().unwrap();
+        f.get(&ip).map_or(0, |(_, last)| ((LOCKOUT_MS - (now_ms() - last)) / 1000).max(1))
     }
 
     fn save(&self, cfg: RemoteConfig) -> Result<(), ApiErr> {
@@ -637,9 +639,6 @@ impl Remote {
         if cfg.enabled && cfg.password_hash.is_empty() {
             return Err(ApiErr::new(400, "set a password before turning on the web dashboard"));
         }
-        if cfg.sharing() && !old.sharing() && cfg.password_hash.is_empty() {
-            return Err(ApiErr::new(400, "set a dashboard password before sharing — other Macs must enter it to pair"));
-        }
         if cfg.enabled && cfg.port == cfg.link_port {
             return Err(ApiErr::new(400, "the web dashboard and the machine link need different ports"));
         }
@@ -755,9 +754,8 @@ impl Remote {
     /// Start two-factor enrollment: returns a fresh secret and its otpauth:// URI. Login is unaffected
     /// until `totp_confirm` sees a valid code for it.
     pub fn totp_begin(&self) -> Value {
-        let cfg = self.config();
         let secret = totp::new_secret();
-        let uri = totp::uri(&secret, &format!("{}@{}", cfg.username, hostname()), "LStack");
+        let uri = totp::uri(&secret, &hostname(), "LStack");
         *self.totp_pending.lock().unwrap() = Some(secret.clone());
         json!({ "secret": secret, "uri": uri })
     }
@@ -772,7 +770,7 @@ impl Remote {
         *self.totp_pending.lock().unwrap() = None;
         *self.totp_last_step.lock().unwrap() = step;
         self.sessions.lock().unwrap().clear();
-        println!("{} remote: two-factor login enabled", paths::iso(now_ms()));
+        println!("{} remote: two-factor authentication enabled", paths::iso(now_ms()));
         Ok(self.status())
     }
 
@@ -785,7 +783,7 @@ impl Remote {
         cfg.totp_secret.clear();
         save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
         *self.cfg.lock().unwrap() = cfg;
-        println!("{} remote: two-factor login disabled", paths::iso(now_ms()));
+        println!("{} remote: two-factor authentication disabled", paths::iso(now_ms()));
         Ok(self.status())
     }
 

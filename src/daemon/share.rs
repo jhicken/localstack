@@ -33,11 +33,17 @@ pub async fn serve(listener: TcpListener, app: AppState, remote: Arc<Remote>) {
 
 async fn connection(mut tcp: TcpStream, addr: SocketAddr, app: AppState, remote: Arc<Remote>) {
     let ip = addr.ip();
-    if remote.locked_out(ip) {
-        return;
-    }
     let mut magic = [0u8; 6];
     if tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut magic)).await.map_or(true, |r| r.is_err()) {
+        return;
+    }
+    if remote.locked_out(ip) {
+        // Say why instead of just dropping the socket (which the other Mac only sees as "connection reset").
+        if &magic == link::MAGIC_PAIR {
+            let mins = (remote.lockout_left_secs(ip) + 59) / 60;
+            let msg = format!("too many failed attempts from {ip} — {} won't accept pairing from it for {mins} more minute{}", super::remote::hostname(), if mins == 1 { "" } else { "s" });
+            link::pair_refuse(tcp, &msg).await;
+        }
         return;
     }
     if &magic == link::MAGIC_PAIR {
@@ -192,13 +198,14 @@ impl PairPolicy for Pairing {
 
     async fn admit(&self, req: &Value, public: [u8; 32], phrase: &str) -> Result<Value, String> {
         let s = |k: &str| req[k].as_str().unwrap_or("").to_string();
-        let totp = req["totp"].as_str().filter(|c| !c.is_empty());
-        if !self.remote.check_login(&s("username"), &s("password"), totp).await {
+        let totp = req["totp"].as_str().map(str::trim).filter(|c| !c.is_empty());
+        if !self.remote.check_pair_totp(totp) {
             self.remote.pair_code_failed();
             self.remote.failed(self.ip);
-            self.remote.audit(json!({ "event": "pair-failed", "address": self.ip.to_string(), "reason": "wrong login" }));
-            let msg = if self.remote.config().totp_secret.is_empty() { "invalid username or password" } else { "invalid username, password or 2FA code" };
-            return Err(msg.into());
+            let reason = if totp.is_none() { "no 2FA code" } else { "wrong 2FA code" };
+            self.remote.audit(json!({ "event": "pair-failed", "address": self.ip.to_string(), "reason": reason }));
+            let host = super::remote::hostname();
+            return Err(if totp.is_none() { format!("{host} uses two-factor authentication — enter the 6-digit code from its authenticator app") } else { "invalid or already used 2FA code".into() });
         }
         let name = match s("hostName") {
             n if n.trim().is_empty() => self.ip.to_string(),

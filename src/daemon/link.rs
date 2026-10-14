@@ -3,8 +3,8 @@
 //! - **Identity**: every install has an X25519 keypair, kept in the secret store (never on disk in plaintext,
 //!   never sent anywhere). Possession of the private key is the only credential between machines.
 //! - **Pairing** (`MAGIC_PAIR`): SPAKE2 keyed by the one-time code shown on the shared Mac, so the code never
-//!   crosses the wire and can't be guessed offline. The SPAKE2 key then encrypts the host's dashboard login
-//!   (+2FA) and the exchange of public keys, which both sides pin.
+//!   crosses the wire and can't be guessed offline. The SPAKE2 key then encrypts a 2FA code (when the
+//!   shared Mac has two-factor authentication on) and the exchange of public keys, which both sides pin.
 //! - **Link** (`MAGIC_LINK`): Noise `IK` (both static keys authenticated, forward secrecy) over TCP, then a
 //!   small multiplexer: many independent byte streams with per-stream flow control over one connection.
 //!   Each stream starts with a JSON header naming its `kind` (`http`, `tunnel`, …); the shared Mac checks
@@ -667,8 +667,8 @@ pub struct Paired {
     pub grants: Value,
 }
 
-/// Host side: pair with the machine at `addr` using its one-time code and its dashboard login.
-pub async fn pair_client(addr: &str, code: &str, login: Value, host_name: &str) -> Result<Paired, String> {
+/// Host side: pair with the machine at `addr` using its one-time code (`auth` may carry a 2FA `totp` code).
+pub async fn pair_client(addr: &str, code: &str, auth: Value, host_name: &str) -> Result<Paired, String> {
     use spake2::{Ed25519Group, Password, Spake2};
     let id = identity()?;
     let mut tcp = timed(Duration::from_secs(8), TcpStream::connect(addr)).await.map_err(|e| format!("can't reach {addr}: {e} (is “Share this Mac” on there?)"))?;
@@ -679,7 +679,7 @@ pub async fn pair_client(addr: &str, code: &str, login: Value, host_name: &str) 
         write_frame(&mut tcp, &plain(&json!({ "v": 1, "spake": hexs(&msg) }))).await?;
         timed(Duration::from_secs(10), read_frame(&mut tcp)).await
     };
-    let reply = io.await.map_err(|e| format!("pairing with {addr} failed: {e}"))?;
+    let reply = io.await.map_err(|e| pair_io_error(addr, &e))?;
     let reply = as_plain(&reply).ok_or("unexpected reply")?;
     if let Some(e) = reply["error"].as_str() {
         return Err(e.to_string());
@@ -687,17 +687,21 @@ pub async fn pair_client(addr: &str, code: &str, login: Value, host_name: &str) 
     let theirs = reply["spake"].as_str().and_then(|s| (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect::<Option<Vec<u8>>>()).ok_or("unexpected reply")?;
     let key = Zeroizing::new(st.finish(&theirs).map_err(|_| "pairing failed (bad key exchange)")?);
     let mut bx = PairBox::new(&key, true);
-    let mut req = login;
+    let mut req = auth;
     req["hostName"] = json!(host_name);
     req["publicKey"] = json!(hexs(&id.public));
     req["version"] = json!(crate::paths::VERSION);
-    write_frame(&mut tcp, &bx.seal(&req)).await.map_err(|e| e.to_string())?;
-    let m = timed(Duration::from_secs(20), read_frame(&mut tcp)).await.map_err(|e| e.to_string())?;
+    write_frame(&mut tcp, &bx.seal(&req)).await.map_err(|e| pair_io_error(addr, &e))?;
+    let m = timed(Duration::from_secs(20), read_frame(&mut tcp)).await.map_err(|e| pair_io_error(addr, &e))?;
     let v = match bx.open(&m) {
         Some(v) => v,
         None => return Err(as_plain(&m).and_then(|v| v["error"].as_str().map(String::from)).unwrap_or_else(|| "pairing failed".into())),
     };
     if let Some(e) = v["error"].as_str() {
+        // LStack before 0.4.1 asked for the dashboard login when pairing.
+        if e.contains("username") {
+            return Err(format!("{e} — that Mac runs an older LStack that asks for its dashboard login; update LStack there and try again"));
+        }
         return Err(e.to_string());
     }
     Ok(Paired {
@@ -709,13 +713,34 @@ pub async fn pair_client(addr: &str, code: &str, login: Value, host_name: &str) 
     })
 }
 
+fn pair_io_error(addr: &str, e: &io::Error) -> String {
+    match e.kind() {
+        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe => format!(
+            "{addr} closed the connection ({e}). Usually that's too many failed pairing attempts from this Mac — wait 5 minutes \
+             (or restart LStack there) — or {addr} isn't running LStack's machine link on that port."
+        ),
+        _ => format!("pairing with {addr} failed: {e}"),
+    }
+}
+
+/// Shared-Mac side: refuse a pairing attempt with a message the other Mac can show.
+pub async fn pair_refuse(mut tcp: TcpStream, msg: &str) {
+    // Read what was sent first: closing with unread data makes the kernel reset the connection, which can
+    // throw away the reply before the other Mac reads it.
+    let _ = timed(Duration::from_secs(5), read_frame(&mut tcp)).await;
+    let _ = write_frame(&mut tcp, &plain(&json!({ "error": msg }))).await;
+    let _ = tcp.shutdown().await;
+    let mut sink = [0u8; 256];
+    let _ = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut sink)).await;
+}
+
 /// What the shared Mac must decide while serving a pairing request.
 pub trait PairPolicy: Send + Sync {
     /// The current one-time code, if one is showing.
     fn code(&self) -> Option<String>;
     /// The code was wrong (it is burned after a few attempts).
     fn wrong_code(&self);
-    /// Check the dashboard login (+2FA) inside the encrypted exchange; on success pin the host's key and
+    /// Check the 2FA code (if 2FA is on) inside the encrypted exchange; on success pin the host's key and
     /// return the grants it gets. Errors are shown to the host.
     fn admit(&self, req: &Value, public: [u8; 32], phrase: &str) -> impl std::future::Future<Output = Result<Value, String>> + Send;
 }

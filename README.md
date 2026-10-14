@@ -133,15 +133,13 @@ lstack remote web local             # back to this Mac only
 lstack remote on --port 8080 --user jeff --read-only
 lstack remote passwd                # change the password (signs everyone out)
 lstack remote status                # shows the URLs to open, e.g. http://192.168.1.20:7380
-lstack remote 2fa on                # two-factor sign-in: scan the QR, enter a code to confirm
-lstack remote 2fa off
 lstack remote off                   # dashboard off (sharing is unaffected)
 echo "$PW" | lstack remote on --password-stdin   # non-interactive
 ```
 
 Then open `http://127.0.0.1:7380` (or `http://<this-mac>:7380` from another device) and sign in. Configs from before the split keep their behavior: the dashboard stays open to other devices and sharing stays on if the dashboard was on.
 
-**Two-factor sign-in (TOTP).** Run `lstack remote 2fa on`, or use **Settings → Web dashboard → Two-factor → Set Up…**, then scan the QR code with 1Password, Google Authenticator, Authy or a similar app. After that, the sign-in page also asks for a 6-digit code. A code can be used only once, and the clock may be off by ±30 s.
+**Two-factor authentication (TOTP).** Run `lstack security 2fa on`, or use **Settings → Security → Two-factor authentication → Set Up…**, then scan the QR code with 1Password, Google Authenticator, Authy or a similar app. After that, pairing a new Mac with this one and the dashboard sign-in page both ask for a 6-digit code. It doesn't depend on the web dashboard being on. A code can be used only once, and the clock may be off by ±30 s. Turn it off with `lstack security 2fa off`.
 
 - **Separate from the local API.** The daemon's own API stays on 127.0.0.1. The remote server is a second listener that exposes a read-mostly subset of it.
 - **Accounts.** There is one account. The password is stored as a PBKDF2-SHA256 hash (120k rounds) in `remote.json`.
@@ -220,8 +218,8 @@ A Mac can watch other Macs that run LStack. Their services and busy processes th
 
 Each paired Mac's web servers are also **forwarded to this Mac automatically**. A service on the other Mac at `127.0.0.1:3000` shows up here as `http://localhost:3000`, marked 🔒 "via studio" in every interface. Everything goes through one end-to-end encrypted link per Mac.
 
-1. On the Mac to be watched, set a dashboard login (`lstack remote on --local`, or **Settings → General → Web dashboard**). Turn on 2FA if you can. Then turn on sharing (`lstack remote share on`, or **Settings → Machines → Share this Mac**) and run `lstack remote pair` or click **Show Pairing Code**. You get a one-time code, valid for 10 minutes. The web dashboard itself can stay off.
-2. On your Mac, run `lstack machine pair studio.local --code XXXX-XXXX`, or use **Settings → Machines**. It asks for the other Mac's dashboard username, password and 2FA code. Both Macs then show the same four-word phrase, which you can compare if you want to be sure.
+1. On the Mac to be watched, turn on sharing (`lstack remote share on`, or **Settings → Machines → Share this Mac**) and run `lstack remote pair` or click **Show Pairing Code**. You get a one-time code, valid for 10 minutes. No dashboard or login is needed. Turn on 2FA (**Settings → Security**, or `lstack security 2fa on`) if you can.
+2. On your Mac, run `lstack machine pair studio.local --code XXXX-XXXX` (add `--totp 123456` if that Mac uses 2FA), or use **Settings → Machines**. Both Macs then show the same four-word phrase, which you can compare if you want to be sure.
 
 ```sh
 lstack machine ls                 # status, address, access granted to you
@@ -250,18 +248,18 @@ lstack remote activity            # links, pairings, tunnels and refusals
 
 Each LStack install has its own X25519 key pair. The private key is kept in the secret store (encrypted, split between the Keychain and a 0600 file) and never leaves the Mac. Pairing ties two installs together; after that, only those two keys can talk.
 
-- **Pairing.** The two Macs run SPAKE2 over the one-time code, so the code never crosses the network and an attacker gets one online guess. Three wrong tries burn it. The dashboard login and 2FA code go only inside that encrypted session and must also be right. Then both Macs swap and pin each other's public key.
-- **The link.** One TCP connection per paired Mac to the watched Mac's link port (default **7381**, `--link-port`), using **Noise IK** (X25519, ChaCha20-Poly1305, BLAKE2s). It's mutually authenticated by the pinned keys and forward-secret. Status, logs, control, `exec` and tunnels are typed streams multiplexed over it, and each stream is checked against that Mac's grants when it opens. The link port speaks nothing but Noise. Unknown keys are refused and logged, and failed pairings count toward a per-address lockout.
+- **Pairing.** The two Macs run SPAKE2 over the one-time code, so the code never crosses the network and an attacker gets one online guess. Three wrong tries burn it. If the watched Mac has 2FA on, the 2FA code goes only inside that encrypted session and must also be right. Then both Macs swap and pin each other's public key.
+- **The link.** One TCP connection per paired Mac to the watched Mac's link port (default **7381**, `--link-port`), using **Noise IK** (X25519, ChaCha20-Poly1305, BLAKE2s). It's mutually authenticated by the pinned keys and forward-secret. Status, logs, control, `exec` and tunnels are typed streams multiplexed over it, and each stream is checked against that Mac's grants when it opens. The link port speaks nothing but Noise. Unknown keys are refused and logged, and failed pairings count toward a per-address lockout (5 failures → 5 minutes; the other Mac is told so rather than just seeing the connection reset).
 - **No shared secrets stored.** `peers.json` and `remote.json` hold only public keys, names and grants, so copying them gives nothing.
 
 | Attacker | Result |
 |---|---|
-| Watches the network | Sees only Noise ciphertext; the pairing code and login are never sent in the clear |
+| Watches the network | Sees only Noise ciphertext; the pairing code and 2FA code are never sent in the clear |
 | Man-in-the-middle during pairing | One guess at the code, then it's burned |
 | Man-in-the-middle later | Handshake fails without both pinned private keys |
 | Copies `peers.json` / `remote.json` | Gets public keys only |
-| Knows the dashboard password only | Can't pair without a live code from the other Mac's screen |
-| Sees the pairing code only | Can't pair without the password (and 2FA) |
+| Knows the dashboard password only | Can't pair: pairing needs a live code from the other Mac's screen |
+| Sees the pairing code only | Has one try before it's burned, and also needs a 2FA code if 2FA is on |
 | Another macOS user on your Mac | Their connections to forwarded ports are refused |
 | Another app running as you | Can use forwards, just like your browser can (same trust as your user) |
 | A compromised paired Mac | Limited to its grants: granted services' own ports on the loopback; audited and revocable |
@@ -301,7 +299,7 @@ lstack add web -- 'cd ~/code/web && export PORT=3000 && source .env && bun run d
 - **What isn't split.** Anything that needs runtime expansion (`$VAR`, `$(…)`, globs) is left alone, as is everything after a pipe or subshell. Pass `--no-split` to keep the command exactly as typed.
 - **In the app.** The Add Service window shows a **Split Out** suggestion as you type.
 
-**1Password CLI (`op`) and other tools that read app data.** macOS privacy rules apply to scripts launched by the LStack daemon. Without permission, `op` can't read 1Password's settings, so it reports "No accounts configured" and never shows the Touch ID prompt. To fix this, grant **Full Disk Access** to LStack. Click **Grant Access…** in the menu bar banner (or **Settings → Full Disk Access → Grant…**). It opens the matching System Settings pane; turn on **LStack** (if it isn't listed, click + and choose LStack from Applications). The background daemon runs from inside the app bundle, so it's covered by the app's grant; there's no separate helper to add. LStack detects the grant and offers to restart your scripts. If it stops working after an update, remove the entry and add it again.
+**1Password CLI (`op`) and other tools that read app data.** macOS privacy rules apply to scripts launched by the LStack daemon. Without permission, `op` can't read 1Password's settings, so it reports "No accounts configured" and never shows the Touch ID prompt. To fix this, grant **Full Disk Access** to LStack. Click **Grant Access…** in the menu bar banner (or **Settings → Full Disk Access → Grant…**). It opens the matching System Settings pane; turn on **LStack** (if it isn't listed, click + and choose LStack from Applications). The background daemon runs from inside the app bundle, so it's covered by the app's grant; there's no separate helper to add. Until access is granted, LStack leaves the running daemon (even an older version) and your services alone; once it detects the grant, it finishes any pending daemon update and restarts your services automatically. Scripts that were running before a daemon restart are started again by the new daemon. If it stops working after an update, remove the entry and add it again.
 
 ### Service YAML
 

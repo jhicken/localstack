@@ -38,6 +38,10 @@ pub fn settings_file() -> PathBuf {
 pub fn state_file() -> PathBuf {
     home().join("state.json")
 }
+/// Scripts that were running when the daemon was restarted (not stopped), so the next daemon starts them again.
+pub fn resume_file() -> PathBuf {
+    home().join("resume.json")
+}
 
 pub fn default_port() -> u16 {
     std::env::var("LSTACK_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7317)

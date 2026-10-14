@@ -175,9 +175,26 @@ pub fn uninstall_cli() -> Vec<String> {
     notes
 }
 
+/// Before restarting the daemon: note which scripts are running so the new daemon starts them again
+/// (a restart shouldn't drop scripts that aren't set to autostart).
+pub fn remember_running(info: &crate::types::DaemonInfo) {
+    let Ok(v) = client::Client::new(info.clone()).req::<serde_json::Value>("GET", "/api/services", None) else { return };
+    let names: Vec<&str> = v["services"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["type"] == "process" && s["status"] == "running")
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    if !names.is_empty() {
+        let _ = std::fs::write(paths::resume_file(), json!({ "at": paths::now_ms(), "services": names }).to_string());
+    }
+}
+
 fn stop_running_daemon() {
     if let Some(info) = client::read_info() {
         if client::ping(&info) {
+            remember_running(&info);
             let _ = client::Client::new(info.clone()).shutdown();
             for _ in 0..50 {
                 if !client::ping(&info) {
@@ -205,6 +222,9 @@ pub fn install_login(app: Option<&Path>, force: bool) -> Result<Vec<String>, Str
     // An older daemon (possibly a different build) may be running outside launchd — stop it gracefully first.
     if !running_me || current.as_deref() != Some(want.as_str()) {
         stop_running_daemon();
+    } else if let Some(i) = client::read_info().filter(client::ping) {
+        // launchd::install boots the running daemon out too.
+        remember_running(&i);
     }
     let mut notes = launchd::install(&me, app)?;
     launchd::load();
@@ -284,6 +304,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let (mut want_cli, mut want_login, mut json_out, mut quiet) = (false, false, false, false);
     let mut app: Option<PathBuf> = None;
     let mut no_app = false;
+    let mut keep_daemon = false;
     let mut bin_dir: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -294,6 +315,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--json" => json_out = true,
             "-q" | "--quiet" => quiet = true,
             "--no-app" => no_app = true,
+            "--keep-daemon" => keep_daemon = true,
             "--app" => app = Some(PathBuf::from(paths::expand_home(it.next().ok_or("--app needs a path")?))),
             "--bin-dir" => bin_dir = Some(PathBuf::from(paths::expand_home(it.next().ok_or("--bin-dir needs a path")?))),
             o => return Err(format!("unknown setup option {o:?}")),
@@ -360,7 +382,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             // Fix things that are installed but point at a stale binary (e.g. the app moved or was updated).
             let s = status_json();
             let mut notes = vec![];
-            if s["login"]["installed"].as_bool() == Some(true) {
+            // --keep-daemon: never stop or replace a running daemon (the app uses it until it has Full Disk Access).
+            let keep = keep_daemon && client::read_info().filter(client::ping).is_some();
+            if s["login"]["installed"].as_bool() == Some(true) && !keep {
                 notes.extend(install_login(if s["login"]["appInstalled"].as_bool() == Some(true) { app.as_deref() } else { None }, false)?);
             }
             if s["cli"]["installed"].as_bool() != Some(true) && has_stale_cli_link() {

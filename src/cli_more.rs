@@ -102,7 +102,7 @@ fn machine_status(s: &str) -> String {
 pub fn cmd_machine(args: &[String]) -> R {
     let a = Args::parse(
         args,
-        &[("code", "", true), ("user", "u", true), ("name", "", true), ("password-stdin", "", false), ("totp", "", true), ("json", "", false), ("yes", "y", false)],
+        &[("code", "", true), ("name", "", true), ("totp", "", true), ("json", "", false), ("yes", "y", false)],
     )?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("ls");
@@ -146,7 +146,7 @@ pub fn cmd_machine(args: &[String]) -> R {
             Ok(())
         }
         "add" | "pair" => {
-            let addr = a.pos.get(1).ok_or("usage: lstack machine pair <address> --code XXXX-XXXX [--user <name>] [--name <alias>]")?;
+            let addr = a.pos.get(1).ok_or("usage: lstack machine pair <address> --code XXXX-XXXX [--totp 123456] [--name <alias>]")?;
             let code = match a.get("code") {
                 Some(c) => c.to_string(),
                 None if std::io::stdin().is_terminal() => {
@@ -157,25 +157,14 @@ pub fn cmd_machine(args: &[String]) -> R {
                 }
                 None => return Err("--code required (run `lstack remote pair` on that Mac)".into()),
             };
-            let user = match a.get("user") {
-                Some(u) => u.to_string(),
-                None if std::io::stdin().is_terminal() => {
-                    eprint!("Its dashboard username [admin]: ");
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
-                    Some(s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "admin".into())
-                }
-                None => "admin".into(),
-            };
-            let password = if a.has("password-stdin") { read_password("", true)? } else { read_password(&format!("{user}'s dashboard password on {addr}: "), false)? };
-            let mut body = json!({ "address": addr, "code": code, "username": user, "password": password });
+            let mut body = json!({ "address": addr, "code": code });
             if let Some(n) = a.get("name") {
                 body["name"] = json!(n);
             }
             let totp = match a.get("totp") {
                 Some(t) => Some(t.to_string()),
                 None if std::io::stdin().is_terminal() => {
-                    eprint!("2FA code (Enter if none): ");
+                    eprint!("2FA code from {addr}'s authenticator (Enter if it doesn't use 2FA): ");
                     let mut s = String::new();
                     std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
                     Some(s.trim().to_string()).filter(|s| !s.is_empty())
@@ -260,8 +249,8 @@ pub fn cmd_remote_peers(cl: &client::Client, sub: &str, rest: &[String], tunnel:
             for u in if urls.is_empty() { vec!["<this-mac-address>"] } else { urls } {
                 println!("  lstack machine pair {u} --code {}", v["code"].as_str().unwrap_or(""));
             }
-            let tfa = if v["totp"].as_bool().unwrap_or(false) { " and a 2FA code" } else { "" };
-            println!("{}", c::dim(&format!("  It also asks for this Mac's dashboard username and password{tfa}. New pairings may view and\n  tunnel to services; allow start/stop with `lstack remote grant <mac> control`.")));
+            let tfa = if v["totp"].as_bool().unwrap_or(false) { "  It also asks for a 2FA code from this Mac's authenticator app.\n" } else { "" };
+            println!("{}", c::dim(&format!("{tfa}  New pairings may view and tunnel to services; allow start/stop with `lstack remote grant <mac> control`.")));
             Ok(())
         }
         "grant" => {

@@ -130,14 +130,11 @@ struct PopoverView: View {
     }
 
     @ViewBuilder private var diskAccessBanner: some View {
-        if store.connected, store.diskAccessJustGranted {
-            Banner(icon: "checkmark.shield.fill", tint: .green,
-                   text: "Full Disk Access granted. Restart scripts so they pick it up.",
-                   action: "Restart Scripts", perform: store.restartScripts,
-                   dismiss: { store.diskAccessJustGranted = false })
-        } else if store.connected, let st = store.settings, !st.fullDiskAccess, !store.diskAccessDismissed {
+        if store.connected, !store.hasDiskAccess, !store.diskAccessDismissed {
             Banner(icon: "lock.shield.fill", tint: .orange,
-                   text: "Scripts can't use the 1Password CLI (op) or other apps' data until LStack has Full Disk Access.",
+                   text: store.holdingForDiskAccess
+                       ? "LStack is waiting for Full Disk Access before it updates its background service and restarts your services. Scripts can't use the 1Password CLI (op) or other apps' data without it."
+                       : "Scripts can't use the 1Password CLI (op) or other apps' data until LStack has Full Disk Access.",
                    action: "Grant Access…", perform: store.requestDiskAccess,
                    dismiss: { store.diskAccessDismissed = true })
         }

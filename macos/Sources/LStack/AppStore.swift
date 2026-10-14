@@ -425,7 +425,7 @@ final class AppStore {
 
     func refreshSetup() async {
         setup = await Helper.status()
-        if let d = setup?.daemon, d.running, d.stale == true {
+        if let d = setup?.daemon, d.running, d.stale == true, !holdingForDiskAccess {
             daemonOutdated = d.staleReason ?? "LStack was updated after the background service started"
         } else {
             daemonOutdated = nil
@@ -437,13 +437,16 @@ final class AppStore {
     var restartingDaemon = false
 
     func restartDaemon() {
+        Task { await restartDaemonNow() }
+    }
+
+    /// Restarts the daemon; scripts that were running are started again by the new one.
+    private func restartDaemonNow() async {
         restartingDaemon = true
-        Task {
-            let r = await Helper.run(["daemon", "restart"])
-            restartingDaemon = false
-            if r.status != 0 { flash(r.output.isEmpty ? "Couldn't restart the daemon" : r.output.trimmingCharacters(in: .whitespacesAndNewlines)) }
-            await refreshSetup()
-        }
+        let r = await Helper.run(["daemon", "restart"])
+        restartingDaemon = false
+        if r.status != 0 { flash(r.output.isEmpty ? "Couldn't restart the daemon" : r.output.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        await refreshSetup()
     }
 
     /// Ask (once per launch) whether to restart an out-of-date daemon. "Later" leaves a banner in the menu.
@@ -461,13 +464,20 @@ final class AppStore {
     /// Called once at launch. Returns true if the setup window should be shown.
     func launch() async -> Bool {
         guard Helper.url != nil, ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT"] == nil else { return false }
+        // Without Full Disk Access a restarted daemon would start scripts that can't reach other apps' data, so
+        // leave whatever daemon is running (even an older one) and its services alone until access is granted.
+        holdingForDiskAccess = onboarded && !Self.hasDiskAccess() && !diskAccessDismissed
         if onboarded {
             // Keep login items / CLI link pointing at this copy of the app (it may have moved or been updated).
-            _ = await Helper.run(["setup", "repair", "--quiet"])
+            _ = await Helper.run(["setup", "repair", "--quiet"] + (holdingForDiskAccess ? ["--keep-daemon"] : []))
         }
         await refreshSetup()
         if setup?.daemon.running == false { startDaemon() }
-        if onboarded { offerDaemonRestart() }
+        if holdingForDiskAccess {
+            watchDiskAccess()
+        } else if onboarded {
+            offerDaemonRestart()
+        }
         return !onboarded
     }
 
@@ -505,14 +515,14 @@ final class AppStore {
     /// Begin two-factor enrollment. Returns the secret + otpauth URI to show as a QR code.
     func totpBegin() async throws -> TotpSetup {
         guard let client else { throw DaemonError.notRunning }
-        return try await client.send("POST", "/api/remote/totp", as: TotpSetup.self)
+        return try await client.send("POST", "/api/security/totp", as: TotpSetup.self)
     }
 
     /// Returns an error message, or nil once the code is accepted and 2FA is on.
     func totpConfirm(_ code: String) async -> String? {
         guard let client else { return DaemonError.notRunning.localizedDescription }
         do {
-            remote = try await client.send("POST", "/api/remote/totp/confirm", body: ["code": code], as: RemoteStatus.self)
+            remote = try await client.send("POST", "/api/security/totp/confirm", body: ["code": code], as: RemoteStatus.self)
             return nil
         } catch { return error.localizedDescription }
     }
@@ -520,7 +530,7 @@ final class AppStore {
     func totpDisable() async -> String? {
         guard let client else { return DaemonError.notRunning.localizedDescription }
         do {
-            remote = try await client.send("DELETE", "/api/remote/totp", as: RemoteStatus.self)
+            remote = try await client.send("DELETE", "/api/security/totp", as: RemoteStatus.self)
             return nil
         } catch { return error.localizedDescription }
     }
@@ -537,40 +547,83 @@ final class AppStore {
     // MARK: Full Disk Access
 
     var diskAccessDismissed = UserDefaults.standard.bool(forKey: "diskAccessDismissed") {
-        didSet { UserDefaults.standard.set(diskAccessDismissed, forKey: "diskAccessDismissed") }
+        didSet {
+            UserDefaults.standard.set(diskAccessDismissed, forKey: "diskAccessDismissed")
+            // The user doesn't want to grant it: stop holding back the daemon update.
+            if diskAccessDismissed, holdingForDiskAccess {
+                holdingForDiskAccess = false
+                diskAccessPoll?.cancel()
+                Task { await refreshSetup(); offerDaemonRestart() }
+            }
+        }
     }
-    /// Set once access flips to granted while we were waiting for it; offers a restart.
-    var diskAccessJustGranted = false
+    /// LStack (the app, and so the daemon inside it) has Full Disk Access. Checked from the app because
+    /// the running daemon may be an older build that can't report it.
+    var hasDiskAccess = AppStore.hasDiskAccess()
+    /// A daemon restart/update is waiting for Full Disk Access (running services are left alone until then).
+    var holdingForDiskAccess = false
     private var diskAccessPoll: Task<Void, Never>?
+
+    /// Files only readable with Full Disk Access (same probe as the daemon's).
+    static func hasDiskAccess() -> Bool {
+        let home = NSHomeDirectory()
+        for p in ["/Library/Application Support/com.apple.TCC/TCC.db",
+                  home + "/Library/Application Support/com.apple.TCC/TCC.db",
+                  home + "/Library/Safari/Bookmarks.plist"] {
+            let fd = Darwin.open(p, O_RDONLY)
+            if fd >= 0 { Darwin.close(fd); return true }
+            if errno != ENOENT { return false }
+        }
+        return false
+    }
+
+    /// Wait for Full Disk Access to be granted (System Settings may be opened outside LStack), then restart.
+    private func watchDiskAccess() {
+        diskAccessPoll?.cancel()
+        diskAccessPoll = Task {
+            while !Task.isCancelled {
+                if Self.hasDiskAccess() {
+                    await diskAccessGranted()
+                    return
+                }
+                try? await Task.sleep(for: .seconds(holdingForDiskAccess ? 3 : 2))
+            }
+        }
+    }
+
+    /// Now that services can get Full Disk Access, restart them: finish a held-back daemon update (the new
+    /// daemon starts the scripts that were running again), or else restart the running scripts.
+    private func diskAccessGranted() async {
+        hasDiskAccess = true
+        let held = holdingForDiskAccess
+        holdingForDiskAccess = false
+        let pid = setup?.daemon.pid
+        if held { _ = await Helper.run(["setup", "repair", "--quiet"]) }
+        await refreshSetup()
+        if daemonOutdated != nil {
+            await restartDaemonNow()
+            flash("Full Disk Access granted — restarted the background service and its scripts")
+        } else if setup?.daemon.pid != nil, setup?.daemon.pid != pid {
+            flash("Full Disk Access granted — restarted the background service and its scripts")
+        } else {
+            let scripts = services.filter { $0.type == "process" && $0.isRunning }
+            for s in scripts { perform(s.name, "restart") }
+            if !scripts.isEmpty { flash("Full Disk Access granted — restarted \(scripts.count) script\(scripts.count == 1 ? "" : "s")") }
+        }
+        await refreshSettings()
+    }
 
     /// macOS has no prompt for Full Disk Access, so take the user straight to the pane, then watch for
     /// the grant. Granting LStack.app covers the daemon too (it runs from inside the app bundle), so
     /// there's no separate helper to add.
     func requestDiskAccess() {
-        guard settings != nil else { flash("Daemon isn't running"); return }
         // Touching a protected file makes macOS list LStack in the pane (switched off), ready to enable.
         _ = FileManager.default.isReadableFile(atPath: NSHomeDirectory() + "/Library/Safari/Bookmarks.plist")
         _ = try? FileHandle(forReadingFrom: URL(fileURLWithPath: "/Library/Application Support/com.apple.TCC/TCC.db")).close()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
             NSWorkspace.shared.open(url)
         }
-        diskAccessPoll?.cancel()
-        diskAccessPoll = Task {
-            for _ in 0..<150 {
-                try? await Task.sleep(for: .seconds(2))
-                if Task.isCancelled { return }
-                await refreshSettings()
-                if settings?.fullDiskAccess == true {
-                    diskAccessJustGranted = services.contains { $0.type == "process" && $0.isRunning }
-                    return
-                }
-            }
-        }
-    }
-
-    func restartScripts() {
-        diskAccessJustGranted = false
-        for s in services where s.type == "process" && s.isRunning { perform(s.name, "restart") }
+        watchDiskAccess()
     }
 
     func setTerminal(_ id: String) {
@@ -667,10 +720,10 @@ final class AppStore {
 
     // MARK: machines
 
-    /// Pair with another Mac: its one-time code plus its dashboard login (+2FA). Returns the result or an error.
-    func addMachine(address: String, code: String, username: String, password: String, totp: String?, name: String?) async -> Result<PairResult, Error> {
+    /// Pair with another Mac: its one-time code (+ its 2FA code if it uses two-factor authentication).
+    func addMachine(address: String, code: String, totp: String?, name: String?) async -> Result<PairResult, Error> {
         guard let client else { return .failure(DaemonError.notRunning) }
-        var body: [String: String] = ["address": address, "code": code, "username": username, "password": password]
+        var body: [String: String] = ["address": address, "code": code]
         if let totp, !totp.isEmpty { body["totp"] = totp }
         if let name, !name.isEmpty { body["name"] = name }
         do {

@@ -27,8 +27,8 @@ fn help() -> String {
   lstack exec <name> [cmd…]      shell into a docker/compose service (docker exec -it)
   lstack metrics <name> [--range 1h|24h|7d]
   lstack setup [--cli] [--login] [--app <path>]   install the CLI + start at login
-  lstack setup status|repair|uninstall
-  lstack remote [on|off|passwd|2fa|status]   web dashboard for other machines (see below)
+  lstack setup status|repair [--keep-daemon]|uninstall
+  lstack remote [on|off|passwd|share|status]   web dashboard for other machines (see below)
   lstack terminal [terminal|iterm|cmux|ghostty]   app used to open the dashboard / attach
   lstack terminal cmux --fix     let LStack open cmux workspaces (socket password mode)
   lstack secret set|ls|rm|rotate-key|unlock   write-only secrets passed to services as env vars
@@ -63,17 +63,18 @@ fn help() -> String {
   lstack remote off              web dashboard off
   lstack remote share on|off     let paired Macs see this machine's services
   lstack remote passwd [--user <name>] [--password-stdin]
-  lstack remote 2fa on|off       authenticator-app codes (TOTP) at sign-in
   lstack remote share on|off [--link-port 7381]
-  lstack remote pair             one-time code another Mac uses to pair with this one (needs sharing + password)
+  lstack remote pair             one-time code another Mac uses to pair with this one (needs sharing)
   lstack remote peers            Macs paired with this one, their access and link state
   lstack remote grant <mac> [control|no-control] [--tunnel all|none|svc,svc]   what a paired Mac may do
   lstack remote revoke <mac>     unpair a Mac now (its link and tunnels drop)
   lstack remote activity         recent links, pairings, tunnels and refusals
 
 {}
-  lstack machine pair studio.local --code K7QP-3M9X [--user admin] [--name studio]
-                                 needs that Mac's pairing code AND its dashboard password (+2FA)
+  lstack machine pair studio.local --code K7QP-3M9X [--totp 123456] [--name studio]
+                                 needs that Mac's pairing code (+ its 2FA code if it uses 2FA)
+  lstack security 2fa on|off|status   authenticator-app codes (TOTP) for pairing new Macs with this one
+                                 and web dashboard sign-in
   lstack machine id              this install's key fingerprint     lstack machine rekey
   lstack ls                      services grouped by machine; address them as name@machine
   lstack logs api@studio -f      lstack restart worker@studio
@@ -134,6 +135,7 @@ pub fn main(argv: Vec<String>) -> i32 {
         "metrics" => cmd_metrics(&rest),
         "setup" => setup::run(&rest),
         "remote" => cmd_remote(&rest),
+        "security" => cmd_security(&rest),
         "terminal" => cmd_terminal(&rest),
         "secret" | "secrets" => crate::cli_more::cmd_secret(&rest),
         "machine" | "machines" => crate::cli_more::cmd_machine(&rest),
@@ -788,16 +790,19 @@ fn print_remote(v: &serde_json::Value) {
     let running = v["running"].as_bool().unwrap_or(false);
     let web = v["enabled"].as_bool().unwrap_or(false);
     let share = v["sharing"].as_bool().unwrap_or(false);
-    let onoff = |on: bool| if !on { c::dim("○ off") } else if running { c::green("● on") } else { c::red("● on but not listening") };
+    let linked = v["shareUrls"].as_array().is_some_and(|u| !u.is_empty());
+    let onoff = |on: bool, up: bool| if !on { c::dim("○ off") } else if up { c::green("● on") } else { c::red("● on but not listening") };
     let reach = if v["webRemote"].as_bool().unwrap_or(false) { "other devices can open it" } else { "this Mac only" };
-    println!("{}  web dashboard{}", onoff(web), if web { c::dim(&format!("  ({reach})")) } else { String::new() });
-    println!("{}  sharing with other Macs", onoff(share));
+    println!("{}  web dashboard{}", onoff(web, running), if web { c::dim(&format!("  ({reach})")) } else { String::new() });
+    println!("{}  sharing with other Macs", onoff(share, linked));
     if running {
         println!("  {:<9} {}:{}", c::dim("listen"), v["bind"].as_str().unwrap_or("?"), v["port"]);
     }
-    let pw = if v["hasPassword"].as_bool().unwrap_or(false) { "" } else { "  (no password set)" };
-    println!("  {:<9} {}{pw}", c::dim("login"), v["username"].as_str().unwrap_or("?"));
-    let tfa = if v["totp"].as_bool().unwrap_or(false) { c::green("on (authenticator code required)") } else { c::dim("off — lstack remote 2fa on") };
+    if web {
+        let pw = if v["hasPassword"].as_bool().unwrap_or(false) { "" } else { "  (no password set)" };
+        println!("  {:<9} {}{pw}", c::dim("login"), v["username"].as_str().unwrap_or("?"));
+    }
+    let tfa = if v["totp"].as_bool().unwrap_or(false) { c::green("on (pairing + sign-in need an authenticator code)") } else { c::dim("off — lstack security 2fa on") };
     println!("  {:<9} {tfa}", c::dim("2fa"));
     if web {
         let access = if v["allowControl"].as_bool().unwrap_or(false) { "view + start/stop/restart" } else { "read-only" };
@@ -923,16 +928,27 @@ fn cmd_remote(args: &[String]) -> R {
     Ok(())
 }
 
+/// `lstack security 2fa on|off|status`
+fn cmd_security(args: &[String]) -> R {
+    let a = Args::parse(args, &[("code", "", true)])?;
+    let cl = client::connect(true)?;
+    match a.pos.first().map(String::as_str).unwrap_or("2fa") {
+        "2fa" | "totp" | "otp" => remote_2fa(&cl, a.pos.get(1).map(String::as_str).unwrap_or("status"), a.get("code")),
+        other => Err(format!("unknown security command {other:?} (2fa on|off|status)")),
+    }
+}
+
 fn remote_2fa(cl: &client::Client, sub: &str, code: Option<&str>) -> R {
     match sub {
         "status" => {
-            let v: serde_json::Value = cl.req("GET", "/api/remote", None)?;
+            let v: serde_json::Value = cl.req("GET", "/api/security", None)?;
             let on = v["totp"].as_bool().unwrap_or(false);
-            println!("two-factor sign-in: {}", if on { c::green("on") } else { c::dim("off") });
+            println!("two-factor authentication: {}", if on { c::green("on") } else { c::dim("off") });
+            println!("{}", c::dim("  When on, pairing a new Mac with this one and web dashboard sign-in need a code from your authenticator app."));
             Ok(())
         }
         "on" | "enable" | "setup" => {
-            let v: serde_json::Value = cl.req("POST", "/api/remote/totp", None)?;
+            let v: serde_json::Value = cl.req("POST", "/api/security/totp", None)?;
             let (secret, uri) = (v["secret"].as_str().unwrap_or(""), v["uri"].as_str().unwrap_or(""));
             println!("Scan this with an authenticator app (1Password, Google Authenticator, Authy…):\n");
             if let Some(qr) = qr_lines(uri) {
@@ -949,15 +965,13 @@ fn remote_2fa(cl: &client::Client, sub: &str, code: Option<&str>) -> R {
                     s.trim().to_string()
                 }
             };
-            let v: serde_json::Value = cl.req("POST", "/api/remote/totp/confirm", Some(json!({ "code": code })))?;
-            println!("{} two-factor sign-in is on; remote browsers were signed out", c::green("✓"));
-            print_remote(&v);
+            cl.req::<serde_json::Value>("POST", "/api/security/totp/confirm", Some(json!({ "code": code })))?;
+            println!("{} two-factor authentication is on: pairing a new Mac and dashboard sign-in now need a code (dashboard browsers were signed out)", c::green("✓"));
             Ok(())
         }
         "off" | "disable" => {
-            let v: serde_json::Value = cl.req("DELETE", "/api/remote/totp", None)?;
-            println!("{} two-factor sign-in is off", c::green("✓"));
-            print_remote(&v);
+            cl.req::<serde_json::Value>("DELETE", "/api/security/totp", None)?;
+            println!("{} two-factor authentication is off", c::green("✓"));
             Ok(())
         }
         other => Err(format!("unknown 2fa command {other:?} (on, off, status)")),
@@ -1066,6 +1080,9 @@ fn cmd_daemon(args: &[String]) -> i32 {
                 println!("{} daemon running (pid {}, port {})", c::green("●"), cl.info.pid, cl.info.port);
             }
             "stop" | "restart" => {
+                if let (Some(i), true, "restart") = (&info, alive, sub) {
+                    crate::setup::remember_running(i);
+                }
                 if launchd::status().loaded && launchd::manages_this_home() {
                     launchd::bootout_daemon();
                 } else if alive {

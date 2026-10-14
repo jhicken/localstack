@@ -313,23 +313,21 @@ fn machines_pair_and_proxy() {
     let client_id = client.get("/api/identity").unwrap();
     assert_eq!(client_id["fingerprint"].as_str().unwrap().len(), 19);
 
-    // Pairing needs a live code AND the dashboard login; a code is burned after 3 failures.
-    let login = |code: &str, pass: &str| json!({ "address": addr, "code": code, "username": "me", "password": pass, "name": "studio" });
-    assert_eq!(host.post("/api/machines", Some(json!({ "address": addr, "code": "AAAA-AAAA" }))).unwrap_err().0, 400, "password required");
+    // Pairing needs only a live one-time code (no dashboard login); a code is burned after 3 failures.
+    let login = |code: &str| json!({ "address": addr, "code": code, "name": "studio" });
+    assert_eq!(host.post("/api/machines", Some(json!({ "address": addr }))).unwrap_err().0, 400, "code required");
     let code = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
-    let e = host.post("/api/machines", Some(login("AAAA-AAAA", "correct horse"))).unwrap_err();
-    assert_eq!(e.0, 403, "{e:?}");
-    for _ in 0..2 {
-        let e = host.post("/api/machines", Some(login(&code, "wrong-pass"))).unwrap_err();
+    for _ in 0..3 {
+        let e = host.post("/api/machines", Some(login("AAAA-AAAA"))).unwrap_err();
         assert_eq!(e.0, 403, "{e:?}");
     }
-    assert!(host.post("/api/machines", Some(login(&code, "correct horse"))).is_err(), "burned after 3 failures");
+    assert!(host.post("/api/machines", Some(login(&code))).is_err(), "burned after 3 failures");
     let code3 = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
-    let m = host.post("/api/machines", Some(login(&code3, "correct horse"))).unwrap();
+    let m = host.post("/api/machines", Some(login(&code3))).unwrap();
     assert_eq!(m["name"], "studio");
     assert_eq!(m["phrase"].as_str().unwrap().split(' ').count(), 4);
     assert_eq!(m["grants"], json!({ "control": false, "tunnel": "all" }));
-    assert!(host.post("/api/machines", Some(login(&code3, "correct horse"))).is_err(), "codes are single use");
+    assert!(host.post("/api/machines", Some(login(&code3))).is_err(), "codes are single use");
     let peers = client.get("/api/remote/peers").unwrap();
     assert_eq!(peers.as_array().unwrap().len(), 1);
     assert_eq!(peers[0]["phrase"], m["phrase"]);
@@ -381,7 +379,7 @@ fn machines_pair_and_proxy() {
 
     // Pairing again replaces the old entry (keeping its name); machines can be renamed.
     let code4 = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
-    let m = host.post("/api/machines", Some(json!({ "address": addr, "code": code4, "username": "me", "password": "correct horse" }))).unwrap();
+    let m = host.post("/api/machines", Some(json!({ "address": addr, "code": code4 }))).unwrap();
     assert_eq!(m["name"], "studio");
     assert_eq!(host.get("/api/machines").unwrap()["machines"].as_array().unwrap().len(), 1);
     host.call("PATCH", "/api/machines/studio", Some(json!({ "name": "lab" }))).unwrap();

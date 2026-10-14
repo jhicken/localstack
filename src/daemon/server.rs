@@ -110,6 +110,10 @@ pub fn router(st: AppState) -> Router {
         .route("/api/remote", get(remote_status).put(remote_update))
         .route("/api/remote/totp", post(|State(st): State<AppState>| async move { to_json(st.remote.totp_begin()) }).delete(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(st.remote.totp_disable()?)) }))
         .route("/api/remote/totp/confirm", post(totp_confirm))
+        // Security settings (2FA for pairing new Macs and dashboard sign-in); /api/remote/totp is the old name.
+        .route("/api/security", get(|State(st): State<AppState>| async move { Json(json!({ "totp": st.remote.totp_enabled() })) }))
+        .route("/api/security/totp", post(|State(st): State<AppState>| async move { to_json(st.remote.totp_begin()) }).delete(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(st.remote.totp_disable()?)) }))
+        .route("/api/security/totp/confirm", post(totp_confirm))
         .route("/api/remote/pair-code", post(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(st.remote.new_pair_code()?)) }))
         .route("/api/remote/peers", get(|State(st): State<AppState>| async move { Json(st.remote.shared_peers()) }))
         .route(
@@ -538,16 +542,14 @@ async fn machine_add(State(st): State<AppState>, body: Bytes) -> Res {
     let addr = v["address"].as_str().or(v["url"].as_str()).unwrap_or("").to_string();
     let name = v["name"].as_str().filter(|s| !s.is_empty()).map(String::from);
     let code = v["code"].as_str().unwrap_or("").trim().to_string();
-    if code.is_empty() || !v["password"].is_string() {
-        return Err(ApiErr(400, "pairing needs the other Mac's one-time code (Share this Mac → Show pairing code) and its dashboard username and password (+ 2FA code if set)".into()));
+    if code.is_empty() {
+        return Err(ApiErr(400, "pairing needs the other Mac's one-time code (Share this Mac → Show pairing code there), plus its 2FA code if it uses two-factor authentication".into()));
     }
-    let mut login = json!({});
-    for k in ["username", "password", "totp"] {
-        if !v[k].is_null() {
-            login[k] = v[k].clone();
-        }
+    let mut auth = json!({});
+    if let Some(t) = v["totp"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+        auth["totp"] = json!(t);
     }
-    Ok(Json(st.peers.pair(&addr, &code, login, name.as_deref()).await?))
+    Ok(Json(st.peers.pair(&addr, &code, auth, name.as_deref()).await?))
 }
 
 async fn identity() -> Res {

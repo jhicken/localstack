@@ -1,5 +1,4 @@
 import AppKit
-import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 /// First-run setup and, afterwards, the Settings window.
@@ -18,8 +17,6 @@ struct SetupView: View {
     @State private var rEditing = false
     @State private var rBusy = false
     @State private var rError: String?
-    @State private var totpSetup: TotpSetup?
-    @State private var totpCode = ""
     @State private var tab: SettingsTab = .general
     @State private var cmuxBusy = false
     @State private var cmuxError: String?
@@ -51,6 +48,8 @@ struct SetupView: View {
                 SecretsSettings()
             } else if tab == .machines {
                 MachinesSettings()
+            } else if tab == .security {
+                SecuritySettings()
             } else if tab == .monitoring {
                 MonitoringSettings()
             }
@@ -223,7 +222,7 @@ struct SetupView: View {
     }
 
     private var diskAccessRow: some View {
-        let granted = store.settings?.fullDiskAccess ?? false
+        let granted = store.hasDiskAccess
         let detail = granted
             ? "Granted. Scripts can use tools that read other apps' data, such as the 1Password CLI (`op`)."
             : "Scripts run by the daemon can't reach other apps' data, so tools like the 1Password CLI (`op`) can't see your accounts. Click Grant, then turn on **LStack** in the list (if it's missing, click + and pick LStack from Applications). The background service is covered too."
@@ -254,7 +253,7 @@ struct SetupView: View {
         } else if on, let e = r?.error {
             detail = e
         } else {
-            detail = "A password-protected web dashboard with live status, metrics and logs — for this Mac only, or for your other devices too. Sharing with other Macs is separate (Settings → Machines)."
+            detail = "A password-protected web dashboard with live status, metrics and logs — for this Mac only, or for your other devices too. Sharing with other Macs is separate (Settings → Machines); two-factor sign-in is in Settings → Security."
         }
         return VStack(alignment: .leading, spacing: 0) {
             SetupRow(icon: "globe", tint: on && r?.running == true ? .teal : .secondary, title: "Web dashboard", detail: detail) {
@@ -323,31 +322,7 @@ struct SetupView: View {
                     Text("")
                     Toggle("Allow start / stop / restart", isOn: $rControl).font(.system(size: 11)).toggleStyle(.checkbox)
                 }
-                if r?.hasPassword == true {
-                    GridRow {
-                        Text("Two-factor").font(.system(size: 11)).foregroundStyle(.secondary)
-                        HStack(spacing: 8) {
-                            if r?.totp == true {
-                                Label("On", systemImage: "checkmark.shield.fill").font(.system(size: 11)).foregroundStyle(.green)
-                                Button("Turn Off") {
-                                    Task { rError = await store.totpDisable() }
-                                }
-                                .controlSize(.small)
-                            } else if totpSetup == nil {
-                                Text("Off").font(.system(size: 11)).foregroundStyle(.secondary)
-                                Button("Set Up…") {
-                                    Task {
-                                        do { totpSetup = try await store.totpBegin(); totpCode = ""; rError = nil }
-                                        catch { rError = error.localizedDescription }
-                                    }
-                                }
-                                .controlSize(.small)
-                            }
-                        }
-                    }
-                }
             }
-            if let t = totpSetup, r?.totp != true { totpPanel(t) }
             if let rError {
                 Text(rError).font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
@@ -363,61 +338,6 @@ struct SetupView: View {
                     .disabled(rBusy)
             }
         }
-    }
-
-    private func totpPanel(_ t: TotpSetup) -> some View {
-        HStack(alignment: .top, spacing: 14) {
-            if let img = qrImage(t.uri) {
-                Image(nsImage: img)
-                    .interpolation(.none)
-                    .resizable()
-                    .frame(width: 132, height: 132)
-                    .padding(6)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(.white))
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Scan with an authenticator app (1Password, Google Authenticator, Authy…), then enter the 6-digit code it shows.")
-                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Text(t.secret.chunked(4))
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .help("Setup key, for manual entry")
-                HStack(spacing: 6) {
-                    TextField("123456", text: $totpCode)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 13, design: .monospaced))
-                        .frame(width: 90)
-                        .onSubmit(confirmTotp)
-                    Button("Confirm", action: confirmTotp)
-                        .controlSize(.small)
-                        .buttonStyle(.borderedProminent)
-                        .disabled(totpCode.filter(\.isNumber).count != 6)
-                    Button("Cancel") { totpSetup = nil; rError = nil }.controlSize(.small)
-                }
-            }
-        }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.background.tertiary))
-    }
-
-    private func confirmTotp() {
-        let code = totpCode.filter(\.isNumber)
-        guard code.count == 6 else { return }
-        Task {
-            rError = await store.totpConfirm(code)
-            if rError == nil { totpSetup = nil; totpCode = "" }
-        }
-    }
-
-    private func qrImage(_ text: String) -> NSImage? {
-        let f = CIFilter.qrCodeGenerator()
-        f.message = Data(text.utf8)
-        f.correctionLevel = "M"
-        guard let out = f.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else { return nil }
-        let rep = NSCIImageRep(ciImage: out)
-        let img = NSImage(size: rep.size)
-        img.addRepresentation(rep)
-        return img
     }
 
     private func syncRemoteFields() {
@@ -521,14 +441,5 @@ struct SetupRow<Accessory: View>: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 11)
-    }
-}
-
-private extension String {
-    func chunked(_ n: Int) -> String {
-        stride(from: 0, to: count, by: n).map { i -> String in
-            let a = index(startIndex, offsetBy: i)
-            return String(self[a..<(index(a, offsetBy: n, limitedBy: endIndex) ?? endIndex)])
-        }.joined(separator: " ")
     }
 }

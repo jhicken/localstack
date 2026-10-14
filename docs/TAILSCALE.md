@@ -56,7 +56,7 @@ Gaps this leaves:
   `OS == "macOS"`.
 - A cheap probe marks the ones running LStack. It's a TCP connect to `:7381` that reads the Noise listener's banner
   frame (or just checks that the connect succeeds), with a 1 s timeout, run in parallel and capped at 32 peers.
-- Picking one fills in the address; the code, login and 2FA steps stay exactly as they are.
+- Picking one fills in the address; the code and 2FA steps stay exactly as they are.
 
 ### 4. Several addresses per Mac
 - `PeerCfg.addr` becomes `addrs: Vec<String>`. Old configs load `addr` as a one-element list.
