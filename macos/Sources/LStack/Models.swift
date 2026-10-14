@@ -27,6 +27,13 @@ struct SystemInfo: Codable {
     var samples: [SystemSample]
 }
 
+/// Another Mac's load, as relayed by the daemon (fields are null until the peer has answered).
+struct MachineSystem: Codable, Equatable {
+    var cores: Int?
+    var memTotal: Double?
+    var samples: [SystemSample]?
+}
+
 struct HealthCheck: Codable, Hashable {
     var type: String
     var url: String?
@@ -150,6 +157,7 @@ struct Machine: Codable, Identifiable, Equatable {
     var services: [ServiceState]?
     var processes: [ProcInfo]?
     var configErrors: [String]?
+    var system: MachineSystem?
 
     var online: Bool { status == "online" }
     var canControl: Bool { allowControl ?? false }

@@ -122,7 +122,7 @@ Run `lstack help` for everything.
 
 ## Web dashboard
 
-LStack can serve a small web dashboard. It shows services, health, CPU and memory history, live logs, and a whole-machine view per machine: click the CPU/MEM row under a machine to see CPU and memory charts for the last 15 minutes, with LStack's share highlighted, plus the busy processes. It is **off by default**. Turn it on from **Settings → Web dashboard** in the app, or from the CLI.
+LStack can serve a small web dashboard. It shows services, health, CPU and memory history, live logs, and a whole-machine view per machine: each machine has a **Machine** section with a Load row (CPU and memory sparklines) above its busiest processes; click the Load row for CPU and memory charts covering the last 15 minutes, with LStack's share highlighted, plus the full process list. Machine groups and Machine sections fold away with a click, and the dashboard remembers which ones are folded. It is **off by default**. Turn it on from **Settings → Web dashboard** in the app, or from the CLI.
 
 You choose who can open it: **this Mac only** (the listener binds to 127.0.0.1, and other devices get 403), or **other devices too**. Sharing with other Macs is a separate switch (see [Other machines](#other-machines)), so you can use the dashboard locally without exposing it, or share with paired Macs while the dashboard stays off.
 
@@ -216,7 +216,7 @@ You can also manage this in **Settings → Monitoring**, where you set the ping 
 
 ## Other machines
 
-A Mac can watch other Macs that run LStack. Their services and busy processes then appear, grouped by machine, in the menu bar, `lstack ls`, `lstack top` and the web dashboard.
+A Mac can watch other Macs that run LStack. Their services and busy processes then appear, grouped by machine, in the menu bar, `lstack ls`, `lstack top` and the web dashboard. In the menu bar, each other Mac shows a Load row with CPU and memory sparklines above its busy processes. Machine sections can be collapsed, and the menu bar remembers which ones are.
 
 1. On the Mac to be watched, turn on sharing (`lstack remote share on`, or **Settings → Machines → Share this Mac**). Then run `lstack remote pair` or click **Show Pairing Code**. You get a one-time code, valid for 10 minutes. Sharing doesn't need the web dashboard.
 2. On your Mac, run `lstack machine add <address> --code XXXX-XXXX`, or use **Settings → Machines**. You can also sign in with the other Mac's dashboard login (`--user`, plus 2FA if it is on).

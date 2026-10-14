@@ -1,3 +1,4 @@
+import Charts
 import SwiftUI
 
 struct PopoverView: View {
@@ -24,32 +25,39 @@ struct PopoverView: View {
                 empty
             } else {
                 ScrollView {
-                    VStack(spacing: 4) {
+                    VStack(spacing: 5) {
                         if !store.machines.isEmpty {
-                            MachineHeader(name: store.localName ?? "This Mac", status: "online", detail: "this Mac")
+                            MachineHeader(name: store.localName ?? "This Mac", status: "online", detail: "this Mac",
+                                          count: store.services.count, collapsed: isCollapsed(Self.localKey)) { toggle(Self.localKey) }
                         }
-                        ForEach(store.services) { s in
-                            ServiceRow(service: s)
-                        }
-                        ForEach(store.configErrors, id: \.self) { e in
-                            Label(e, systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(8)
-                        }
-                        ProcessList(processes: store.processes)
-                        ForEach(store.machines) { m in
-                            MachineHeader(name: m.name, status: m.status, detail: m.online ? (m.canControl ? nil : "read-only") : (m.error ?? m.status))
-                                .padding(.top, 6)
-                            ForEach(m.services ?? []) { s in
+                        if store.machines.isEmpty || !isCollapsed(Self.localKey) {
+                            ForEach(store.services) { s in
                                 ServiceRow(service: s)
                             }
-                            if m.online, (m.services ?? []).isEmpty {
-                                Text("No services").font(.system(size: 11)).foregroundStyle(.secondary)
-                                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
+                            ForEach(store.configErrors, id: \.self) { e in
+                                Label(e, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(8)
                             }
-                            ProcessList(processes: m.processes ?? [])
+                            // This Mac's load is the card at the top of the menu.
+                            ProcessList(processes: store.processes, key: Self.localKey)
+                        }
+                        ForEach(store.machines) { m in
+                            MachineHeader(name: m.name, status: m.status, detail: m.online ? (m.canControl ? nil : "read-only") : (m.error ?? m.status),
+                                          count: m.services?.count ?? 0, collapsed: isCollapsed(m.name)) { toggle(m.name) }
+                                .padding(.top, 10)
+                            if !isCollapsed(m.name) {
+                                ForEach(m.services ?? []) { s in
+                                    ServiceRow(service: s)
+                                }
+                                if m.online, (m.services ?? []).isEmpty {
+                                    Text("No services").font(.system(size: 11)).foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
+                                }
+                                ProcessList(processes: m.processes ?? [], system: m.online ? m.system : nil, key: m.name)
+                            }
                         }
                     }
                     .padding(8)
@@ -79,6 +87,18 @@ struct PopoverView: View {
         .animation(.snappy(duration: 0.25), value: store.toast)
         .animation(.snappy(duration: 0.25), value: store.cmuxDenied)
         .onAppear { Task { await store.refreshSettings() } }
+    }
+
+    /// Machines whose section is folded away (newline-separated names; this Mac is `localKey`).
+    @AppStorage("lstack.collapsedMachines") private var collapsedRaw = ""
+    private static let localKey = "@local"
+
+    private func isCollapsed(_ key: String) -> Bool { collapsedRaw.split(separator: "\n").contains { $0 == key } }
+
+    private func toggle(_ key: String) {
+        var set = collapsedRaw.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        if let i = set.firstIndex(of: key) { set.remove(at: i) } else { set.append(key) }
+        withAnimation(.snappy(duration: 0.2)) { collapsedRaw = set.joined(separator: "\n") }
     }
 
     private var header: some View {
@@ -307,18 +327,29 @@ struct MachineHeader: View {
     let name: String
     let status: String
     let detail: String?
+    var count = 0
+    var collapsed = false
+    var toggle: () -> Void = {}
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle().fill(color).frame(width: 7, height: 7)
-            Image(systemName: "desktopcomputer").font(.system(size: 10)).foregroundStyle(.secondary)
-            Text(name).font(.system(size: 11, weight: .semibold))
-            if let detail { Text(detail).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail) }
-            Spacer()
+        Button(action: toggle) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(collapsed ? 0 : 90))
+                Circle().fill(color).frame(width: 7, height: 7)
+                Text(name).font(.system(size: 12, weight: .semibold))
+                if let detail { Text(detail).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail) }
+                Spacer()
+                if count > 0 { Text("\(count)").font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit() }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 2)
-        .help("\(name): \(status)")
+        .buttonStyle(.plain)
+        .help("\(name): \(status) — click to \(collapsed ? "expand" : "collapse")")
     }
 
     private var color: Color {
@@ -331,48 +362,130 @@ struct MachineHeader: View {
     }
 }
 
-/// Busy processes that aren't LStack services (over the thresholds in Settings → Monitoring).
+/// Another Mac's whole-machine load, styled like a service row: values plus CPU / memory sparklines.
+struct MachineLoadRow: View {
+    let system: MachineSystem
+
+    private var samples: [SystemSample] { Array((system.samples ?? []).suffix(120)) }
+    private var last: SystemSample? { samples.last }
+    private var memPct: Double? {
+        guard let last, let t = system.memTotal, t > 0 else { return nil }
+        return last.mem / t * 100
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "desktopcomputer").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Load").font(.system(size: 12, weight: .medium))
+                Text(meta).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            metric("CPU", Fmt.pct(last?.cpu), \.cpu, .green, max: nil)
+            metric("MEM", memPct.map { Fmt.pct($0) } ?? Fmt.bytes(last?.mem), \.mem, .blue, max: system.memTotal)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.04)))
+        .help("Whole-machine load. CPU is % of all cores; memory is in use vs. total RAM.")
+    }
+
+    private var meta: String {
+        [system.cores.map { "\($0) cores" }, system.memTotal.map { "\(Fmt.gb($0)) RAM" }].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func metric(_ label: String, _ value: String, _ key: KeyPath<SystemSample, Double>, _ color: Color, max cap: Double?) -> some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            HStack(spacing: 3) {
+                Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                Text(value).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+            }
+            Chart {
+                ForEach(samples, id: \.ts) { s in
+                    AreaMark(x: .value("Time", s.date), y: .value("V", s[keyPath: key]))
+                        .interpolationMethod(.monotone)
+                        .foregroundStyle(LinearGradient(colors: [color.opacity(0.35), color.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+                    LineMark(x: .value("Time", s.date), y: .value("V", s[keyPath: key]))
+                        .interpolationMethod(.monotone)
+                        .foregroundStyle(color)
+                        .lineStyle(StrokeStyle(lineWidth: 1.2, lineCap: .round))
+                }
+            }
+            .chartXAxis(.hidden)
+            .chartYAxis(.hidden)
+            .chartLegend(.hidden)
+            .chartYScale(domain: 0...yMax(key, cap))
+            .frame(width: 64, height: 16)
+        }
+    }
+
+    private func yMax(_ key: KeyPath<SystemSample, Double>, _ cap: Double?) -> Double {
+        if let cap, cap > 0 { return cap }
+        let peak = samples.map { $0[keyPath: key] }.max() ?? 0
+        return min(Swift.max(peak * 1.25, 10), 100)
+    }
+}
+
+/// A machine's load (other Macs) plus busy processes that aren't LStack services
+/// (over the thresholds in Settings → Monitoring). Folding is remembered per machine.
 struct ProcessList: View {
     let processes: [ProcInfo]
-    @State private var open = true
+    var system: MachineSystem?
+    @AppStorage private var open: Bool
     @State private var all = false
     private static let collapsed = 5
 
+    init(processes: [ProcInfo], system: MachineSystem? = nil, key: String) {
+        self.processes = processes
+        self.system = system
+        _open = AppStorage(wrappedValue: true, "lstack.procs.\(key)")
+    }
+
+    private var hasLoad: Bool { !(system?.samples ?? []).isEmpty }
+
     var body: some View {
-        if !processes.isEmpty {
-            VStack(alignment: .leading, spacing: 2) {
+        if !processes.isEmpty || hasLoad {
+            VStack(alignment: .leading, spacing: 4) {
                 Button { withAnimation(.snappy(duration: 0.2)) { open.toggle() } } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: open ? "chevron.down" : "chevron.right").font(.system(size: 8, weight: .bold))
-                        Text("Other busy processes").font(.system(size: 10, weight: .semibold)).textCase(.uppercase)
-                        Text("\(processes.count)").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold))
+                            .rotationEffect(.degrees(open ? 90 : 0))
+                        Text(hasLoad ? "Machine" : "Other busy processes").font(.system(size: 10, weight: .semibold)).textCase(.uppercase)
                         Spacer()
+                        if !processes.isEmpty {
+                            Text("\(processes.count) busy").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        }
                     }
                     .foregroundStyle(.secondary)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(.horizontal, 10)
                 if open {
-                    ForEach(all ? processes : Array(processes.prefix(Self.collapsed))) { p in
-                        HStack(spacing: 8) {
-                            Text(p.name).font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
-                            Text(verbatim: String(p.pid)).font(.system(size: 9)).foregroundStyle(.tertiary).monospacedDigit()
-                            Spacer()
-                            Text(Fmt.pct(p.cpu)).frame(width: 46, alignment: .trailing)
-                            Text(Fmt.bytes(p.mem)).frame(width: 64, alignment: .trailing).foregroundStyle(.secondary)
-                            Text((p.net ?? 0) > 0 ? Fmt.rate(p.net) : "")
-                                .frame(width: 62, alignment: .trailing).foregroundStyle(.secondary)
+                    if let system, hasLoad { MachineLoadRow(system: system) }
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(all ? processes : Array(processes.prefix(Self.collapsed))) { p in
+                            HStack(spacing: 8) {
+                                Text(p.name).font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
+                                Text(verbatim: String(p.pid)).font(.system(size: 9)).foregroundStyle(.tertiary).monospacedDigit()
+                                Spacer()
+                                Text(Fmt.pct(p.cpu)).frame(width: 46, alignment: .trailing)
+                                Text(Fmt.bytes(p.mem)).frame(width: 64, alignment: .trailing).foregroundStyle(.secondary)
+                                Text((p.net ?? 0) > 0 ? Fmt.rate(p.net) : "")
+                                    .frame(width: 62, alignment: .trailing).foregroundStyle(.secondary)
+                            }
+                            .font(.system(size: 10.5)).monospacedDigit()
                         }
-                        .font(.system(size: 10.5)).monospacedDigit()
+                        if processes.count > Self.collapsed {
+                            Button(all ? "Show fewer" : "Show all \(processes.count)") { withAnimation(.snappy(duration: 0.2)) { all.toggle() } }
+                                .buttonStyle(.link).font(.system(size: 10))
+                        }
                     }
-                    if processes.count > Self.collapsed {
-                        Button(all ? "Show fewer" : "Show all \(processes.count)") { withAnimation(.snappy(duration: 0.2)) { all.toggle() } }
-                            .buttonStyle(.link).font(.system(size: 10))
-                    }
+                    .padding(.horizontal, 10)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
+            .padding(.top, 6)
+            .padding(.bottom, 2)
         }
     }
 }

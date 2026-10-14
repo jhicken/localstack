@@ -95,17 +95,17 @@ header.top .logo { width: 34px; height: 34px; border-radius: 9px; }
 .btn.go { color: var(--green); } .btn.stop { color: var(--red); } .btn.re { color: var(--amber); }
 
 main.body { display: grid; grid-template-columns: 360px 1fr; min-height: 0; }
-aside.list { border-right: 1px solid var(--border); overflow-y: auto; padding: 12px; }
+aside.list { border-right: 1px solid var(--border); overflow-y: auto; padding: 16px 14px; }
 .list-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 6px 10px; color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
 .svc {
   display: grid; grid-template-columns: auto 1fr auto; gap: 4px 10px; align-items: center;
-  padding: 10px 12px; border-radius: 12px; cursor: pointer; border: 1px solid transparent; margin-bottom: 4px;
+  padding: 11px 12px; border-radius: 12px; cursor: pointer; border: 1px solid transparent; margin-bottom: 6px;
   transition: background .12s, border-color .12s;
 }
 .svc:hover { background: var(--panel); }
 .svc.sel { background: var(--panel-2); border-color: var(--border-2); }
-.svc .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.svc .meta { grid-column: 2; color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; overflow: hidden; white-space: nowrap; }
+.svc .name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.svc .meta { grid-column: 2; color: var(--muted); font-size: 11.5px; display: flex; gap: 8px; align-items: center; overflow: hidden; white-space: nowrap; }
 .svc .nums { text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); }
 .svc .nums b { color: var(--text); font-weight: 600; }
 .svc .spark { grid-column: 3; grid-row: 2; justify-self: end; }
@@ -135,9 +135,9 @@ a.link:hover { background: rgba(79, 209, 255, 0.16); border-color: rgba(79, 209,
 .link.warn { color: var(--amber); background: rgba(251, 191, 36, 0.08); border-color: rgba(251, 191, 36, 0.22); }
 .link.more { color: var(--muted); background: var(--panel-2); border-color: var(--border); }
 .lwarn { cursor: help; }
-.machine { margin-bottom: 14px; }
+.machine { margin-bottom: 26px; }
 .machine.stale .svc { opacity: 0.55; }
-.mach { display: flex; align-items: center; gap: 8px; padding: 8px 8px 6px; margin-bottom: 2px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.mach { display: flex; align-items: center; gap: 8px; padding: 8px 6px 9px; margin-bottom: 8px; border-bottom: 1px solid var(--border); font-size: 14px; }
 .mach .m-sub { color: var(--muted); font-size: 11.5px; }
 .mach .m-n { margin-left: auto; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .mdot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
@@ -149,9 +149,9 @@ a.link:hover { background: rgba(79, 209, 255, 0.16); border-color: rgba(79, 209,
 .empty.sm { padding: 12px 8px; font-size: 12px; }
 .procs { margin-top: 10px; }
 .procs .list-head { padding-bottom: 4px; }
-.ptable { width: 100%; border-collapse: collapse; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.ptable { width: 100%; border-collapse: collapse; table-layout: auto; font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .ptable th { text-align: right; color: var(--faint); font-weight: 600; padding: 2px 6px; }
-.ptable td { text-align: right; padding: 2px 6px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ptable td { text-align: right; padding: 3px 6px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ptable th:first-child, .ptable td.pn { text-align: left; color: var(--text); }
 .ptable td.pn { max-width: 0; width: 100%; }
 .ptable tbody tr:hover td { background: var(--panel); }
@@ -238,13 +238,22 @@ section.detail { overflow-y: auto; padding: 20px 24px 24px; display: flex; flex-
 }
 .card-h .seg { margin-left: auto; }
 
-/* whole-machine summary row + overview */
-.msum { display: flex; align-items: center; gap: 6px; padding: 7px 10px; margin: 4px 0 6px; border-radius: 10px; cursor: pointer; font-size: 12px; font-variant-numeric: tabular-nums; border: 1px solid transparent; }
-.msum:hover { background: var(--panel); }
-.msum.sel { background: var(--panel); border-color: var(--border); }
-.msum .mk { color: var(--muted); font-size: 11px; }
-.msum .mk:not(:first-child) { margin-left: 8px; }
-.msum b { min-width: 40px; }
+/* machine section: load row + collapsible busy processes */
+.mach { cursor: pointer; user-select: none; }
+.mach:hover b { color: #fff; }
+.chev { display: inline-block; width: 10px; color: var(--faint); font-size: 14px; line-height: 1; transition: transform .15s; }
+.chev.open { transform: rotate(90deg); }
+.msec { margin-top: 14px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.sec-h { display: flex; align-items: center; gap: 6px; padding: 0 6px 6px; color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; user-select: none; }
+.sec-h:hover { color: var(--text); }
+.sec-h .sec-n { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--faint); }
+.svc.mrow .micon { grid-row: span 2; width: 18px; height: 18px; display: grid; place-items: center; opacity: 0.7; }
+.svc.mrow .micon svg { width: 16px; height: 16px; stroke: var(--muted); }
+.svc.mrow .name { color: var(--muted); font-weight: 600; }
+.svc.mrow .sparks { grid-column: 3; grid-row: 2; justify-self: end; display: flex; gap: 6px; }
+.ptable td.pid { color: var(--faint); font-size: 11px; }
+.pmore { display: block; width: 100%; margin-top: 4px; padding: 5px 6px; border: 0; background: none; color: var(--accent); font-size: 11.5px; text-align: left; cursor: pointer; border-radius: 6px; }
+.pmore:hover { background: var(--panel); }
 .d-icon.machine { background: linear-gradient(135deg, #64748b, #334155); }
 .legend { margin-left: auto; color: var(--muted); font-size: 11.5px; display: inline-flex; align-items: center; gap: 5px; }
 .legend .sw { width: 10px; height: 3px; border-radius: 2px; display: inline-block; margin-left: 6px; }

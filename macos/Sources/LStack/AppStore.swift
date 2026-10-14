@@ -122,6 +122,7 @@ final class AppStore {
                 m.services = machines[i].services
                 m.processes = machines[i].processes
                 m.configErrors = machines[i].configErrors
+                if m.system == nil { m.system = machines[i].system }
                 machines[i] = m
             } else {
                 machines.append(m)
@@ -160,6 +161,14 @@ final class AppStore {
         case "processes":
             guard let e = try? dec.decode(ProcessesEvent.self, from: data) else { return }
             machines[i].processes = e.processes
+        case "system":
+            guard let x = try? dec.decode(SystemSample.self, from: data) else { return }
+            var sys = machines[i].system ?? MachineSystem()
+            var list = sys.samples ?? []
+            list.append(x)
+            if list.count > 300 { list.removeFirst(list.count - 300) }
+            sys.samples = list
+            machines[i].system = sys
         default:
             break
         }

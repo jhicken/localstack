@@ -17,6 +17,7 @@
     processes: [],
     thresholds: null,
     system: null, // this machine's {cores, memTotal, samples}
+    collapsed: new Set(JSON.parse(localStorage.getItem("lstack.collapsed") || "[]")), // "m:<machine>" groups, "p:<machine>" process tables
     range: "15m",
     logs: [],
     filter: "",
@@ -240,6 +241,7 @@
       if (m) { const M = S.machines.get(m); if (!M) return; M.system = sys; } else S.system = sys;
     }
     sys.samples = [...(sys.samples || []).slice(-(SYS_HISTORY - 1)), sample];
+    renderList();
     if (selMach() === m) renderMachineLive();
   }
 
@@ -428,16 +430,44 @@
     return errs + (list.map(svcRow).join("") || empty);
   }
 
+  const SIDEBAR_PROCS = 6;
+
+  function procTable(procs, max) {
+    const shown = max ? procs.slice(0, max) : procs;
+    const rows = shown.map((p) => `<tr>
+        <td class="pn" title="${esc(p.name)}">${esc(p.name)}</td><td class="pid">${esc(p.pid)}</td>
+        <td>${pct(p.cpu)}</td><td>${bytes(p.mem)}</td><td>${p.net ? rate(p.net) : ""}</td></tr>`).join("");
+    return `<table class="ptable"><thead><tr><th>Process</th><th>PID</th><th>CPU</th><th>MEM</th><th>NET</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function procNote(t) {
+    return t ? (t.enabled ? `over CPU ${+t.cpu}% · mem ${+t.mem}% · net ${rate(t.net)}` : "process breakdown is off") : "";
+  }
+
+  // Full list (machine overview).
   function procPanel(procs, t) {
     procs = procs || [];
-    const note = t ? (t.enabled ? `over CPU ${+t.cpu}% · mem ${+t.mem}% · net ${rate(t.net)}` : "process breakdown is off") : "";
-    const rows = procs.map((p) => `<tr>
-        <td class="pn" title="${esc(p.name)}">${esc(p.name)}</td><td>${esc(p.pid)}</td>
-        <td>${pct(p.cpu)}</td><td>${bytes(p.mem)}</td><td>${p.net != null ? rate(p.net) : "—"}</td></tr>`).join("");
-    const body = rows
-      ? `<table class="ptable"><thead><tr><th>Name</th><th>PID</th><th>CPU</th><th>MEM</th><th>NET</th></tr></thead><tbody>${rows}</tbody></table>`
-      : t && !t.enabled ? "" : '<div class="pnote">nothing busy</div>';
+    const note = procNote(t);
+    const body = procs.length ? procTable(procs) : t && !t.enabled ? "" : '<div class="pnote">nothing busy</div>';
     return `<div class="procs"><div class="list-head"><span>Other processes</span><span>${procs.length || ""}</span></div>${body}${note ? `<div class="pnote">${esc(note)}</div>` : ""}</div>`;
+  }
+
+  const chev = (open) => `<span class="chev ${open ? "open" : ""}">›</span>`;
+
+  // Under each machine's services: its load (like a service row) and a collapsible table of busy processes.
+  function machSection(m, procs, t) {
+    procs = procs || [];
+    const open = !S.collapsed.has(`p:${m}`);
+    const more = procs.length - SIDEBAR_PROCS;
+    let body = "";
+    if (open) {
+      body = procs.length ? procTable(procs, SIDEBAR_PROCS) : `<div class="pnote">${t && !t.enabled ? "process breakdown is off" : "nothing busy"}</div>`;
+      if (more > 0) body += `<button class="pmore" data-key="${esc(machKey(m))}">+${more} more · open overview</button>`;
+    }
+    return `<div class="msec">
+        <div class="sec-h" data-toggle="p:${esc(m)}" title="${esc(procNote(t))}">${chev(open)}<span>Machine</span><span class="sec-n">${procs.length ? `${procs.length} busy` : ""}</span></div>
+        ${machRow(m)}${body}
+      </div>`;
   }
 
   function machHead(i, count) {
@@ -446,19 +476,24 @@
     const sub = i.local ? "this machine" : st !== "online" ? st : "";
     const ro = !i.local && !i.allowControl ? '<span class="badge ro" title="Control is disabled on that machine">read-only</span>' : "";
     const err = !i.local && st !== "online" && i.error ? `<div class="m-err">${esc(i.error)}</div>` : "";
-    return `<div class="mach" title="${esc(tip)}"><span class="mdot ${esc(st)}"></span><b>${esc(i.name)}</b>${sub ? `<span class="m-sub">${esc(sub)}</span>` : ""}${ro}<span class="m-n">${count}</span></div>${err}`;
+    const open = !S.collapsed.has(`m:${i.local ? "" : i.name}`);
+    return `<div class="mach" data-toggle="m:${esc(i.local ? "" : i.name)}" title="${esc(tip)}">${chev(open)}<span class="mdot ${esc(st)}"></span><b>${esc(i.name)}</b>${sub ? `<span class="m-sub">${esc(sub)}</span>` : ""}${ro}<span class="m-n">${count}</span></div>${err}`;
   }
 
-  // Clickable whole-machine row: CPU and memory now, with sparklines of the last minutes.
+  // Whole-machine load, laid out like a service row: CPU and memory now, sparklines of the last minutes.
   function machRow(m) {
     const sys = sysOf(m);
     const smp = (sys?.samples || []).slice(-HISTORY);
     const last = smp[smp.length - 1];
     const memPct = last && sys.memTotal ? (last.mem / sys.memTotal) * 100 : null;
     const k = machKey(m);
-    return `<div class="msum ${k === S.selected ? "sel" : ""}" data-key="${esc(k)}" title="Whole-machine load">
-        <span class="mk">CPU</span><b>${last ? pct(last.cpu) : "—"}</b>${sparkline(smp.map((x) => x.cpu), 54, 16, "#34d399")}
-        <span class="mk">MEM</span><b>${memPct != null ? pct(memPct) : last ? bytes(last.mem) : "—"}</b>${sparkline(smp.map((x) => x.mem), 54, 16, "#60a5fa")}
+    const meta = [sys?.cores && `${sys.cores} cores`, sys?.memTotal && `${bytes(sys.memTotal)} RAM`].filter(Boolean).join(" · ");
+    return `<div class="svc mrow ${k === S.selected ? "sel" : ""}" data-key="${esc(k)}" title="Whole machine — click for charts">
+        <span class="micon">${ICONS.machine}</span>
+        <span class="name">Load</span>
+        <span class="nums">CPU <b>${last ? pct(last.cpu) : "—"}</b> · MEM <b>${memPct != null ? pct(memPct) : "—"}</b></span>
+        <span class="meta">${esc(meta || "waiting for samples…")}</span>
+        <span class="sparks">${sparkline(smp.map((x) => x.cpu), 52, 18, "#34d399")}${sparkline(smp.map((x) => x.mem), 52, 18, "#60a5fa")}</span>
       </div>`;
   }
 
@@ -476,19 +511,27 @@
     if (el.querySelector(":active")) return;
     const peers = sortedPeers();
     const total = all.length + peers.reduce((a, M) => a + M.services.size, 0);
-    const localBody = machRow("") + svcSection(all, S.configErrors, '<div class="empty">No services defined yet.<br>Add one with <code>lstack add</code>.</div>') + procPanel(S.processes, S.thresholds);
+    const localBody = svcSection(all, S.configErrors, '<div class="empty">No services defined yet.<br>Add one with <code>lstack add</code>.</div>') + machSection("", S.processes, S.thresholds);
+    const group = (m, head, body, stale) => `<div class="machine ${stale ? "stale" : ""}">${head}${S.collapsed.has(`m:${m}`) ? "" : body}</div>`;
     let html = `<div class="list-head"><span>Services</span><span>${total}</span></div>`;
     if (!peers.length) html += localBody;
     else {
-      html += `<div class="machine">${machHead({ name: S.local || S.session?.hostname || "this machine", local: true, status: "online", hostname: S.session?.hostname, version: S.session?.version }, all.length)}${localBody}</div>`;
+      html += group("", machHead({ name: S.local || S.session?.hostname || "this machine", local: true, status: "online", hostname: S.session?.hostname, version: S.session?.version }, all.length), localBody);
       for (const M of peers) {
-        html += `<div class="machine ${M.info.status === "online" ? "" : "stale"}">${machHead(M.info, M.services.size)}${machRow(M.info.name)}${svcSection(sortedSvcs(M.services), M.configErrors, '<div class="empty sm">No services.</div>')}${procPanel(M.processes)}</div>`;
+        const n = M.info.name;
+        html += group(n, machHead(M.info, M.services.size), svcSection(sortedSvcs(M.services), M.configErrors, '<div class="empty sm">No services.</div>') + machSection(n, M.processes), M.info.status !== "online");
       }
     }
     el.innerHTML = html;
-    el.querySelectorAll(".svc, .msum").forEach((row) => row.addEventListener("click", (e) => {
+    el.querySelectorAll(".svc, .pmore").forEach((row) => row.addEventListener("click", (e) => {
       if (e.target.closest("a")) return;
       select(row.dataset.key);
+    }));
+    el.querySelectorAll("[data-toggle]").forEach((t) => t.addEventListener("click", () => {
+      const k = t.dataset.toggle;
+      if (!S.collapsed.delete(k)) S.collapsed.add(k);
+      localStorage.setItem("lstack.collapsed", JSON.stringify([...S.collapsed]));
+      renderList();
     }));
   }
 
