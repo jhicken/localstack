@@ -418,9 +418,16 @@ impl Tailnet {
         self.st.lock().unwrap().phase
     }
 
-    /// The tailnet this Mac's helper is signed in to.
+    /// The tailnet this Mac's helper is signed in to (its display name, e.g. "jeff@github").
     pub fn tailnet_name(&self) -> Option<String> {
         self.st.lock().unwrap().helper["tailnet"].as_str().filter(|t| !t.is_empty()).map(str::to_string)
+    }
+
+    /// The tailnet as connections through the helper identify it: this Mac's MagicDNS domain
+    /// ("lstack-studio.tail1234.ts.net" → "tail1234.ts.net"), the same as the helper's per-connection header.
+    pub fn tailnet_id(&self) -> Option<String> {
+        let st = self.st.lock().unwrap();
+        st.helper["self"]["dnsName"].as_str().and_then(tailnet_of)
     }
 
     pub fn status(&self, cfg: &TailnetConfig) -> Value {
@@ -726,9 +733,20 @@ pub async fn api_check_update(remote: &Arc<Remote>) -> Result<Value, ApiErr> {
     Ok(st)
 }
 
+/// The tailnet part of a MagicDNS name, as the helper computes it.
+fn tailnet_of(dns_name: &str) -> Option<String> {
+    dns_name.trim_end_matches('.').split_once('.').map(|(_, d)| d.to_string()).filter(|d| !d.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tailnet_of_dns_name() {
+        assert_eq!(tailnet_of("lstack-studio.tail1234.ts.net.").as_deref(), Some("tail1234.ts.net"));
+        assert_eq!(tailnet_of("studio"), None);
+    }
     use ed25519_dalek::{Signer, SigningKey};
 
     fn hex(b: &[u8]) -> String {

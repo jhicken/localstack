@@ -395,7 +395,8 @@
   const LOCAL_ONLY_TIP = "bound to localhost on that machine – not reachable from here";
 
   function urlChips(s, max) {
-    const urls = s.urls || [];
+    // LAN addresses of a Mac reached over Tailscale can't be opened from here.
+    const urls = (s.urls || []).filter((u) => u.blocked !== "lan");
     const shown = max ? urls.slice(0, max) : urls;
     const more = urls.length - shown.length;
     return shown.map((u) => {

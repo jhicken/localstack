@@ -212,6 +212,12 @@ impl Forwards {
         self.inner.lock().unwrap().active.get(&(machine.to_string(), service.to_string(), port)).map(|f| f.local)
     }
 
+    /// Whether `machine`'s `service:port` would be forwarded but is paused.
+    pub fn paused(&self, machine: &str, service: &str, port: u16) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.saved.paused.contains(&format!("{machine}/{service}")) && g.wanted.get(machine).is_some_and(|w| w.iter().any(|(s, p)| s == service && *p == port))
+    }
+
     pub fn remove_machine(&self, machine: &str) {
         let mut g = self.inner.lock().unwrap();
         g.links.remove(machine);

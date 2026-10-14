@@ -675,7 +675,7 @@ impl Remote {
         let changed = p.transport != t;
         p.transport = t;
         // Over Tailscale it must come from this Mac's own tailnet (the helpers only see each other there).
-        p.tailnet_id = (t == Transport::Tailscale).then(|| TailnetId { tailnet: self.tailnet.tailnet_name().unwrap_or_default(), ..Default::default() });
+        p.tailnet_id = (t == Transport::Tailscale).then(|| TailnetId { tailnet: self.tailnet.tailnet_id().unwrap_or_default(), ..Default::default() });
         self.save(cfg)?;
         self.transport_requests.lock().unwrap().retain(|r| r.peer_id != pid);
         if changed {

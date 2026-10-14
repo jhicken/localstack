@@ -538,8 +538,9 @@ struct MachinesSettings: View {
     private func phaseText(_ t: TailnetStatus) -> (String, Color) {
         switch t.phase {
         case "running":
-            let who = [t.user, t.tailnet].compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " · ")
-            return ("Connected\(who.isEmpty ? "" : " — \(who)")", .green)
+            var who: [String] = []
+            for v in [t.user, t.tailnet] { if let v, !v.isEmpty, !who.contains(v) { who.append(v) } }
+            return ("Connected\(who.isEmpty ? "" : " — \(who.joined(separator: " · "))")", .green)
         case "needs-login": return ("Sign in to Tailscale to use it", .orange)
         case "installing": return ("Downloading the Tailscale helper…", .secondary)
         case "starting": return ("Starting…", .secondary)

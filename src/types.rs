@@ -218,6 +218,10 @@ pub struct ServiceUrl {
     /// Reached through the encrypted link to this machine (a local forward); the URL is on this Mac.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub via: Option<String>,
+    /// Why it can't be opened from here as is: "paused" (its local forward is paused; resume it) or
+    /// "lan" (the other Mac's LAN address, but that Mac is reached over Tailscale).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub blocked: Option<String>,
 }
 
 /// Outcome of the latest healthchecks.io ping.

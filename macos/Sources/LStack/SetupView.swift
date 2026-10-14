@@ -20,6 +20,7 @@ struct SetupView: View {
     @State private var tab: SettingsTab = .general
     @State private var cmuxBusy = false
     @State private var cmuxError: String?
+    @State private var contentHeight: CGFloat = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -31,6 +32,39 @@ struct SetupView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
             }
+            // The window fits its content; past the screen's height the middle scrolls instead.
+            ScrollView(.vertical) {
+                content
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(contentHeight, maxContentHeight))
+            footer
+        }
+        .padding(24)
+        .frame(width: 520)
+        .onAppear {
+            // Snapshot/dev helper: LSTACK_SNAPSHOT_TAB=secrets|machines|monitoring|general.
+            if let t = ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_TAB"], let tab = SettingsTab.allCases.first(where: { $0.title.lowercased() == t }) {
+                onboarding = false
+                self.tab = tab
+            }
+        }
+        .task {
+            await store.refreshSetup()
+            await store.refreshRemote()
+            await store.refreshSettings()
+            syncRemoteFields()
+        }
+    }
+
+    /// Room for the scrolling part: the screen less the title bar, header, tabs, footer and padding.
+    private var maxContentHeight: CGFloat {
+        max(300, (NSScreen.main?.visibleFrame.height ?? 900) - 240)
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 18) {
             if tab == .general || onboarding || !store.connected {
                 if Helper.isBundled && !Helper.inApplications { moveCard }
                 VStack(spacing: 0) {
@@ -60,22 +94,6 @@ struct SetupView: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            footer
-        }
-        .padding(24)
-        .frame(width: 520)
-        .onAppear {
-            // Snapshot/dev helper: LSTACK_SNAPSHOT_TAB=secrets|machines|monitoring|general.
-            if let t = ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_TAB"], let tab = SettingsTab.allCases.first(where: { $0.title.lowercased() == t }) {
-                onboarding = false
-                self.tab = tab
-            }
-        }
-        .task {
-            await store.refreshSetup()
-            await store.refreshRemote()
-            await store.refreshSettings()
-            syncRemoteFields()
         }
     }
 

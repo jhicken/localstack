@@ -48,7 +48,8 @@ def status():
         "state": "Running" if up else "NeedsLogin",
         "authURL": "" if up else "https://login.tailscale.com/a/fake",
         "self": {"dnsName": f"{HOST}.{SUFFIX}", "ips": [ip_of(HOST)]} if up else None,
-        "tailnet": SUFFIX if up else "",
+        # Like the real helper: status shows the tailnet's display name; connection headers carry its DNS domain.
+        "tailnet": USER if up else "",
         "user": USER if up else "",
         "version": VERSION,
         "tsnet": "fake",

@@ -228,6 +228,16 @@ pub fn normalize_addr(u: &str) -> Result<String, String> {
     Ok(if has_port { rest.to_string() } else { format!("{rest}:{}", link::DEFAULT_PORT) })
 }
 
+/// The host part of a URL ("http://studio.lan:3000/x" → "studio.lan").
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let auth = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if auth.starts_with('[') {
+        return auth.find(']').map_or(auth, |i| &auth[..=i]);
+    }
+    auth.split(':').next().unwrap_or(auth)
+}
+
 fn host_of(addr: &str) -> String {
     let rest = addr.split_once("://").map(|x| x.1).unwrap_or(addr);
     let hp = rest.split('/').next().unwrap_or(rest);
@@ -591,9 +601,11 @@ impl Peers {
         want
     }
 
-    /// Point URLs at local forwards where there is one, else at the machine's address.
-    fn place_urls(&self, name: &str, host: &str, s: &mut ServiceState) {
+    /// Point URLs at local forwards where there is one, else at the machine's address. Over Tailscale
+    /// (`tailnet`) that address is a LAN one, so such URLs are flagged rather than offered.
+    fn place_urls(&self, name: &str, host: &str, tailnet: bool, s: &mut ServiceState) {
         for u in &mut s.urls {
+            u.blocked = None;
             let local = u.port.filter(|_| u.listening).and_then(|port| self.forwards.local_port(name, &s.name, port));
             match (local, u.port) {
                 (Some(l), _) => {
@@ -607,6 +619,13 @@ impl Peers {
                     u.via = None;
                 }
                 _ => {}
+            }
+            if u.via.is_none() {
+                if u.port.is_some_and(|port| u.listening && self.forwards.paused(name, &s.name, port)) {
+                    u.blocked = Some("paused".into());
+                } else if tailnet && url_host(&u.url) == host {
+                    u.blocked = Some("lan".into());
+                }
             }
         }
     }
@@ -678,9 +697,10 @@ impl Peers {
         let (msgs, online) = {
             let mut g = self.inner.lock().unwrap();
             let Some(p) = g.get_mut(name) else { return };
+            let tailnet = p.cfg.transport == Transport::Tailscale;
             let mut services = std::mem::take(&mut p.services);
             for s in services.values_mut() {
-                self.place_urls(name, host, s);
+                self.place_urls(name, host, tailnet, s);
             }
             p.services = services;
             let snapshot = || json!({ "services": p.services.values().collect::<Vec<_>>(), "configErrors": p.config_errors });
@@ -879,9 +899,10 @@ impl Peers {
         let snap = {
             let mut g = self.inner.lock().unwrap();
             let Some(p) = g.get_mut(machine) else { return Ok(()) };
+            let tailnet = p.cfg.transport == Transport::Tailscale;
             let mut services = std::mem::take(&mut p.services);
             for s in services.values_mut() {
-                self.place_urls(machine, &host, s);
+                self.place_urls(machine, &host, tailnet, s);
             }
             p.services = services;
             json!({ "services": p.services.values().collect::<Vec<_>>(), "configErrors": p.config_errors })
@@ -1118,7 +1139,8 @@ impl Peers {
             if let Ok(mut s) = serde_json::from_value::<ServiceState>(v.clone()) {
                 s.machine = Some(name.to_string());
                 rewrite_urls(&mut s, &host);
-                self.place_urls(name, &host, &mut s);
+                let tailnet = self.cfg(name).is_some_and(|c| c.transport == Transport::Tailscale);
+                self.place_urls(name, &host, tailnet, &mut s);
                 v = json!(s);
             }
         }
@@ -1256,6 +1278,9 @@ mod tests {
         assert_eq!(host_of("studio.local:7381"), "studio.local");
         assert_eq!(host_of("http://studio.local:7380"), "studio.local");
         assert_eq!(host_of("[fd00::1]:7381"), "[fd00::1]");
+        assert_eq!(url_host("http://studio.lan:3000/x?y"), "studio.lan");
+        assert_eq!(url_host("https://[fd00::1]:8443/"), "[fd00::1]");
+        assert_eq!(url_host("http://studio.lan"), "studio.lan");
         let mut s = ServiceState { urls: vec![crate::types::ServiceUrl { url: "http://localhost:3000/x".into(), source: "detected".into(), ..Default::default() }], ..Default::default() };
         rewrite_urls(&mut s, "studio.local");
         assert_eq!(s.urls[0].url, "http://studio.local:3000/x");

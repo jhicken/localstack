@@ -383,9 +383,24 @@ final class AppStore {
         }
     }
 
-    /// Open a service URL in the default browser.
-    func open(_ u: ServiceURL) {
-        if let url = URL(string: u.url) { NSWorkspace.shared.open(url) }
+    /// Open a service URL in the default browser. A paused forward is resumed first and its local URL opened.
+    func open(_ u: ServiceURL, in s: ServiceState? = nil) {
+        guard u.blocked == "paused", let s, let machine = s.machine else {
+            if let url = URL(string: u.url) { NSWorkspace.shared.open(url) }
+            return
+        }
+        Task {
+            guard let client else { return }
+            do {
+                let list = try await client.send("POST", "/api/forwards/resume", body: ["machine": machine, "service": s.name], as: [ForwardInfo].self)
+                let f = list.first { $0.machine == machine && $0.service == s.name && $0.port == u.port }
+                if let str = f?.url, let url = URL(string: str) {
+                    NSWorkspace.shared.open(url)
+                } else {
+                    flash(f?.error ?? "Resumed forwarding \(s.name), but it isn't listening on this Mac yet")
+                }
+            } catch { flash(error.localizedDescription) }
+        }
     }
 
     func setAutostart(_ name: String, _ on: Bool) {

@@ -120,6 +120,8 @@ struct ServiceURL: Codable, Hashable {
     let localOnly: Bool?
     /// Forwarded from this paired Mac over the encrypted link: the URL is on this Mac.
     var via: String? = nil
+    /// "paused": its forward is paused (opening resumes it). "lan": a LAN address of a Mac reached over Tailscale.
+    var blocked: String? = nil
 
     var display: String {
         if let label, !label.isEmpty { return label }
@@ -442,7 +444,8 @@ struct ServiceState: Codable, Identifiable, Hashable {
     let machine: String?
     let config: ServiceConfig
 
-    var links: [ServiceURL] { urls ?? [] }
+    /// Addresses that can be opened from here (LAN ones are hidden while that Mac is on Tailscale).
+    var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "lan" } }
     var isRemote: Bool { machine != nil }
 
     var isRunning: Bool { status == "running" }

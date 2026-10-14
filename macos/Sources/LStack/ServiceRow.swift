@@ -91,7 +91,7 @@ struct ServiceRow: View {
                 }
             } else if service.isRunning {
                 if let u = service.links.first {
-                    IconButton(icon: "globe", help: "Open \(u.url)") { store.open(u) }
+                    IconButton(icon: "globe", help: u.blocked == "paused" ? "Resume forwarding and open" : "Open \(u.url)") { store.open(u, in: service) }
                 }
                 VStack(alignment: .trailing, spacing: 1) {
                     Text(Fmt.pct(service.metrics?.cpu)).font(.system(size: 11, weight: .medium)).monospacedDigit()
@@ -132,7 +132,7 @@ struct ServiceRow: View {
     private var controls: some View {
         HStack(spacing: 0) {
             if let u = service.links.first {
-                IconButton(icon: "globe", help: "Open \(u.url)") { store.open(u) }
+                IconButton(icon: "globe", help: u.blocked == "paused" ? "Resume forwarding and open" : "Open \(u.url)") { store.open(u, in: service) }
             }
             controlButtons.disabled(!canControl)
             IconButton(icon: "text.alignleft", help: "Logs") {
@@ -208,7 +208,7 @@ struct ServiceRow: View {
     }
 
     private var links: some View {
-        FlowLinks(urls: service.links, open: store.open)
+        FlowLinks(urls: service.links) { store.open($0, in: service) }
     }
 
     private func heartbeatLine(_ hb: HeartbeatStatus) -> some View {
@@ -302,7 +302,7 @@ struct FlowLinks: View {
             HStack(spacing: 3) {
                 Image(systemName: icon(u))
                     .font(.system(size: 9))
-                    .foregroundStyle(warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
+                    .foregroundStyle(paused(u) ? Color.secondary : warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
                 Text(u.display).font(.system(size: 10, weight: .medium)).lineLimit(1)
             }
             .padding(.horizontal, 6).padding(.vertical, 2)
@@ -313,13 +313,16 @@ struct FlowLinks: View {
     }
 
     private func warn(_ u: ServiceURL) -> Bool { u.via == nil && u.localOnly == true }
+    private func paused(_ u: ServiceURL) -> Bool { u.blocked == "paused" }
 
     private func icon(_ u: ServiceURL) -> String {
+        if paused(u) { return "pause.circle.fill" }
         if u.via != nil { return "lock.fill" }
         return u.localOnly == true ? "exclamationmark.triangle.fill" : "link"
     }
 
     private func help(_ u: ServiceURL) -> String {
+        if paused(u) { return "Forwarding is paused — click to resume it and open \(u.port.map { "port \($0)" } ?? "it") on this Mac" }
         if let m = u.via { return "\(u.url) — forwarded from \(m) over the encrypted link" }
         return u.localOnly == true ? "\(u.url) — bound to localhost on that Mac, so it may not be reachable from here" : u.url
     }

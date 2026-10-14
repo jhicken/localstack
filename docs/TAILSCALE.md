@@ -76,6 +76,11 @@ local`) moves it back to the LAN. The link is closed with a reason, and the watc
 (`lstack remote auto-approve on|off`). With it off, requests wait under Share this Mac (or `lstack remote requests`)
 until you choose Allow or Deny. The "prepare" request (turning Tailscale on there) also needs auto-approve.
 
+**Service links.** Services are reached through forwards on `localhost`, which work the same over Tailscale. While
+a machine is on Tailscale, links to its LAN address (e.g. `http://studio.lan:3000`, for a service that isn't
+forwarded) are hidden, since that name may not resolve away from home. A link whose forward is paused shows a pause
+icon; clicking it resumes the forward and opens the local URL.
+
 ## What the shared Mac accepts
 
 The shared Mac checks every link it accepts against that peer's transport:
