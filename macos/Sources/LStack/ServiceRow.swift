@@ -22,10 +22,12 @@ struct ServiceRow: View {
                     if !expanded { Task { await store.loadHistory(service) } }
                 }
             if expanded {
+                // Fade in place: sliding from the top drew the detail over the rows above it while opening.
                 detail
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(.opacity)
             }
         }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(expanded ? Color.primary.opacity(0.06) : hover ? Color.primary.opacity(0.04) : .clear)

@@ -83,6 +83,10 @@ struct PopoverView: View {
         .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+        // The window catches up to a new content height a frame late (see MenuWindowSizer). Pin the
+        // content to the top so that frame only shows spare space at the bottom instead of the whole
+        // menu (header included) jumping down and back.
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(MenuWindowSizer(height: contentHeight))
         .background(LiveWindowReporter(store: store))
         .animation(.snappy(duration: 0.25), value: store.toast)
