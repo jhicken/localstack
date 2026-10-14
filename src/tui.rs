@@ -109,7 +109,7 @@ fn ago(ms: i64) -> String {
 fn machine_color(status: &str) -> Color {
     match status {
         "online" => Color::Green,
-        "connecting" => Color::Yellow,
+        "connecting" | "repair" => Color::Yellow,
         _ => Color::Red,
     }
 }
@@ -474,7 +474,7 @@ impl Ui {
         let name = skey(s);
         if let Some(m) = s.machine.as_deref().and_then(|m| self.machine(m)) {
             if !m.allow_control {
-                let msg = format!("{} is read-only — turn on control there to {action} its services", m.name);
+                let msg = format!("{} lets this Mac view only — allow control there (Share this Mac, or `lstack remote grant <this-mac> control`) to {action} its services", m.name);
                 self.flash(msg, true);
                 return;
             }
@@ -501,7 +501,7 @@ impl Ui {
     fn open_url(&mut self) {
         let Some(s) = self.current() else { return };
         let remote = s.machine.is_some();
-        let url = s.urls.iter().find(|u| !(remote && u.local_only)).map(|u| u.url.clone());
+        let url = s.urls.iter().find(|u| u.via.is_some() || !(remote && u.local_only)).map(|u| u.url.clone());
         let msg = match (url, s.urls.is_empty()) {
             (Some(u), _) => match std::process::Command::new("/usr/bin/open")
                 .arg(&u)
@@ -784,7 +784,9 @@ fn draw_list(fr: &mut Frame, ui: &Ui, area: Rect) {
                     Span::styled(format!("● {}", info.status), Style::new().fg(machine_color(&info.status))),
                 ];
                 if !info.allow_control && info.status == "online" {
-                    v.push(dim(" read-only"));
+                    v.push(dim(" 🔒 view only"));
+                } else if info.status == "online" {
+                    v.push(dim(" 🔒"));
                 }
                 lines.push(Line::from(v));
                 if info.status != "online" {
@@ -910,7 +912,9 @@ fn details(s: &ServiceState, hist: &[MetricSample], w: usize) -> Vec<Line<'stati
         if let Some(l) = &u.label {
             v.push(dim(format!("  {l}")));
         }
-        if u.local_only {
+        if let Some(m) = &u.via {
+            v.push(dim(format!("  🔒 via {m}")));
+        } else if u.local_only {
             v.push(dim(if s.machine.is_some() { "  (not reachable from here)" } else { "  (localhost only)" }));
         }
         out.push(Line::from(v));

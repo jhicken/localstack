@@ -111,8 +111,21 @@ pub fn router(st: AppState) -> Router {
         .route("/api/remote/totp", post(|State(st): State<AppState>| async move { to_json(st.remote.totp_begin()) }).delete(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(st.remote.totp_disable()?)) }))
         .route("/api/remote/totp/confirm", post(totp_confirm))
         .route("/api/remote/pair-code", post(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(st.remote.new_pair_code()?)) }))
-        .route("/api/remote/peers", get(|State(st): State<AppState>| async move { Json(st.remote.peer_tokens()) }))
-        .route("/api/remote/peers/:id", axum::routing::delete(|State(st): State<AppState>, Path(id): Path<String>| async move { st.remote.revoke_peer(&id)?; ok() }))
+        .route("/api/remote/peers", get(|State(st): State<AppState>| async move { Json(st.remote.shared_peers()) }))
+        .route(
+            "/api/remote/peers/:id",
+            axum::routing::patch(|State(st): State<AppState>, Path(id): Path<String>, body: Bytes| async move { Ok::<_, ApiErr>(Json(st.remote.set_grants(&id, &parse_body(&body)?)?)) })
+                .delete(|State(st): State<AppState>, Path(id): Path<String>| async move {
+                    st.remote.revoke_peer(&id)?;
+                    ok()
+                }),
+        )
+        .route("/api/remote/activity", get(|State(st): State<AppState>| async move { Json(st.remote.activity()) }))
+        .route("/api/identity", get(identity))
+        .route("/api/identity/rekey", post(identity_rekey))
+        .route("/api/forwards", get(|State(st): State<AppState>| async move { Json(st.peers.forwards.list()) }))
+        .route("/api/forwards/pause", post(|st: State<AppState>, body: Bytes| async move { forwards_pause(st, body, true) }))
+        .route("/api/forwards/resume", post(|st: State<AppState>, body: Bytes| async move { forwards_pause(st, body, false) }))
         .route("/api/settings", get(|| async { to_json(super::terminal::status()) }).put(settings_update))
         .route("/api/split-command", post(split_command))
         .route("/api/secrets", get(secrets_list))
@@ -522,22 +535,45 @@ pub(super) async fn machine_get(State(st): State<AppState>, Path(m): Path<String
 
 async fn machine_add(State(st): State<AppState>, body: Bytes) -> Res {
     let v = parse_body(&body)?;
-    let url = v["url"].as_str().unwrap_or("").to_string();
+    let addr = v["address"].as_str().or(v["url"].as_str()).unwrap_or("").to_string();
     let name = v["name"].as_str().filter(|s| !s.is_empty()).map(String::from);
-    let mut auth = json!({});
-    if let Some(c) = v["code"].as_str().filter(|s| !s.trim().is_empty()) {
-        auth["code"] = json!(c.trim().to_uppercase());
-    } else if v["password"].is_string() {
-        for k in ["username", "password", "totp"] {
-            if !v[k].is_null() {
-                auth[k] = v[k].clone();
-            }
-        }
-    } else {
-        return Err(ApiErr(400, "give a pairing code (from `lstack remote pair` on that machine) or its dashboard username/password".into()));
+    let code = v["code"].as_str().unwrap_or("").trim().to_string();
+    if code.is_empty() || !v["password"].is_string() {
+        return Err(ApiErr(400, "pairing needs the other Mac's one-time code (Share this Mac → Show pairing code) and its dashboard username and password (+ 2FA code if set)".into()));
     }
-    let peers = st.peers.clone();
-    Ok(Json(blocking(move || peers.pair(&url, auth, name.as_deref())).await?))
+    let mut login = json!({});
+    for k in ["username", "password", "totp"] {
+        if !v[k].is_null() {
+            login[k] = v[k].clone();
+        }
+    }
+    Ok(Json(st.peers.pair(&addr, &code, login, name.as_deref()).await?))
+}
+
+async fn identity() -> Res {
+    let id = blocking(|| super::link::identity().map_err(|e| ApiErr(500, e))).await?;
+    Ok(Json(json!({
+        "name": super::peers::local_name(),
+        "fingerprint": super::link::fingerprint(&id.public),
+        "publicKey": super::link::key_hex(&id.public),
+    })))
+}
+
+/// New install key: every pairing (both directions) must be made again.
+async fn identity_rekey(State(st): State<AppState>) -> Res {
+    let id = blocking(|| super::link::rekey().map_err(|e| ApiErr(500, e))).await?;
+    st.remote.forget_peers();
+    st.peers.reconnect_all();
+    Ok(Json(json!({ "name": super::peers::local_name(), "fingerprint": super::link::fingerprint(&id.public), "publicKey": super::link::key_hex(&id.public) })))
+}
+
+fn forwards_pause(State(st): State<AppState>, body: Bytes, paused: bool) -> Res {
+    let v = parse_body(&body)?;
+    let (Some(m), Some(svc)) = (v["machine"].as_str(), v["service"].as_str()) else {
+        return Err(ApiErr(400, "machine and service required".into()));
+    };
+    st.peers.set_forward_paused(m, svc, paused)?;
+    Ok(Json(st.peers.forwards.list()))
 }
 
 async fn machine_patch(State(st): State<AppState>, Path(m): Path<String>, body: Bytes) -> Res {

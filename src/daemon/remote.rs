@@ -1,10 +1,9 @@
-//! Optional second HTTP listener (default port 7380) with two independent features:
-//! - the **web dashboard** (`enabled`): a small web UI behind a username/password login. Available on this
-//!   Mac only, or to other devices too when `webRemote` is set;
-//! - **sharing** (`sharing`): `/peer/*`, which paired Macs use to show this machine's services.
-//!
-//! The listener binds to the network only when one of them is remote; otherwise to 127.0.0.1.
-//! Start/stop/restart are only exposed when `allowControl` is set.
+//! Two independent features:
+//! - the **web dashboard** (`enabled`, default port 7380): a small web UI behind a username/password login.
+//!   Available on this Mac only, or to other devices too when `webRemote` is set. Start/stop/restart from
+//!   the dashboard need `allowControl`.
+//! - **sharing** (`sharing`, link port 7381): paired Macs connect over the encrypted link (see `link.rs`,
+//!   `share.rs`). Each paired Mac has its own grants (control, tunnels).
 use super::server::{self, ApiErr, AppState};
 use super::totp;
 use crate::paths::{self, now_ms, VERSION};
@@ -27,6 +26,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use zeroize::Zeroizing;
 
 pub const DEFAULT_PORT: u16 = 7380;
 const SESSION_TTL_MS: i64 = 12 * 3_600_000;
@@ -56,28 +56,56 @@ pub struct RemoteConfig {
     pub allow_control: bool,
     /// Base32 TOTP secret; empty = two-factor login off.
     pub totp_secret: String,
-    /// Machines allowed to watch this one through `/peer/api` (bearer tokens, stored hashed).
-    pub peer_tokens: Vec<PeerToken>,
+    /// Port of the encrypted machine link (sharing).
+    pub link_port: u16,
+    /// Macs paired with this one: their pinned public keys and what each may do.
+    pub peers: Vec<SharedPeer>,
 }
 
+/// A Mac allowed to connect to this one over the link.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct PeerToken {
+pub struct SharedPeer {
     pub id: String,
-    /// Name the host machine gave when pairing.
+    /// Name the other Mac gave when pairing.
     pub name: String,
-    /// sha256 of the token, hex.
-    pub hash: String,
+    /// Its install identity (X25519, hex), pinned at pairing.
+    pub public_key: String,
+    pub grants: Grants,
+    /// The confirmation words both Macs showed at pairing.
+    pub phrase: String,
     pub created_at: i64,
     pub last_seen: Option<i64>,
 }
 
-const PAIR_CODE_TTL_MS: i64 = 10 * 60_000;
-
-fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    hex(&sha2::Sha256::digest(s.as_bytes()))
+/// What one paired Mac may do here (viewing status is always allowed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Grants {
+    /// Start / stop / restart services.
+    pub control: bool,
+    /// Tunnels to every service's listening ports…
+    pub tunnel_all: bool,
+    /// …or only these services'.
+    pub tunnel: Vec<String>,
 }
+
+impl Grants {
+    pub fn new_pairing() -> Grants {
+        Grants { control: false, tunnel_all: true, tunnel: vec![] }
+    }
+    pub fn tunnel_allows(&self, service: &str) -> bool {
+        self.tunnel_all || self.tunnel.iter().any(|s| s == service)
+    }
+    pub fn json(&self) -> Value {
+        let tunnel = if self.tunnel_all { json!("all") } else if self.tunnel.is_empty() { json!("none") } else { json!(self.tunnel) };
+        json!({ "control": self.control, "tunnel": tunnel })
+    }
+}
+
+const PAIR_CODE_TTL_MS: i64 = 10 * 60_000;
+/// Wrong attempts (code, then login) before a pairing code is burned.
+const PAIR_CODE_TRIES: u32 = 3;
 
 impl Default for RemoteConfig {
     fn default() -> Self {
@@ -91,7 +119,8 @@ impl Default for RemoteConfig {
             password_hash: String::new(),
             allow_control: false,
             totp_secret: String::new(),
-            peer_tokens: vec![],
+            link_port: super::link::DEFAULT_PORT,
+            peers: vec![],
         }
     }
 }
@@ -118,23 +147,24 @@ impl RemoteConfig {
     pub fn sharing(&self) -> bool {
         self.sharing.unwrap_or(false)
     }
-    /// Whether the listener runs at all.
+    /// Whether the web dashboard listener runs at all.
     pub fn listening(&self) -> bool {
-        self.enabled || self.sharing()
+        self.enabled
     }
-    /// The address to bind: the configured one when anything is remote, else loopback only.
+    /// The dashboard's bind address: the configured one when other devices may use it, else loopback only.
     pub fn bind_addr(&self) -> String {
-        if self.sharing() || (self.enabled && self.web_remote()) {
+        if self.enabled && self.web_remote() {
             self.bind.clone()
         } else {
             "127.0.0.1".into()
         }
     }
-    /// Whether a request for `path` from `ip` may be served (None) or why not (status, message).
-    pub fn admit(&self, path: &str, ip: IpAddr) -> Option<(u16, &'static str)> {
-        if path.starts_with("/peer/") {
-            return (!self.sharing()).then_some((404, "this Mac isn't sharing with other Macs"));
-        }
+    pub fn peer_by_key(&self, key: &[u8; 32]) -> Option<&SharedPeer> {
+        let hex = super::link::key_hex(key);
+        self.peers.iter().find(|p| ct_eq(p.public_key.as_bytes(), hex.as_bytes()))
+    }
+    /// Whether a dashboard request from `ip` may be served (None) or why not (status, message).
+    pub fn admit(&self, _path: &str, ip: IpAddr) -> Option<(u16, &'static str)> {
         if !self.enabled {
             return Some((404, "the web dashboard is off"));
         }
@@ -206,6 +236,15 @@ struct Running {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// A connected paired Mac.
+pub(super) struct LiveLink {
+    pub peer_id: String,
+    pub mux: Arc<super::link::Mux>,
+    pub addr: SocketAddr,
+}
+
+type TunnelKey = (String, String, u16);
+
 /// Owns the remote listener's lifecycle, its sessions and login throttling.
 pub struct Remote {
     cfg: Mutex<RemoteConfig>,
@@ -219,8 +258,16 @@ pub struct Remote {
     totp_last_step: Mutex<u64>,
     /// Bumped whenever the listener or credentials change; open streams and stale routers stop serving.
     gen: watch::Sender<u64>,
-    /// One-time pairing code shown to the user (code, expires at ms).
-    pair_code: Mutex<Option<(String, i64)>>,
+    /// One-time pairing code shown to the user (code, expires at ms, wrong attempts).
+    pair_code: Mutex<Option<(String, i64, u32)>>,
+    /// The link listener (sharing).
+    link: Mutex<Option<Running>>,
+    pub(super) links: Mutex<Vec<LiveLink>>,
+    /// Recent link / tunnel events, newest last.
+    activity: Mutex<std::collections::VecDeque<Value>>,
+    /// Tunnel use per (peer, service, port): connections, bytes, last at.
+    /// (peer, service, port) → (connections, bytes, last used).
+    tunnel_stats: Mutex<HashMap<TunnelKey, (u64, u64, i64)>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -230,6 +277,7 @@ pub struct RemotePatch {
     pub web_remote: Option<bool>,
     pub sharing: Option<bool>,
     pub port: Option<u16>,
+    pub link_port: Option<u16>,
     pub bind: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -248,80 +296,241 @@ impl Remote {
             totp_last_step: Mutex::new(0),
             gen: watch::channel(0).0,
             pair_code: Mutex::new(None),
+            link: Mutex::new(None),
+            links: Mutex::new(vec![]),
+            activity: Mutex::new(Default::default()),
+            tunnel_stats: Mutex::new(HashMap::new()),
         })
     }
 
     /// New one-time code another machine can use to pair with this one (valid 10 minutes).
     pub fn new_pair_code(&self) -> Result<Value, ApiErr> {
-        if !self.config().sharing() {
+        let cfg = self.config();
+        if !cfg.sharing() {
             return Err(ApiErr::new(400, "turn on sharing first (lstack remote share on) so other Macs can reach this one"));
         }
+        if cfg.password_hash.is_empty() {
+            return Err(ApiErr::new(400, "set a dashboard password first (lstack remote password) — pairing asks for it"));
+        }
+        super::link::identity().map_err(|e| ApiErr::new(500, e))?;
         const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         let raw = random_hex(8);
         let code: String = raw.as_bytes().chunks(2).map(|c| ALPHABET[u8::from_str_radix(std::str::from_utf8(c).unwrap_or("0"), 16).unwrap_or(0) as usize % ALPHABET.len()] as char).collect();
         let exp = now_ms() + PAIR_CODE_TTL_MS;
-        *self.pair_code.lock().unwrap() = Some((code.clone(), exp));
-        Ok(json!({ "code": format!("{}-{}", &code[..4], &code[4..]), "expiresAt": exp, "urls": self.status()["shareUrls"] }))
+        *self.pair_code.lock().unwrap() = Some((code.clone(), exp, 0));
+        Ok(json!({ "code": format!("{}-{}", &code[..4], &code[4..]), "expiresAt": exp, "urls": self.status()["shareUrls"], "totp": !cfg.totp_secret.is_empty() }))
     }
 
-    fn take_pair_code(&self, code: &str) -> bool {
-        let want: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_uppercase();
+    pub(super) fn current_pair_code(&self) -> Option<String> {
         let mut pc = self.pair_code.lock().unwrap();
         match &*pc {
-            Some((c, exp)) if *exp > now_ms() && ct_eq(c.as_bytes(), want.as_bytes()) => {
+            Some((c, exp, _)) if *exp > now_ms() => Some(c.clone()),
+            _ => {
                 *pc = None;
-                true
+                None
             }
-            _ => false,
         }
     }
 
-    fn issue_peer_token(&self, name: &str) -> Result<String, ApiErr> {
-        let token = format!("lsp_{}", random_hex(32));
-        let mut cfg = self.config();
-        cfg.peer_tokens.push(PeerToken {
-            id: random_hex(4),
-            name: name.chars().take(64).collect(),
-            hash: sha256_hex(&token),
-            created_at: now_ms(),
-            last_seen: None,
-        });
-        save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
-        *self.cfg.lock().unwrap() = cfg;
-        Ok(token)
+    /// A pairing attempt with the current code failed; burn the code after a few.
+    pub(super) fn pair_code_failed(&self) {
+        let mut pc = self.pair_code.lock().unwrap();
+        if let Some((_, _, n)) = pc.as_mut() {
+            *n += 1;
+            if *n >= PAIR_CODE_TRIES {
+                *pc = None;
+                println!("{} remote: pairing code burned after {PAIR_CODE_TRIES} failed attempts", paths::iso(now_ms()));
+            }
+        }
     }
 
-    /// Which paired machine a bearer token belongs to (updates last-seen at most once a minute).
-    fn peer_for(&self, token: &str) -> Option<String> {
-        let h = sha256_hex(token);
-        let mut cfg = self.cfg.lock().unwrap();
+    pub(super) fn pair_code_used(&self) {
+        *self.pair_code.lock().unwrap() = None;
+    }
+
+    pub(super) fn locked_out(&self, ip: IpAddr) -> bool {
         let now = now_ms();
-        let p = cfg.peer_tokens.iter_mut().find(|p| ct_eq(p.hash.as_bytes(), h.as_bytes()))?;
-        let name = p.name.clone();
-        if p.last_seen.is_none_or(|t| now - t > 60_000) {
-            p.last_seen = Some(now);
+        let mut f = self.failures.lock().unwrap();
+        f.retain(|_, (_, last)| now - *last < LOCKOUT_MS);
+        f.get(&ip).is_some_and(|(n, _)| *n >= MAX_FAILURES)
+    }
+
+    pub(super) fn failed(&self, ip: IpAddr) -> u32 {
+        let now = now_ms();
+        let mut f = self.failures.lock().unwrap();
+        let e = f.entry(ip).or_insert((0, now));
+        *e = (e.0 + 1, now);
+        e.0
+    }
+
+    pub(super) fn succeeded(&self, ip: IpAddr) {
+        self.failures.lock().unwrap().remove(&ip);
+    }
+
+    /// Check the dashboard login (+2FA) a pairing Mac sent inside the encrypted exchange.
+    pub(super) async fn check_login(&self, username: &str, password: &str, code: Option<&str>) -> bool {
+        let cfg = self.config();
+        if cfg.password_hash.is_empty() {
+            return false;
+        }
+        let user_ok = ct_eq(username.as_bytes(), cfg.username.as_bytes());
+        let stored = cfg.password_hash.clone();
+        let password = Zeroizing::new(password.to_string());
+        let pass_ok = tokio::task::spawn_blocking(move || verify_password(&password, &stored)).await.unwrap_or(false);
+        user_ok && pass_ok && (cfg.totp_secret.is_empty() || self.totp_check(&cfg.totp_secret, code))
+    }
+
+    fn save(&self, cfg: RemoteConfig) -> Result<(), ApiErr> {
+        save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
+        *self.cfg.lock().unwrap() = cfg;
+        Ok(())
+    }
+
+    /// Pin a newly paired Mac. A Mac pairing again under the same name or key replaces its old entry
+    /// (keeping its grants if the key is the same).
+    pub(super) fn add_peer(&self, name: &str, public: &[u8; 32], phrase: &str) -> Result<SharedPeer, ApiErr> {
+        let mut cfg = self.config();
+        let key = super::link::key_hex(public);
+        let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        let old: Vec<String> = cfg.peers.iter().filter(|p| p.public_key == key || p.name == name).map(|p| p.id.clone()).collect();
+        let grants = cfg.peers.iter().find(|p| p.public_key == key).map(|p| p.grants.clone()).unwrap_or_else(Grants::new_pairing);
+        cfg.peers.retain(|p| !old.contains(&p.id));
+        let peer = SharedPeer { id: random_hex(4), name, public_key: key, grants, phrase: phrase.to_string(), created_at: now_ms(), last_seen: None };
+        cfg.peers.push(peer.clone());
+        self.save(cfg)?;
+        for id in old {
+            self.drop_links(&id);
+        }
+        Ok(peer)
+    }
+
+    pub(super) fn touch_peer(&self, id: &str) {
+        let mut cfg = self.cfg.lock().unwrap();
+        if let Some(p) = cfg.peers.iter_mut().find(|p| p.id == id) {
+            p.last_seen = Some(now_ms());
             let snapshot = cfg.clone();
             drop(cfg);
             let _ = save_config(&snapshot);
         }
-        Some(name)
     }
 
-    pub fn peer_tokens(&self) -> Value {
+    /// Close every link (and so every stream and tunnel) of one paired Mac.
+    fn drop_links(&self, id: &str) {
+        for l in self.links.lock().unwrap().iter().filter(|l| l.peer_id == id) {
+            l.mux.shutdown();
+        }
+    }
+
+    fn find_peer(cfg: &RemoteConfig, id: &str) -> Result<usize, ApiErr> {
+        cfg.peers.iter().position(|p| p.id == id || p.name == id).ok_or_else(|| ApiErr::new(404, format!("no paired machine {id:?}")))
+    }
+
+    /// Paired Macs with their grants and whether they're connected now.
+    pub fn shared_peers(&self) -> Value {
         let cfg = self.config();
-        json!(cfg.peer_tokens.iter().map(|p| json!({ "id": p.id, "name": p.name, "createdAt": p.created_at, "lastSeen": p.last_seen })).collect::<Vec<_>>())
+        let links = self.links.lock().unwrap();
+        json!(cfg
+            .peers
+            .iter()
+            .map(|p| {
+                let live: Vec<&LiveLink> = links.iter().filter(|l| l.peer_id == p.id && !l.mux.is_closed()).collect();
+                json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "fingerprint": super::link::unhex32(&p.public_key).map(|k| super::link::fingerprint(&k)),
+                    "phrase": p.phrase,
+                    "grants": p.grants.json(),
+                    "createdAt": p.created_at,
+                    "lastSeen": p.last_seen,
+                    "online": !live.is_empty(),
+                    "address": live.first().map(|l| l.addr.ip().to_string()),
+                    "streams": live.iter().map(|l| l.mux.stream_count()).sum::<usize>(),
+                    "connectedSince": live.iter().map(|l| l.mux.opened_at).min(),
+                })
+            })
+            .collect::<Vec<_>>())
+    }
+
+    /// Change what a paired Mac may do: `{control: bool, tunnel: "all" | "none" | [services]}`.
+    /// Its link is reset so open streams that lost access close.
+    pub fn set_grants(&self, id: &str, patch: &Value) -> Result<Value, ApiErr> {
+        let mut cfg = self.config();
+        let i = Self::find_peer(&cfg, id)?;
+        let g = &mut cfg.peers[i].grants;
+        if let Some(c) = patch.get("control") {
+            g.control = c.as_bool().ok_or_else(|| ApiErr::new(400, "control must be true or false"))?;
+        }
+        match patch.get("tunnel") {
+            None => {}
+            Some(Value::String(s)) if s == "all" => (g.tunnel_all, g.tunnel) = (true, vec![]),
+            Some(Value::String(s)) if s == "none" => (g.tunnel_all, g.tunnel) = (false, vec![]),
+            Some(Value::Array(a)) => {
+                let list: Option<Vec<String>> = a.iter().map(|v| v.as_str().map(String::from)).collect();
+                (g.tunnel_all, g.tunnel) = (false, list.ok_or_else(|| ApiErr::new(400, "tunnel must list service names"))?);
+                g.tunnel.sort();
+                g.tunnel.dedup();
+            }
+            Some(_) => return Err(ApiErr::new(400, "tunnel must be \"all\", \"none\" or a list of services")),
+        }
+        let (pid, name, grants) = (cfg.peers[i].id.clone(), cfg.peers[i].name.clone(), cfg.peers[i].grants.json());
+        self.save(cfg)?;
+        self.drop_links(&pid);
+        self.audit(json!({ "event": "grants", "peer": name, "grants": grants }));
+        Ok(self.shared_peers())
     }
 
     pub fn revoke_peer(&self, id: &str) -> Result<(), ApiErr> {
         let mut cfg = self.config();
-        let before = cfg.peer_tokens.len();
-        cfg.peer_tokens.retain(|p| p.id != id && p.name != id);
-        if cfg.peer_tokens.len() == before {
-            return Err(ApiErr::new(404, format!("no paired machine {id:?}")));
-        }
-        save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
-        *self.cfg.lock().unwrap() = cfg;
+        let i = Self::find_peer(&cfg, id)?;
+        let p = cfg.peers.remove(i);
+        self.save(cfg)?;
+        self.drop_links(&p.id);
+        self.audit(json!({ "event": "revoked", "peer": p.name }));
         Ok(())
+    }
+
+    /// Forget every pairing (after this Mac's key changed, they can't connect anyway).
+    pub fn forget_peers(&self) {
+        let mut cfg = self.config();
+        let ids: Vec<String> = cfg.peers.drain(..).map(|p| p.id).collect();
+        let _ = self.save(cfg);
+        for id in ids {
+            self.drop_links(&id);
+        }
+    }
+
+    /// Record a link / tunnel event (never payload data).
+    pub(super) fn audit(&self, mut ev: Value) {
+        let line = ev
+            .as_object()
+            .map(|o| o.iter().map(|(k, v)| format!("{k}={}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        println!("{} share: {line}", paths::iso(now_ms()));
+        ev["at"] = json!(now_ms());
+        let mut a = self.activity.lock().unwrap();
+        a.push_back(ev);
+        while a.len() > 300 {
+            a.pop_front();
+        }
+    }
+
+    pub(super) fn count_tunnel(&self, peer: &str, service: &str, port: u16, bytes: u64) {
+        let mut t = self.tunnel_stats.lock().unwrap();
+        let e = t.entry((peer.to_string(), service.to_string(), port)).or_insert((0, 0, 0));
+        *e = (e.0 + 1, e.1 + bytes, now_ms());
+    }
+
+    /// Recent link / tunnel events (newest first) and tunnel totals since the daemon started.
+    pub fn activity(&self) -> Value {
+        let mut tunnels: Vec<Value> = self
+            .tunnel_stats
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((peer, service, port), (n, bytes, at))| json!({ "peer": peer, "service": service, "port": port, "connections": n, "bytes": bytes, "lastAt": at }))
+            .collect();
+        tunnels.sort_by_key(|t| -t["lastAt"].as_i64().unwrap_or(0));
+        json!({ "events": self.activity.lock().unwrap().iter().rev().cloned().collect::<Vec<_>>(), "tunnels": tunnels })
     }
 
     fn generation(&self) -> u64 {
@@ -352,12 +561,19 @@ impl Remote {
             Some(_) if cfg.enabled => network.clone(),
             _ => vec![],
         };
-        let share_urls: Vec<String> = if cfg.sharing() { network } else { vec![] };
+        let link = self.link.lock().unwrap();
+        let share_urls: Vec<String> = match &*link {
+            Some(l) if l.bind == "0.0.0.0" || l.bind == "::" => local_addresses().into_iter().map(|ip| format!("{ip}:{}", l.port)).collect(),
+            Some(l) => vec![format!("{}:{}", l.bind, l.port)],
+            None => vec![],
+        };
         json!({
             "enabled": cfg.enabled,
             "webRemote": cfg.web_remote(),
             "sharing": cfg.sharing(),
             "shareUrls": share_urls,
+            "linkPort": cfg.link_port,
+            "pairedMachines": cfg.peers.len(),
             "running": running.is_some(),
             "port": cfg.port,
             "bind": running.as_ref().map_or(cfg.bind.clone(), |r| r.bind.clone()),
@@ -394,6 +610,12 @@ impl Remote {
             }
             cfg.port = p;
         }
+        if let Some(p) = patch.link_port {
+            if p < 1024 {
+                return Err(ApiErr::new(400, "link port must be 1024 or higher"));
+            }
+            cfg.link_port = p;
+        }
         if let Some(b) = patch.bind {
             if b.parse::<IpAddr>().is_err() {
                 return Err(ApiErr::new(400, format!("invalid bind address {b:?}")));
@@ -415,6 +637,12 @@ impl Remote {
         if cfg.enabled && cfg.password_hash.is_empty() {
             return Err(ApiErr::new(400, "set a password before turning on the web dashboard"));
         }
+        if cfg.sharing() && !old.sharing() && cfg.password_hash.is_empty() {
+            return Err(ApiErr::new(400, "set a dashboard password before sharing — other Macs must enter it to pair"));
+        }
+        if cfg.enabled && cfg.port == cfg.link_port {
+            return Err(ApiErr::new(400, "the web dashboard and the machine link need different ports"));
+        }
         save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
         let creds_changed = cfg.username != old.username || cfg.password_hash != old.password_hash;
         *self.cfg.lock().unwrap() = cfg;
@@ -425,8 +653,9 @@ impl Remote {
         Ok(self.status())
     }
 
-    /// Make the listener match the config (called at boot and after every change).
+    /// Make the listeners match the config (called at boot and after every change).
     pub async fn apply(self: &Arc<Self>, app: &AppState) {
+        self.apply_link(app).await;
         let cfg = self.config();
         let old = self.running.lock().unwrap().take();
         self.bump();
@@ -469,14 +698,59 @@ impl Remote {
             let svc = app_router.into_make_service_with_connect_info::<SocketAddr>();
             let _ = axum::serve(listener, svc).await;
         });
-        let what = match (cfg.enabled, cfg.sharing()) {
-            (true, true) => "web dashboard + sharing",
-            (true, false) => "web dashboard",
-            _ => "sharing",
-        };
-        println!("{} remote: {what} listening on http://{addr}", paths::iso(now_ms()));
+        println!("{} remote: web dashboard listening on http://{addr}", paths::iso(now_ms()));
         *self.running.lock().unwrap() = Some(Running { port: cfg.port, bind, task });
     }
+
+    /// Start, keep or stop the link listener; stopping it drops every connected Mac.
+    async fn apply_link(self: &Arc<Self>, app: &AppState) {
+        let cfg = self.config();
+        let want = cfg.sharing().then(|| (cfg.bind.clone(), cfg.link_port));
+        {
+            let cur = self.link.lock().unwrap();
+            let same = want.as_ref() == cur.as_ref().map(|r| (r.bind.clone(), r.port)).as_ref();
+            if same && (want.is_none() || cur.as_ref().is_some_and(|r| !r.task.is_finished())) {
+                return;
+            }
+        }
+        let old = self.link.lock().unwrap().take();
+        if let Some(r) = old {
+            r.task.abort();
+            let _ = r.task.await;
+        }
+        for l in self.links.lock().unwrap().drain(..) {
+            l.mux.shutdown();
+        }
+        let Some((bind, port)) = want else { return };
+        if let Err(e) = super::link::identity() {
+            *self.error.lock().unwrap() = Some(e);
+            return;
+        }
+        let addr = format!("{bind}:{port}");
+        let mut bound = tokio::net::TcpListener::bind(&addr).await;
+        for _ in 0..10 {
+            match &bound {
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    bound = tokio::net::TcpListener::bind(&addr).await;
+                }
+                _ => break,
+            }
+        }
+        match bound {
+            Ok(l) => {
+                println!("{} remote: sharing — machine link listening on {addr}", paths::iso(now_ms()));
+                let task = tokio::spawn(super::share::serve(l, app.clone(), self.clone()));
+                *self.link.lock().unwrap() = Some(Running { port, bind, task });
+            }
+            Err(e) => {
+                let msg = format!("cannot listen on {addr}: {e}");
+                println!("{} remote: {msg}", paths::iso(now_ms()));
+                *self.error.lock().unwrap() = Some(msg);
+            }
+        }
+    }
+
 
     /// Start two-factor enrollment: returns a fresh secret and its otpauth:// URI. Login is unaffected
     /// until `totp_confirm` sees a valid code for it.
@@ -529,6 +803,12 @@ impl Remote {
     pub fn stop(&self) {
         if let Some(r) = self.running.lock().unwrap().take() {
             r.task.abort();
+        }
+        if let Some(r) = self.link.lock().unwrap().take() {
+            r.task.abort();
+        }
+        for l in self.links.lock().unwrap().drain(..) {
+            l.mux.shutdown();
         }
         self.bump();
     }
@@ -600,15 +880,42 @@ pub fn local_addresses() -> Vec<String> {
 
 // ------------------------------------------------------------------ HTTP
 
+/// Which paired Mac a link-served request comes from (set from its Noise key, never from the request).
+#[derive(Clone)]
+struct LinkPeer {
+    id: String,
+    mux: Arc<super::link::Mux>,
+}
+
 #[derive(Clone)]
 struct RState {
     app: AppState,
     remote: Arc<Remote>,
     gen: u64,
+    peer: Option<LinkPeer>,
+}
+
+/// The API a paired Mac uses, served over `http` streams of its link.
+pub(super) fn peer_router(app: AppState, remote: Arc<Remote>, peer_id: String, mux: Arc<super::link::Mux>) -> Router {
+    let rs = RState { app, gen: remote.generation(), remote, peer: Some(LinkPeer { id: peer_id, mux }) };
+    Router::new()
+        .route("/peer/api/info", get(peer_info))
+        .route("/peer/api/services", get(list))
+        .route("/peer/api/services/:name", get(get_one))
+        .route("/peer/api/services/:name/logs", get(logs))
+        .route("/peer/api/services/:name/logs/stream", get(log_stream))
+        .route("/peer/api/services/:name/metrics", get(metrics))
+        .route("/peer/api/services/:name/:action", post(peer_action))
+        .route("/peer/api/system", get(|State(rs): State<RState>| async move { Json(rs.app.sup.system()) }))
+        .route("/peer/api/processes", get(|State(rs): State<RState>| async move { Json(json!({ "processes": *rs.app.sup.processes() })) }))
+        .route("/peer/api/events", get(peer_events))
+        .fallback(|| async { ApiErr::new(404, "not found") })
+        .layer(middleware::from_fn_with_state(rs.clone(), require_link))
+        .with_state(rs)
 }
 
 fn router(app: AppState, remote: Arc<Remote>, gen: u64) -> Router {
-    let rs = RState { app, remote, gen };
+    let rs = RState { app, remote, gen, peer: None };
     let api = Router::new()
         .route("/api/session", get(session))
         .route("/api/services", get(list))
@@ -635,22 +942,8 @@ fn router(app: AppState, remote: Arc<Remote>, gen: u64) -> Router {
             }),
         )
         .layer(middleware::from_fn_with_state(rs.clone(), require_session));
-    let peer = Router::new()
-        .route("/peer/api/info", get(peer_info))
-        .route("/peer/api/services", get(list))
-        .route("/peer/api/services/:name", get(get_one))
-        .route("/peer/api/services/:name/logs", get(logs))
-        .route("/peer/api/services/:name/logs/stream", get(log_stream))
-        .route("/peer/api/services/:name/metrics", get(metrics))
-        .route("/peer/api/services/:name/:action", post(action))
-        .route("/peer/api/system", get(|State(rs): State<RState>| async move { Json(rs.app.sup.system()) }))
-        .route("/peer/api/processes", get(|State(rs): State<RState>| async move { Json(json!({ "processes": *rs.app.sup.processes() })) }))
-        .route("/peer/api/events", get(peer_events))
-        .layer(middleware::from_fn_with_state(rs.clone(), require_peer));
     Router::new()
         .route("/", get(|| async { asset("text/html; charset=utf-8", INDEX_HTML.as_bytes()) }))
-        .route("/peer/pair", post(pair))
-        .merge(peer)
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", APP_JS.as_bytes()) }))
         .route("/app.css", get(|| async { asset("text/css; charset=utf-8", APP_CSS.as_bytes()) }))
         .route("/icon.png", get(|| async { asset("image/png", ICON_PNG) }))
@@ -717,79 +1010,32 @@ async fn require_session(State(rs): State<RState>, req: Request, next: Next) -> 
     next.run(req).await
 }
 
-async fn require_peer(State(rs): State<RState>, req: Request, next: Next) -> Response {
-    if bearer(&req).and_then(|t| rs.remote.peer_for(&t)).is_none() {
-        return ApiErr::new(401, "invalid or revoked peer token").into_response();
+/// Link-served requests: the Mac must still be paired and sharing still on.
+async fn require_link(State(rs): State<RState>, req: Request, next: Next) -> Response {
+    let cfg = rs.remote.config();
+    let ok = rs.peer.as_ref().is_some_and(|p| cfg.sharing() && !p.mux.is_closed() && cfg.peers.iter().any(|x| x.id == p.id));
+    if !ok {
+        return ApiErr::new(403, "this Mac is no longer shared with you").into_response();
     }
     next.run(req).await
 }
 
+fn link_grants(rs: &RState) -> Option<(String, Grants)> {
+    let id = &rs.peer.as_ref()?.id;
+    rs.remote.config().peers.iter().find(|p| &p.id == id).map(|p| (p.name.clone(), p.grants.clone()))
+}
+
 async fn peer_info(State(rs): State<RState>) -> Json<Value> {
+    let (name, grants) = link_grants(&rs).unwrap_or_default();
     Json(json!({
         "hostname": hostname(),
         "version": VERSION,
-        "allowControl": rs.remote.config().allow_control,
+        "you": name,
+        "grants": grants.json(),
+        "allowControl": grants.control,
         "cores": super::procinfo::host_cores(),
         "memTotal": super::procinfo::host_mem_total(),
     }))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PairReq {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    username: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
-    #[serde(default)]
-    totp: Option<String>,
-    host_name: String,
-}
-
-/// Exchange a one-time pairing code, or this machine's dashboard login (+2FA), for a peer token.
-async fn pair(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
-    let ip = peer.ip();
-    let now = now_ms();
-    {
-        let mut f = rs.remote.failures.lock().unwrap();
-        f.retain(|_, (_, last)| now - *last < LOCKOUT_MS);
-        if f.get(&ip).is_some_and(|(n, _)| *n >= MAX_FAILURES) {
-            return ApiErr::new(429, "too many failed attempts, try again in a few minutes").into_response();
-        }
-    }
-    let Ok(r) = serde_json::from_slice::<PairReq>(&body) else {
-        return ApiErr::new(400, "invalid JSON body").into_response();
-    };
-    let ok = if let Some(code) = r.code.as_deref() {
-        rs.remote.take_pair_code(code)
-    } else {
-        let cfg = rs.remote.config();
-        let user_ok = ct_eq(r.username.as_deref().unwrap_or("").as_bytes(), cfg.username.as_bytes());
-        let stored = cfg.password_hash.clone();
-        let password = r.password.clone().unwrap_or_default();
-        let pass_ok = !stored.is_empty() && tokio::task::spawn_blocking(move || verify_password(&password, &stored)).await.unwrap_or(false);
-        user_ok && pass_ok && (cfg.totp_secret.is_empty() || rs.remote.totp_check(&cfg.totp_secret, r.totp.as_deref()))
-    };
-    if !ok {
-        {
-            let mut f = rs.remote.failures.lock().unwrap();
-            let e = f.entry(ip).or_insert((0, now));
-            *e = (e.0 + 1, now);
-        }
-        println!("{} remote: failed pairing attempt from {ip}", paths::iso(now));
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        return ApiErr::new(401, "invalid or expired pairing code / credentials").into_response();
-    }
-    rs.remote.failures.lock().unwrap().remove(&ip);
-    match rs.remote.issue_peer_token(&r.host_name) {
-        Ok(token) => {
-            println!("{} remote: paired with {} ({ip})", paths::iso(now), r.host_name);
-            Json(json!({ "token": token, "hostname": hostname(), "version": VERSION })).into_response()
-        }
-        Err(e) => e.into_response(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -803,12 +1049,8 @@ struct Login {
 async fn login(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
     let ip = peer.ip();
     let now = now_ms();
-    {
-        let mut f = rs.remote.failures.lock().unwrap();
-        f.retain(|_, (_, last)| now - *last < LOCKOUT_MS);
-        if f.get(&ip).is_some_and(|(n, _)| *n >= MAX_FAILURES) {
-            return ApiErr::new(429, "too many failed attempts, try again in a few minutes").into_response();
-        }
+    if rs.remote.locked_out(ip) {
+        return ApiErr::new(429, "too many failed attempts, try again in a few minutes").into_response();
     }
     let Ok(l) = serde_json::from_slice::<Login>(&body) else {
         return ApiErr::new(400, "invalid JSON body").into_response();
@@ -820,18 +1062,13 @@ async fn login(State(rs): State<RState>, ConnectInfo(peer): ConnectInfo<SocketAd
     let pass_ok = tokio::task::spawn_blocking(move || verify_password(&password, &stored)).await.unwrap_or(false);
     let code_ok = cfg.totp_secret.is_empty() || (user_ok && pass_ok && rs.remote.totp_check(&cfg.totp_secret, l.code.as_deref()));
     if !(user_ok && pass_ok && code_ok) {
-        let n = {
-            let mut f = rs.remote.failures.lock().unwrap();
-            let e = f.entry(ip).or_insert((0, now));
-            *e = (e.0 + 1, now);
-            e.0
-        };
+        let n = rs.remote.failed(ip);
         println!("{} remote: failed login from {ip} ({n}/{MAX_FAILURES})", paths::iso(now));
         tokio::time::sleep(Duration::from_millis(400)).await;
         let msg = if cfg.totp_secret.is_empty() { "invalid username or password" } else { "invalid username, password or code" };
         return ApiErr::new(401, msg).into_response();
     }
-    rs.remote.failures.lock().unwrap().remove(&ip);
+    rs.remote.succeeded(ip);
     let token = random_hex(32);
     rs.remote.sessions.lock().unwrap().insert(token.clone(), (cfg.username.clone(), now + SESSION_TTL_MS));
     println!("{} remote: {} logged in from {ip}", paths::iso(now), cfg.username);
@@ -911,29 +1148,37 @@ async fn events(State(rs): State<RState>) -> Response {
     let gen = rs.gen;
     server::events_stream(rs.app, true, true, Some(Box::new(move || remote.generation() == gen))).await
 }
-async fn peer_events(State(rs): State<RState>, req: Request) -> Response {
-    let hash = bearer(&req).map(|t| sha256_hex(&t)).unwrap_or_default();
-    let remote = rs.remote.clone();
-    let gen = rs.gen;
-    let alive = move || remote.generation() == gen && remote.config().peer_tokens.iter().any(|p| p.hash == hash);
-    server::events_stream(rs.app, true, false, Some(Box::new(alive))).await
+async fn peer_events(State(rs): State<RState>) -> Response {
+    let Some(mux) = rs.peer.as_ref().map(|p| p.mux.clone()) else { return ApiErr::new(403, "not a link").into_response() };
+    server::events_stream(rs.app, true, false, Some(Box::new(move || !mux.is_closed()))).await
 }
 
-fn bearer(req: &Request) -> Option<String> {
-    req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::to_string)
+/// Start/stop/restart from a paired Mac: needs its `control` grant.
+async fn peer_action(State(rs): State<RState>, Path((name, action)): Path<(String, String)>) -> Result<Json<ServiceState>, ApiErr> {
+    let (peer, grants) = link_grants(&rs).ok_or_else(|| ApiErr::new(403, "not paired"))?;
+    if !grants.control {
+        return Err(ApiErr::new(403, format!("{} doesn't let this Mac start or stop services (give it the control permission there)", hostname())));
+    }
+    let st = run_action(&rs, &name, &action).await?;
+    rs.remote.audit(json!({ "event": "control", "peer": peer, "service": name, "action": action }));
+    Ok(Json(redact(st)))
+}
+
+async fn run_action(rs: &RState, name: &str, action: &str) -> Result<ServiceState, ApiErr> {
+    let sup = &rs.app.sup;
+    match action {
+        "start" => Ok(sup.start(name).await?),
+        "stop" => Ok(sup.stop(name).await?),
+        "restart" => Ok(sup.restart(name).await?),
+        _ => Err(ApiErr::new(404, "unknown action")),
+    }
 }
 
 async fn action(State(rs): State<RState>, Path((name, action)): Path<(String, String)>) -> Result<Json<ServiceState>, ApiErr> {
     if !rs.remote.config().allow_control {
         return Err(ApiErr::new(403, "remote control is disabled on this machine"));
     }
-    let sup = &rs.app.sup;
-    let st = match action.as_str() {
-        "start" => sup.start(&name).await?,
-        "stop" => sup.stop(&name).await?,
-        "restart" => sup.restart(&name).await?,
-        _ => return Err(ApiErr::new(404, "unknown action")),
-    };
+    let st = run_action(&rs, &name, &action).await?;
     println!("{} remote: {action} {name}", paths::iso(now_ms()));
     Ok(Json(redact(st)))
 }
@@ -952,25 +1197,20 @@ mod tests {
         assert!(c.admit("/", lo).is_none());
         assert!(c.admit("/api/services", mapped).is_none());
         assert_eq!(c.admit("/", lan).unwrap().0, 403);
-        assert_eq!(c.admit("/peer/api/services", lo).unwrap().0, 404);
 
+        // Sharing uses the separate link port; the dashboard stays on this Mac.
         c.sharing = Some(true);
-        assert_eq!(c.bind_addr(), "0.0.0.0");
-        assert!(c.admit("/peer/api/services", lan).is_none());
+        assert_eq!(c.bind_addr(), "127.0.0.1");
         assert_eq!(c.admit("/api/login", lan).unwrap().0, 403);
 
         c.enabled = false;
-        assert!(c.listening());
-        assert_eq!(c.admit("/", lo).unwrap().0, 404);
-        assert!(c.admit("/peer/pair", lan).is_none());
-
-        c.sharing = Some(false);
         assert!(!c.listening());
+        assert_eq!(c.admit("/", lo).unwrap().0, 404);
 
         c = RemoteConfig { enabled: true, web_remote: Some(true), sharing: Some(false), ..Default::default() };
         assert_eq!(c.bind_addr(), "0.0.0.0");
         assert!(c.admit("/", lan).is_none());
-        assert!(c.admit("/peer/api/system", lan).is_some());
+        assert_eq!(c.link_port, 7381);
     }
 
     #[test]
@@ -981,6 +1221,25 @@ mod tests {
         assert!(c.web_remote() && c.sharing());
         let off = migrate(serde_json::from_str(r#"{"enabled":false}"#).unwrap());
         assert!(off.web_remote() && !off.sharing());
+    }
+
+    #[test]
+    fn grants() {
+        let mut g = Grants::new_pairing();
+        assert!(g.tunnel_allows("web") && !g.control);
+        assert_eq!(g.json()["tunnel"], "all");
+        g.tunnel_all = false;
+        g.tunnel = vec!["web".into()];
+        assert!(g.tunnel_allows("web") && !g.tunnel_allows("db"));
+        g.tunnel.clear();
+        assert_eq!(g.json()["tunnel"], "none");
+        // Old configs with bearer tokens load (and drop them) cleanly.
+        let c: RemoteConfig = serde_json::from_str(r#"{"enabled":true,"peerTokens":[{"id":"a","hash":"x"}]}"#).unwrap();
+        assert!(c.peers.is_empty());
+        let k = [9u8; 32];
+        let c = RemoteConfig { peers: vec![SharedPeer { id: "p".into(), public_key: super::super::link::key_hex(&k), ..Default::default() }], ..Default::default() };
+        assert_eq!(c.peer_by_key(&k).unwrap().id, "p");
+        assert!(c.peer_by_key(&[1u8; 32]).is_none());
     }
 
     #[test]

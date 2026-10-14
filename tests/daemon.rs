@@ -297,74 +297,94 @@ fn machines_pair_and_proxy() {
     assert_eq!(u["localOnly"], true);
     assert!(client.get("/api/processes").unwrap()["thresholds"].is_object());
 
-    // Pairing codes need sharing on. Sharing works with the web dashboard off.
-    let status = |path: &str| match ureq::get(path).call() {
-        Ok(r) => r.status(),
-        Err(ureq::Error::Status(c, _)) => c,
-        Err(_) => 0,
-    };
+    // Pairing codes need sharing on. Sharing works with the web dashboard off: only the link port listens.
     assert_eq!(client.post("/api/remote/pair-code", None).unwrap_err().0, 400);
-    let rport = free_port();
+    let (rport, lport) = (free_port(), free_port());
     client
-        .call("PUT", "/api/remote", Some(json!({ "enabled": false, "sharing": true, "bind": "127.0.0.1", "port": rport, "username": "me", "password": "correct horse", "allowControl": true })))
+        .call("PUT", "/api/remote", Some(json!({ "enabled": false, "sharing": true, "bind": "127.0.0.1", "port": rport, "linkPort": lport, "username": "me", "password": "correct horse" })))
         .unwrap();
-    let url = format!("127.0.0.1:{rport}");
-    wait_until("remote listener", 10, || status(&format!("http://{url}/api/login")) == 404);
-    assert_eq!(status(&format!("http://{url}/")), 404, "web dashboard is off");
+    let addr = format!("127.0.0.1:{lport}");
+    wait_until("link listener", 10, || std::net::TcpStream::connect(&addr).is_ok());
+    assert!(std::net::TcpStream::connect(("127.0.0.1", rport)).is_err(), "web dashboard is off");
+    // The link port speaks only the LStack link protocol.
+    assert!(ureq::get(&format!("http://{addr}/peer/api/info")).timeout(Duration::from_secs(8)).call().is_err());
     let rs = client.get("/api/remote").unwrap();
     assert_eq!((rs["sharing"].clone(), rs["enabled"].clone()), (json!(true), json!(false)));
+    let client_id = client.get("/api/identity").unwrap();
+    assert_eq!(client_id["fingerprint"].as_str().unwrap().len(), 19);
 
-    // Wrong code is refused; a fresh code pairs once.
-    assert_eq!(host.post("/api/machines", Some(json!({ "url": url, "code": "AAAA-AAAA" }))).unwrap_err().0, 401);
+    // Pairing needs a live code AND the dashboard login; a code is burned after 3 failures.
+    let login = |code: &str, pass: &str| json!({ "address": addr, "code": code, "username": "me", "password": pass, "name": "studio" });
+    assert_eq!(host.post("/api/machines", Some(json!({ "address": addr, "code": "AAAA-AAAA" }))).unwrap_err().0, 400, "password required");
     let code = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
-    let m = host.post("/api/machines", Some(json!({ "url": url, "code": code, "name": "studio" }))).unwrap();
+    let e = host.post("/api/machines", Some(login("AAAA-AAAA", "correct horse"))).unwrap_err();
+    assert_eq!(e.0, 403, "{e:?}");
+    for _ in 0..2 {
+        let e = host.post("/api/machines", Some(login(&code, "wrong-pass"))).unwrap_err();
+        assert_eq!(e.0, 403, "{e:?}");
+    }
+    assert!(host.post("/api/machines", Some(login(&code, "correct horse"))).is_err(), "burned after 3 failures");
+    let code3 = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
+    let m = host.post("/api/machines", Some(login(&code3, "correct horse"))).unwrap();
     assert_eq!(m["name"], "studio");
-    assert_eq!(host.post("/api/machines", Some(json!({ "url": url, "code": code }))).unwrap_err().0, 409);
+    assert_eq!(m["phrase"].as_str().unwrap().split(' ').count(), 4);
+    assert_eq!(m["grants"], json!({ "control": false, "tunnel": "all" }));
+    assert!(host.post("/api/machines", Some(login(&code3, "correct horse"))).is_err(), "codes are single use");
     let peers = client.get("/api/remote/peers").unwrap();
     assert_eq!(peers.as_array().unwrap().len(), 1);
+    assert_eq!(peers[0]["phrase"], m["phrase"]);
+    let saved = std::fs::read_to_string(base.join("host/peers.json")).unwrap();
+    assert!(saved.contains("publicKey") && !saved.contains("token") && !saved.contains("correct horse"), "{saved}");
 
-    // The host sees the client's services, tagged and with URLs pointing at the client.
-    let peer_url = format!("http://127.0.0.1:{web_port}");
-    wait_until("peer services", 20, || {
-        let v = host.get("/api/machines/studio").unwrap();
-        v["status"] == "online" && v["services"].as_array().is_some_and(|s| s.iter().any(|s| s["name"] == "web" && s["machine"] == "studio" && s["urls"][0]["url"] == json!(peer_url)))
-    });
+    // The client's 127.0.0.1-only web server is forwarded to a local port on the host, automatically.
+    let forwarded = || -> Option<String> {
+        let v = host.get("/api/machines/studio").ok()?;
+        let s = v["services"].as_array()?.iter().find(|s| s["name"] == "web" && s["machine"] == "studio")?.clone();
+        (v["status"] == "online" && s["urls"][0]["via"] == "studio").then(|| s["urls"][0]["url"].as_str().unwrap().to_string())
+    };
+    wait_until("automatic forward", 30, || forwarded().is_some());
+    let local_url = forwarded().unwrap();
+    assert!(local_url.starts_with("http://localhost:") && local_url != want_url, "{local_url} (same port is taken here, so another is used)");
+    let fw = host.get("/api/forwards").unwrap();
+    assert_eq!(fw[0]["machine"], "studio");
+    assert_eq!(fw[0]["port"], web_port);
+    let page = ureq::get(&local_url.replace("localhost", "127.0.0.1")).timeout(Duration::from_secs(10)).call().unwrap().into_string().unwrap();
+    assert!(page.contains("Directory listing"), "{page}");
+    wait_until("tunnel audited", 10, || client.get("/api/remote/activity").unwrap()["tunnels"].as_array().is_some_and(|t| !t.is_empty()));
     let ms = host.get("/api/machines").unwrap();
     assert_eq!(ms["local"]["local"], true);
     assert_eq!(ms["machines"][0]["name"], "studio");
 
-    // Proxied logs, details and control.
+    // Proxied logs and details over the link; control needs the control grant.
     assert!(host.get("/api/machines/studio/services/web").unwrap()["status"] == "running");
     assert!(host.get("/api/machines/studio/services/web/logs?tail=50").unwrap()["lines"].is_array());
     assert!(host.get("/api/machines/studio/services/web/metrics?range=5m").unwrap()["samples"].is_array());
-    host.post("/api/machines/studio/services/web/stop", None).unwrap();
+    assert_eq!(host.post("/api/machines/studio/services/web/stop", None).unwrap_err().0, 403);
+    let id = peers[0]["id"].as_str().unwrap().to_string();
+    client.call("PATCH", &format!("/api/remote/peers/{id}"), Some(json!({ "control": true }))).unwrap();
+    wait_until("control granted", 20, || host.post("/api/machines/studio/services/web/stop", None).is_ok());
     wait_until("peer stop seen on host", 20, || {
         let v = host.get("/api/machines/studio").unwrap();
         v["services"].as_array().unwrap().iter().any(|s| s["name"] == "web" && s["status"] == "stopped")
     });
+    wait_until("forward dropped for stopped service", 10, || host.get("/api/forwards").unwrap().as_array().unwrap().is_empty());
     assert_eq!(host.get("/api/machines/nope").unwrap_err().0, 404);
 
     // CLI on the host lists both machines.
     let (ok, out) = host.cli(&["machine", "ls"]);
     assert!(ok && out.contains("studio"), "{out}");
 
-    // Control follows the client's allowControl.
-    client.call("PUT", "/api/remote", Some(json!({ "allowControl": false }))).unwrap();
-    wait_until("remote restart", 10, || status(&format!("http://{url}/api/login")) == 404);
-    wait_until("control refused", 20, || host.post("/api/machines/studio/services/web/start", None).is_err_and(|e| e.0 == 403));
-
-    // Revoking the token on the client cuts the host off.
-    let id = client.get("/api/remote/peers").unwrap()[0]["id"].as_str().unwrap().to_string();
+    // Revoking on the client cuts the host off.
     client.call("DELETE", &format!("/api/remote/peers/{id}"), None).unwrap();
-    assert_eq!(host.get("/api/machines/studio/services/web").unwrap_err().0, 401);
-    wait_until("host marks unauthorized", 40, || host.get("/api/machines/studio").unwrap()["status"] == "unauthorized");
+    wait_until("host marks unauthorized", 30, || host.get("/api/machines/studio").unwrap()["status"] == "unauthorized");
+    assert!(host.get("/api/machines/studio/services/web").is_err());
 
-    // Password pairing works too, and machines can be renamed/removed.
-    host.call("DELETE", "/api/machines/studio", None).unwrap();
-    assert_eq!(host.post("/api/machines", Some(json!({ "url": url, "username": "me", "password": "wrong-pass" }))).unwrap_err().0, 401);
-    let m = host.post("/api/machines", Some(json!({ "url": url, "username": "me", "password": "correct horse" }))).unwrap();
-    let name = m["name"].as_str().unwrap().to_string();
-    host.call("PATCH", &format!("/api/machines/{name}"), Some(json!({ "name": "lab" }))).unwrap();
+    // Pairing again replaces the old entry (keeping its name); machines can be renamed.
+    let code4 = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
+    let m = host.post("/api/machines", Some(json!({ "address": addr, "code": code4, "username": "me", "password": "correct horse" }))).unwrap();
+    assert_eq!(m["name"], "studio");
+    assert_eq!(host.get("/api/machines").unwrap()["machines"].as_array().unwrap().len(), 1);
+    host.call("PATCH", "/api/machines/studio", Some(json!({ "name": "lab" }))).unwrap();
     assert!(host.get("/api/machines/lab").is_ok());
     assert!(std::fs::read_to_string(base.join("host/peers.json")).unwrap().contains("\"lab\""));
     drop(host);

@@ -399,12 +399,15 @@
     const shown = max ? urls.slice(0, max) : urls;
     const more = urls.length - shown.length;
     return shown.map((u) => {
-      const warn = !!s._m && u.localOnly;
+      const via = u.via || "";
+      const warn = !!s._m && u.localOnly && !via;
       const text = u.label || String(u.url || "").replace(/^https?:\/\//i, "").replace(/\/$/, "");
-      const inner = `${warn ? `<span class="lwarn" title="${esc(LOCAL_ONLY_TIP)}">⚠</span>` : ""}${esc(text)}`;
-      const cls = `link${warn ? " warn" : ""}`;
-      if (!/^https?:\/\//i.test(u.url || "")) return `<span class="${cls}" title="${esc(u.url)}">${inner}</span>`;
-      return `<a class="${cls}" href="${esc(u.url)}" target="_blank" rel="noopener noreferrer" title="${esc(u.url)}">${inner}</a>`;
+      const mark = via ? '<span class="lvia">🔒</span>' : warn ? `<span class="lwarn" title="${esc(LOCAL_ONLY_TIP)}">⚠</span>` : "";
+      const inner = `${mark}${esc(text)}`;
+      const cls = `link${warn ? " warn" : ""}${via ? " via" : ""}`;
+      const tip = via ? `${u.url}\nforwarded from ${via} (port ${u.port ?? "?"} there) over the encrypted link — works on this Mac` : u.url;
+      if (!/^https?:\/\//i.test(u.url || "")) return `<span class="${cls}" title="${esc(tip)}">${inner}</span>`;
+      return `<a class="${cls}" href="${esc(u.url)}" target="_blank" rel="noopener noreferrer" title="${esc(tip)}">${inner}</a>`;
     }).join("") + (more > 0 ? `<span class="link more" title="${esc(urls.slice(max).map((u) => u.url).join("\n"))}">+${more}</span>` : "");
   }
 
@@ -472,9 +475,9 @@
 
   function machHead(i, count) {
     const st = i.status || "offline";
-    const tip = [i.hostname, i.version && `v${i.version}`, i.url, !i.local && st !== "online" && i.lastSeen ? `last seen ${ago(i.lastSeen)}` : ""].filter(Boolean).join(" · ");
-    const sub = i.local ? "this machine" : st !== "online" ? st : "";
-    const ro = !i.local && !i.allowControl ? '<span class="badge ro" title="Control is disabled on that machine">read-only</span>' : "";
+    const tip = [i.hostname, i.version && `v${i.version}`, i.address || i.url, i.fingerprint && `key ${i.fingerprint}`, !i.local && st !== "online" && i.lastSeen ? `last seen ${ago(i.lastSeen)}` : ""].filter(Boolean).join(" · ");
+    const sub = i.local ? "this machine" : st === "repair" ? "pair again" : st !== "online" ? st : "";
+    const ro = !i.local && st === "online" && !i.allowControl ? '<span class="badge ro" title="That Mac lets this one view, not start/stop">view only</span>' : "";
     const err = !i.local && st !== "online" && i.error ? `<div class="m-err">${esc(i.error)}</div>` : "";
     const open = !S.collapsed.has(`m:${i.local ? "" : i.name}`);
     return `<div class="mach" data-toggle="m:${esc(i.local ? "" : i.name)}" title="${esc(tip)}">${chev(open)}<span class="mdot ${esc(st)}"></span><b>${esc(i.name)}</b>${sub ? `<span class="m-sub">${esc(sub)}</span>` : ""}${ro}<span class="m-n">${count}</span></div>${err}`;

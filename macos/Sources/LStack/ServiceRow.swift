@@ -298,15 +298,27 @@ struct FlowLinks: View {
     private func chip(_ u: ServiceURL) -> some View {
         Button { open(u) } label: {
             HStack(spacing: 3) {
-                Image(systemName: u.localOnly == true ? "exclamationmark.triangle.fill" : "link")
+                Image(systemName: icon(u))
                     .font(.system(size: 9))
-                    .foregroundStyle(u.localOnly == true ? .orange : .accentColor)
+                    .foregroundStyle(warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
                 Text(u.display).font(.system(size: 10, weight: .medium)).lineLimit(1)
             }
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(Capsule().fill(Color.accentColor.opacity(0.12)))
         }
         .buttonStyle(.plain)
-        .help(u.localOnly == true ? "\(u.url) — bound to localhost on that Mac, so it may not be reachable from here" : u.url)
+        .help(help(u))
+    }
+
+    private func warn(_ u: ServiceURL) -> Bool { u.via == nil && u.localOnly == true }
+
+    private func icon(_ u: ServiceURL) -> String {
+        if u.via != nil { return "lock.fill" }
+        return u.localOnly == true ? "exclamationmark.triangle.fill" : "link"
+    }
+
+    private func help(_ u: ServiceURL) -> String {
+        if let m = u.via { return "\(u.url) — forwarded from \(m) over the encrypted link" }
+        return u.localOnly == true ? "\(u.url) — bound to localhost on that Mac, so it may not be reachable from here" : u.url
     }
 }

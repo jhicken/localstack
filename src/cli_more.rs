@@ -1,5 +1,5 @@
 //! CLI commands for secrets, heartbeats, machines and processes.
-use crate::cli::{read_password, Args};
+use crate::cli::{confirm, read_password, Args};
 use crate::client;
 use crate::fmt as c;
 use serde_json::{json, Value};
@@ -94,6 +94,7 @@ fn machine_status(s: &str) -> String {
         "online" => c::green("● online"),
         "connecting" => c::yellow("◌ connecting"),
         "unauthorized" => c::red("● unauthorized"),
+        "repair" => c::yellow("● pair again"),
         _ => c::red(&format!("○ {s}")),
     }
 }
@@ -127,10 +128,10 @@ pub fn cmd_machine(args: &[String]) -> R {
                 let running = m["services"].as_array().into_iter().flatten().filter(|s| s["status"] == "running").count();
                 rows.push(vec![
                     c::bold(m["name"].as_str().unwrap_or("?")),
-                    m["url"].as_str().unwrap_or("").to_string(),
+                    m["address"].as_str().unwrap_or("").to_string(),
                     machine_status(m["status"].as_str().unwrap_or("?")),
                     format!("{running}/{n} running"),
-                    if m["allowControl"].as_bool().unwrap_or(false) { c::cyan("control") } else { c::dim("read-only") },
+                    if m["grants"].is_null() { c::dim("—") } else { grants_text(&m["grants"]) },
                 ]);
             }
             println!("{}", c::table(&rows, &["MACHINE", "ADDRESS", "STATUS", "SERVICES", "ACCESS"]));
@@ -140,47 +141,86 @@ pub fn cmd_machine(args: &[String]) -> R {
                 }
             }
             if v["machines"].as_array().is_none_or(Vec::is_empty) {
-                println!("{}", c::dim("  Watch another Mac: run `lstack remote pair` there, then `lstack machine add <address> --code XXXX-XXXX` here."));
+                println!("{}", c::dim("  Watch another Mac: run `lstack remote pair` there, then `lstack machine pair <address> --code XXXX-XXXX` here."));
             }
             Ok(())
         }
         "add" | "pair" => {
-            let url = a.pos.get(1).ok_or("usage: lstack machine add <address> (--code XXXX-XXXX | --user <name>) [--name <alias>]")?;
-            let mut body = json!({ "url": url });
+            let addr = a.pos.get(1).ok_or("usage: lstack machine pair <address> --code XXXX-XXXX [--user <name>] [--name <alias>]")?;
+            let code = match a.get("code") {
+                Some(c) => c.to_string(),
+                None if std::io::stdin().is_terminal() => {
+                    eprint!("Pairing code shown on {addr} (Share this Mac → Show pairing code): ");
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
+                    s.trim().to_string()
+                }
+                None => return Err("--code required (run `lstack remote pair` on that Mac)".into()),
+            };
+            let user = match a.get("user") {
+                Some(u) => u.to_string(),
+                None if std::io::stdin().is_terminal() => {
+                    eprint!("Its dashboard username [admin]: ");
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
+                    Some(s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "admin".into())
+                }
+                None => "admin".into(),
+            };
+            let password = if a.has("password-stdin") { read_password("", true)? } else { read_password(&format!("{user}'s dashboard password on {addr}: "), false)? };
+            let mut body = json!({ "address": addr, "code": code, "username": user, "password": password });
             if let Some(n) = a.get("name") {
                 body["name"] = json!(n);
             }
-            if let Some(code) = a.get("code") {
-                body["code"] = json!(code);
-            } else if let Some(u) = a.get("user") {
-                body["username"] = json!(u);
-                body["password"] = json!(if a.has("password-stdin") { read_password("", true)? } else { read_password(&format!("{u}'s dashboard password on {url}: "), false)? });
-                let totp = match a.get("totp") {
-                    Some(t) => Some(t.to_string()),
-                    None if std::io::stdin().is_terminal() => {
-                        eprint!("2FA code (Enter if none): ");
-                        let mut s = String::new();
-                        std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
-                        Some(s.trim().to_string()).filter(|s| !s.is_empty())
-                    }
-                    None => None,
-                };
-                if let Some(t) = totp {
-                    body["totp"] = json!(t);
+            let totp = match a.get("totp") {
+                Some(t) => Some(t.to_string()),
+                None if std::io::stdin().is_terminal() => {
+                    eprint!("2FA code (Enter if none): ");
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
+                    Some(s.trim().to_string()).filter(|s| !s.is_empty())
                 }
-            } else {
-                return Err("give --code (run `lstack remote pair` on that machine) or --user to sign in with its dashboard password".into());
+                None => None,
+            };
+            if let Some(t) = totp {
+                body["totp"] = json!(t);
             }
             let m: Value = cl.req("POST", "/api/machines", Some(body))?;
-            println!("{} paired with {} ({})", c::green("✓"), c::bold(m["name"].as_str().unwrap_or("?")), m["url"].as_str().unwrap_or(""));
-            println!("{}", c::dim("  Its services now show up in `lstack ls`, the menu bar and the web dashboard. Address them as name@machine."));
+            if a.has("json") {
+                println!("{}", serde_json::to_string_pretty(&m).unwrap_or_default());
+                return Ok(());
+            }
+            println!("{} paired with {} ({})", c::green("✓"), c::bold(m["name"].as_str().unwrap_or("?")), m["address"].as_str().unwrap_or(""));
+            println!("  {:<12} {}", c::dim("phrase"), c::bold(m["phrase"].as_str().unwrap_or("?")));
+            println!("  {:<12} {}", c::dim("fingerprint"), m["fingerprint"].as_str().unwrap_or("?"));
+            println!("  {:<12} {}", c::dim("access"), grants_text(&m["grants"]));
+            println!("{}", c::dim("  The other Mac shows the same phrase. Its services now show up in `lstack ls`, the menu bar and the web\n  dashboard (address them as name@machine); services it shares are forwarded to localhost — see `lstack forwards`."));
+            Ok(())
+        }
+        "id" | "identity" | "whoami" => {
+            let v: Value = cl.req("GET", "/api/identity", None)?;
+            if a.has("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return Ok(());
+            }
+            println!("{}  {}", c::bold(v["name"].as_str().unwrap_or("?")), v["fingerprint"].as_str().unwrap_or("?"));
+            println!("{}", c::dim("  This install's link key fingerprint. Paired Macs pin it; it never leaves this Mac's secret store."));
+            Ok(())
+        }
+        "rekey" => {
+            if !a.has("yes") && !confirm("New link key for this Mac? Every pairing (both ways) must be made again.") {
+                return Ok(());
+            }
+            let v: Value = cl.req("POST", "/api/identity/rekey", None)?;
+            println!("{} new key {}", c::green("✓"), v["fingerprint"].as_str().unwrap_or("?"));
+            println!("{}", c::dim("  Pair again with each Mac: `lstack machine pair <address> --code …`."));
             Ok(())
         }
         "rm" | "remove" | "forget" => {
             let n = a.pos.get(1).ok_or("usage: lstack machine rm <name>")?;
             let _: Value = cl.req("DELETE", &format!("/api/machines/{}", client::enc(n)), None)?;
             println!("{} forgot {n}", c::green("✓"));
-            println!("{}", c::dim("  To revoke its access token on that machine too: `lstack remote peers rm <id>` there."));
+            println!("{}", c::dim("  To cut it off on that Mac too: `lstack remote revoke <name>` there."));
             Ok(())
         }
         "rename" | "mv" => {
@@ -189,37 +229,108 @@ pub fn cmd_machine(args: &[String]) -> R {
             println!("{} {n} → {to}", c::green("✓"));
             Ok(())
         }
-        other => Err(format!("unknown machine command {other:?} (ls, add, rm, rename)")),
+        other => Err(format!("unknown machine command {other:?} (ls, pair, id, rekey, rm, rename)")),
     }
 }
 
-/// `lstack remote pair` / `lstack remote peers [rm <id>]` (this machine's side of pairing).
-pub fn cmd_remote_peers(cl: &client::Client, sub: &str, rest: &[String], json_out: bool) -> R {
+/// "control + tunnel all" etc. from `{control, tunnel: "all" | "none" | [..]}`.
+pub fn grants_text(g: &Value) -> String {
+    let tunnel = match &g["tunnel"] {
+        Value::String(s) if s == "all" => "tunnel all".to_string(),
+        Value::Array(a) if !a.is_empty() => format!("tunnel {}", a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")),
+        _ => "no tunnels".to_string(),
+    };
+    let control = if g["control"].as_bool().unwrap_or(false) { c::cyan("view + control") } else { "view".to_string() };
+    format!("{control}, {tunnel}")
+}
+
+/// `lstack remote pair|peers|grant|revoke|activity` (this Mac's side of pairing).
+pub fn cmd_remote_peers(cl: &client::Client, sub: &str, rest: &[String], tunnel: Option<&str>, json_out: bool) -> R {
+    let out = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     match sub {
         "pair" => {
             let v: Value = cl.req("POST", "/api/remote/pair-code", None)?;
             if json_out {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                out(&v);
                 return Ok(());
             }
             println!("Pairing code (valid 10 minutes, one use): {}\n", c::bold(v["code"].as_str().unwrap_or("?")));
-            println!("On the Mac that should watch this one, run:");
+            println!("On the Mac that should pair with this one, run:");
             let urls: Vec<&str> = v["urls"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
             for u in if urls.is_empty() { vec!["<this-mac-address>"] } else { urls } {
-                println!("  lstack machine add {u} --code {}", v["code"].as_str().unwrap_or(""));
+                println!("  lstack machine pair {u} --code {}", v["code"].as_str().unwrap_or(""));
+            }
+            let tfa = if v["totp"].as_bool().unwrap_or(false) { " and a 2FA code" } else { "" };
+            println!("{}", c::dim(&format!("  It also asks for this Mac's dashboard username and password{tfa}. New pairings may view and\n  tunnel to services; allow start/stop with `lstack remote grant <mac> control`.")));
+            Ok(())
+        }
+        "grant" => {
+            let who = rest.first().ok_or("usage: lstack remote grant <mac> [control|no-control] [--tunnel all|none|svc,svc]")?;
+            let mut patch = json!({});
+            for w in &rest[1..] {
+                match w.as_str() {
+                    "control" => patch["control"] = json!(true),
+                    "no-control" | "view" => patch["control"] = json!(false),
+                    other => return Err(format!("unknown grant {other:?} (control, no-control; tunnels with --tunnel)")),
+                }
+            }
+            if let Some(t) = tunnel {
+                patch["tunnel"] = match t {
+                    "all" | "none" => json!(t),
+                    list => json!(list.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+                };
+            }
+            if patch.as_object().is_some_and(|o| o.is_empty()) {
+                return Err("say what to change: control, no-control and/or --tunnel all|none|svc,svc".into());
+            }
+            let v: Value = cl.req("PATCH", &format!("/api/remote/peers/{}", client::enc(who)), Some(patch))?;
+            let p = v.as_array().into_iter().flatten().find(|p| p["id"] == json!(who) || p["name"] == json!(who));
+            println!("{} {who}: {}", c::green("✓"), p.map(|p| grants_text(&p["grants"])).unwrap_or_default());
+            Ok(())
+        }
+        "revoke" => {
+            let who = rest.first().ok_or("usage: lstack remote revoke <mac>")?;
+            let _: Value = cl.req("DELETE", &format!("/api/remote/peers/{}", client::enc(who)), None)?;
+            println!("{} unpaired {who}; its link and tunnels are closed", c::green("✓"));
+            Ok(())
+        }
+        "activity" => {
+            let v: Value = cl.req("GET", "/api/remote/activity", None)?;
+            if json_out {
+                out(&v);
+                return Ok(());
+            }
+            let events: Vec<&Value> = v["events"].as_array().into_iter().flatten().collect();
+            if events.is_empty() {
+                println!("{}", c::dim("No link activity yet."));
+            }
+            for e in events.iter().take(40).rev() {
+                let mut detail: Vec<String> = vec![];
+                for k in ["peer", "service", "port", "address", "reason", "bytes"] {
+                    if let Some(x) = e.get(k).filter(|x| !x.is_null()) {
+                        detail.push(format!("{k}={}", x.as_str().map(String::from).unwrap_or_else(|| x.to_string())));
+                    }
+                }
+                println!("{}  {:<14} {}", c::dim(&e["at"].as_i64().map(c::local_time).unwrap_or_default()), e["event"].as_str().unwrap_or("?"), detail.join("  "));
+            }
+            let tunnels: Vec<&Value> = v["tunnels"].as_array().into_iter().flatten().collect();
+            if !tunnels.is_empty() {
+                println!();
+                let rows: Vec<Vec<String>> = tunnels
+                    .iter()
+                    .map(|t| vec![c::bold(t["peer"].as_str().unwrap_or("?")), format!("{}:{}", t["service"].as_str().unwrap_or("?"), t["port"]), t["connections"].to_string(), c::bytes(t["bytes"].as_f64()), t["lastAt"].as_i64().map(c::local_time).unwrap_or_default()])
+                    .collect();
+                println!("{}", c::table(&rows, &["MAC", "TUNNEL", "CONNS", "BYTES", "LAST USED"]));
             }
             Ok(())
         }
         _ => {
             if matches!(rest.first().map(String::as_str), Some("rm" | "revoke" | "remove")) {
-                let id = rest.get(1).ok_or("usage: lstack remote peers rm <id|name>")?;
-                let _: Value = cl.req("DELETE", &format!("/api/remote/peers/{}", client::enc(id)), None)?;
-                println!("{} revoked {id}", c::green("✓"));
-                return Ok(());
+                return cmd_remote_peers(cl, "revoke", &rest[1..], None, json_out);
             }
             let v: Value = cl.req("GET", "/api/remote/peers", None)?;
             if json_out {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                out(&v);
                 return Ok(());
             }
             let rows: Vec<Vec<String>> = v
@@ -228,17 +339,73 @@ pub fn cmd_remote_peers(cl: &client::Client, sub: &str, rest: &[String], json_ou
                 .flatten()
                 .map(|p| {
                     vec![
-                        p["id"].as_str().unwrap_or("").to_string(),
                         c::bold(p["name"].as_str().unwrap_or("?")),
-                        p["createdAt"].as_i64().map(c::local_time).unwrap_or_default(),
+                        if p["online"].as_bool().unwrap_or(false) { c::green("● linked") } else { c::dim("○ offline") },
+                        grants_text(&p["grants"]),
+                        p["fingerprint"].as_str().unwrap_or("").to_string(),
                         p["lastSeen"].as_i64().map(c::local_time).unwrap_or_else(|| c::dim("never")),
                     ]
                 })
                 .collect();
             if rows.is_empty() {
-                println!("{}", c::dim("No machines watch this one. Allow one with: lstack remote pair"));
+                println!("{}", c::dim("No Macs are paired with this one. Pair one with: lstack remote pair"));
             } else {
-                println!("{}", c::table(&rows, &["ID", "WATCHED BY", "PAIRED", "LAST SEEN"]));
+                println!("{}", c::table(&rows, &["MAC", "LINK", "ACCESS", "KEY", "LAST SEEN"]));
+            }
+            Ok(())
+        }
+    }
+}
+
+// ------------------------------------------------------------------ forwards
+
+/// `lstack forwards [pause|resume svc@machine]`: paired Macs' services on localhost.
+pub fn cmd_forwards(args: &[String]) -> R {
+    let a = Args::parse(args, &[("json", "", false)])?;
+    let cl = client::connect(true)?;
+    match a.pos.first().map(String::as_str) {
+        Some(verb @ ("pause" | "resume")) => {
+            let target = a.pos.get(1).ok_or(format!("usage: lstack forwards {verb} <service>@<machine>"))?;
+            let (svc, m) = target.split_once('@').ok_or("give the service as service@machine")?;
+            let _: Value = cl.req("POST", &format!("/api/forwards/{verb}"), Some(json!({ "machine": m, "service": svc })))?;
+            println!("{} {verb}d forwarding {target}", c::green("✓"));
+            Ok(())
+        }
+        Some(other) if other != "ls" && other != "list" => Err(format!("unknown forwards command {other:?} (ls, pause, resume)")),
+        _ => {
+            let v: Value = cl.req("GET", "/api/forwards", None)?;
+            if a.has("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|f| {
+                    let state = if f["paused"].as_bool().unwrap_or(false) {
+                        c::dim("paused")
+                    } else if let Some(e) = f["error"].as_str() {
+                        c::red(e)
+                    } else if f["online"].as_bool().unwrap_or(false) {
+                        c::green("● ready")
+                    } else {
+                        c::yellow("○ machine offline")
+                    };
+                    vec![
+                        c::bold(&format!("{}@{}", f["service"].as_str().unwrap_or("?"), f["machine"].as_str().unwrap_or("?"))),
+                        f["port"].to_string(),
+                        f["url"].as_str().map(c::cyan).unwrap_or_else(|| c::dim("—")),
+                        state,
+                        f["connections"].to_string(),
+                    ]
+                })
+                .collect();
+            if rows.is_empty() {
+                println!("{}", c::dim("Nothing forwarded. Services a paired Mac lets you tunnel to appear here while they listen on a port."));
+            } else {
+                println!("{}", c::table(&rows, &["SERVICE", "REMOTE PORT", "LOCAL URL", "STATE", "CONNS"]));
+                println!("{}", c::dim("  Only reachable from this Mac, by your user; traffic rides the encrypted link."));
             }
             Ok(())
         }

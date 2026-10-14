@@ -124,7 +124,7 @@ Run `lstack help` for everything.
 
 LStack can serve a small web dashboard. It shows services, health, CPU and memory history, live logs, and a whole-machine view per machine: each machine has a **Machine** section with a Load row (CPU and memory sparklines) above its busiest processes; click the Load row for CPU and memory charts covering the last 15 minutes, with LStack's share highlighted, plus the full process list. Machine groups and Machine sections fold away with a click, and the dashboard remembers which ones are folded. It is **off by default**. Turn it on from **Settings → Web dashboard** in the app, or from the CLI.
 
-You choose who can open it: **this Mac only** (the listener binds to 127.0.0.1, and other devices get 403), or **other devices too**. Sharing with other Macs is a separate switch (see [Other machines](#other-machines)), so you can use the dashboard locally without exposing it, or share with paired Macs while the dashboard stays off.
+You choose who can open it: **this Mac only** (the listener binds to 127.0.0.1, and other devices get 403), or **other devices too**. Sharing with other Macs is a separate switch on its own encrypted link port (see [Other machines](#other-machines)), so you can use the dashboard locally without exposing it, or share with paired Macs while the dashboard stays off.
 
 ```sh
 lstack remote on --local            # asks for a password the first time; http://127.0.0.1:7380
@@ -218,23 +218,57 @@ You can also manage this in **Settings → Monitoring**, where you set the ping 
 
 A Mac can watch other Macs that run LStack. Their services and busy processes then appear, grouped by machine, in the menu bar, `lstack ls`, `lstack top` and the web dashboard. In the menu bar, each other Mac shows a Load row with CPU and memory sparklines above its busy processes. Machine sections can be collapsed, and the menu bar remembers which ones are.
 
-1. On the Mac to be watched, turn on sharing (`lstack remote share on`, or **Settings → Machines → Share this Mac**). Then run `lstack remote pair` or click **Show Pairing Code**. You get a one-time code, valid for 10 minutes. Sharing doesn't need the web dashboard.
-2. On your Mac, run `lstack machine add <address> --code XXXX-XXXX`, or use **Settings → Machines**. You can also sign in with the other Mac's dashboard login (`--user`, plus 2FA if it is on).
+Each paired Mac's web servers are also **forwarded to this Mac automatically**. A service on the other Mac at `127.0.0.1:3000` shows up here as `http://localhost:3000`, marked 🔒 "via studio" in every interface. Everything goes through one end-to-end encrypted link per Mac.
+
+1. On the Mac to be watched, set a dashboard login (`lstack remote on --local`, or **Settings → General → Web dashboard**). Turn on 2FA if you can. Then turn on sharing (`lstack remote share on`, or **Settings → Machines → Share this Mac**) and run `lstack remote pair` or click **Show Pairing Code**. You get a one-time code, valid for 10 minutes. The web dashboard itself can stay off.
+2. On your Mac, run `lstack machine pair studio.local --code XXXX-XXXX`, or use **Settings → Machines**. It asks for the other Mac's dashboard username, password and 2FA code. Both Macs then show the same four-word phrase, which you can compare if you want to be sure.
 
 ```sh
-lstack machine ls                 # status, service counts, access
+lstack machine ls                 # status, address, access granted to you
+lstack machine id                 # this install's key fingerprint; `machine rekey` replaces it
 lstack ls --machine studio        # or --local
 lstack logs api@studio -f         # name@machine works for logs/show/start/stop/restart/metrics
 lstack ps --machine studio
+lstack forwards                   # paired Macs' services forwarded to localhost
+lstack forwards pause web@studio  # or resume
 lstack machine rename studio mini
 lstack machine rm mini
-lstack remote peers               # on the watched Mac: who's watching; `rm <id>` revokes
+
+# on the watched Mac
+lstack remote peers               # paired Macs, their access and link state
+lstack remote grant laptop control --tunnel web,api   # or no-control, --tunnel all|none
+lstack remote revoke laptop       # unpair now: its link and tunnels drop
+lstack remote activity            # links, pairings, tunnels and refusals
 ```
 
-- **Control.** Start, stop and restart are allowed only when the watched Mac allows it (**Paired Macs can start / stop / restart** in Settings → Machines, the same setting as the web dashboard's). Turning sharing off (`lstack remote share off`) disconnects watchers until it is back on; their tokens are kept. Otherwise its services are read-only.
-- **Auth.** Each pairing gets its own long-lived bearer token. The watched Mac stores it only as a SHA-256 hash in `remote.json`. Revoking it cuts off that machine's live streams immediately.
+- **Access per Mac.** A new pairing can view and tunnel to all services but can't control them. On the watched Mac, change this per paired Mac: start/stop/restart, and tunnels to all services, none, or a list (Settings → Machines → Share this Mac, or `lstack remote grant`). Changes apply at once: the link reconnects with the new grants. Turning sharing off drops every link; pairings are kept.
+- **Forwards.** Forwards appear only for granted services and only for ports that service is listening on *right now*. The watched Mac checks this again for every connection, so another program sitting on a stopped service's port is refused. It only ever connects to its own loopback. On this Mac, forwards listen only on 127.0.0.1/::1 and keep the same port number when it's free (otherwise a remembered fallback, saved in `forwards.json`). Each connection must come from a process owned by your macOS user.
 - **No secrets cross.** Secret values are never sent, env values and ping URLs are redacted, and logs are scrubbed on the watched Mac before they're sent.
-- **Plain HTTP.** As with the dashboard, use a trusted network or a VPN such as Tailscale.
+- **Upgrading from an older LStack.** Old pairings used bearer tokens over plain HTTP and are no longer accepted. They show as **pair again**: get a new code on the other Mac and pair again; the name is kept.
+
+### Security model
+
+Each LStack install has its own X25519 key pair. The private key is kept in the secret store (encrypted, split between the Keychain and a 0600 file) and never leaves the Mac. Pairing ties two installs together; after that, only those two keys can talk.
+
+- **Pairing.** The two Macs run SPAKE2 over the one-time code, so the code never crosses the network and an attacker gets one online guess. Three wrong tries burn it. The dashboard login and 2FA code go only inside that encrypted session and must also be right. Then both Macs swap and pin each other's public key.
+- **The link.** One TCP connection per paired Mac to the watched Mac's link port (default **7381**, `--link-port`), using **Noise IK** (X25519, ChaCha20-Poly1305, BLAKE2s). It's mutually authenticated by the pinned keys and forward-secret. Status, logs, control, `exec` and tunnels are typed streams multiplexed over it, and each stream is checked against that Mac's grants when it opens. The link port speaks nothing but Noise. Unknown keys are refused and logged, and failed pairings count toward a per-address lockout.
+- **No shared secrets stored.** `peers.json` and `remote.json` hold only public keys, names and grants, so copying them gives nothing.
+
+| Attacker | Result |
+|---|---|
+| Watches the network | Sees only Noise ciphertext; the pairing code and login are never sent in the clear |
+| Man-in-the-middle during pairing | One guess at the code, then it's burned |
+| Man-in-the-middle later | Handshake fails without both pinned private keys |
+| Copies `peers.json` / `remote.json` | Gets public keys only |
+| Knows the dashboard password only | Can't pair without a live code from the other Mac's screen |
+| Sees the pairing code only | Can't pair without the password (and 2FA) |
+| Another macOS user on your Mac | Their connections to forwarded ports are refused |
+| Another app running as you | Can use forwards, just like your browser can (same trust as your user) |
+| A compromised paired Mac | Limited to its grants: granted services' own ports on the loopback; audited and revocable |
+
+Not supported: reverse tunnels, UDP, and relays or NAT traversal. Use the LAN or a VPN such as Tailscale to reach the link port.
+
+**Future: screen sharing.** The link's typed streams are built so that screen sharing can be added later as two more stream kinds, each with its own grant and a consent prompt on the shared Mac: `screen` (ScreenCaptureKit capture, VideoToolbox H.264/HEVC frames) and `input` (CGEvent injection; needs Accessibility). Those frames would use the same Noise link with no extra crypto. This isn't implemented yet.
 
 ## Busy processes
 

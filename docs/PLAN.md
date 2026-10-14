@@ -73,6 +73,17 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | Web vs sharing | The web dashboard (`enabled`, plus `webRemote`: this Mac only or other devices) and sharing with paired Macs (`sharing`) are independent switches on the same listener. It binds to loopback unless something is remote, and requests are gated per path and client IP. `lstack remote web local\|network`, `lstack remote share on\|off`; Settings → Web dashboard / Machines → Share this Mac. Old configs migrate to their previous behavior. |
 | Machine charts | The web dashboard has a per-machine overview (local and peers): CPU/memory sparklines in the list, plus whole-machine charts with LStack's share overlaid, tiles and busy processes. `/api/system` was added to the web API. |
 
+## Phase 1.8 — Encrypted machine links & automatic tunnels ✅ (done)
+
+| Area | Delivered |
+|---|---|
+| Identity | X25519 key pair per install, private half in the secret store. Fingerprint + 4-word phrase (`lstack machine id`), `lstack machine rekey` (all pairings must re-pair). |
+| Pairing | SPAKE2 over the one-time code (3 tries, then burned). The dashboard password + TOTP are sent only inside the PAKE-encrypted session. Keys are pinned on both sides and a confirmation phrase is shown. Per-IP lockout. |
+| Link | Dedicated link port (7381) speaking only Noise IK. A small multiplexer carries typed streams (`http` = the peer API router, `tunnel` = byte relay), each checked against the peer's grants. Plain-HTTP bearer `/peer/*` routes and tokens were removed; old pairings show "pair again". |
+| Grants | Per paired Mac: `control` and `tunnel` (all, none or a list). Settings → Share this Mac, `lstack remote grant/revoke/activity`, `/api/remote/peers`. Changes drop the link so new grants apply immediately. |
+| Forwards | Automatic localhost forwards (127.0.0.1/::1) for granted services' live ports, same port when free, remembered fallbacks (`forwards.json`). Same-user check via libproc, 128 connections per Mac, per-service pause (`lstack forwards`). The shared Mac re-checks port ownership on each open, dials only its loopback, and audits. URL chips show 🔒 "via <machine>" everywhere. |
+| Later | Built-in screen sharing as `screen` / `input` stream kinds with their own grants and consent (design note in the README). |
+
 ## Phase 2 — Daily-driver polish
 
 **Interaction**

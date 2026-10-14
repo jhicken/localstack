@@ -64,14 +64,21 @@ fn help() -> String {
   lstack remote share on|off     let paired Macs see this machine's services
   lstack remote passwd [--user <name>] [--password-stdin]
   lstack remote 2fa on|off       authenticator-app codes (TOTP) at sign-in
-  lstack remote pair             one-time code another Mac uses to watch this one (needs sharing)
-  lstack remote peers [rm <id>]  machines that watch this one (revoke access)
+  lstack remote share on|off [--link-port 7381]
+  lstack remote pair             one-time code another Mac uses to pair with this one (needs sharing + password)
+  lstack remote peers            Macs paired with this one, their access and link state
+  lstack remote grant <mac> [control|no-control] [--tunnel all|none|svc,svc]   what a paired Mac may do
+  lstack remote revoke <mac>     unpair a Mac now (its link and tunnels drop)
+  lstack remote activity         recent links, pairings, tunnels and refusals
 
 {}
-  lstack machine add studio.local --code K7QP-3M9X [--name studio]
-  lstack machine add 100.64.1.2 --user admin     sign in with its dashboard password (+2FA)
+  lstack machine pair studio.local --code K7QP-3M9X [--user admin] [--name studio]
+                                 needs that Mac's pairing code AND its dashboard password (+2FA)
+  lstack machine id              this install's key fingerprint     lstack machine rekey
   lstack ls                      services grouped by machine; address them as name@machine
   lstack logs api@studio -f      lstack restart worker@studio
+  lstack forwards                services of paired Macs forwarded to localhost (encrypted link)
+  lstack forwards pause|resume web@studio
 
 {}
   lstack heartbeat key                           healthchecks.io project ping key (stored encrypted)
@@ -130,6 +137,7 @@ pub fn main(argv: Vec<String>) -> i32 {
         "terminal" => cmd_terminal(&rest),
         "secret" | "secrets" => crate::cli_more::cmd_secret(&rest),
         "machine" | "machines" => crate::cli_more::cmd_machine(&rest),
+        "forwards" | "forward" | "tunnels" => crate::cli_more::cmd_forwards(&rest),
         "ps" | "processes" => crate::cli_more::cmd_ps(&rest),
         "heartbeat" | "heartbeats" | "hc" => crate::cli_more::cmd_heartbeat(&rest),
         "startup" => cmd_startup(&rest),
@@ -239,7 +247,11 @@ fn url_cell(s: &ServiceState) -> String {
         None => c::dim("—"),
         Some(u) => {
             let more = if s.urls.len() > 1 { c::dim(&format!(" +{}", s.urls.len() - 1)) } else { String::new() };
-            let warn = if u.local_only && s.machine.is_some() { c::yellow(" (local only)") } else { String::new() };
+            let warn = match &u.via {
+                Some(m) => c::dim(&format!(" (via {m})")),
+                None if u.local_only && s.machine.is_some() => c::yellow(" (local only)"),
+                None => String::new(),
+            };
             format!("{}{warn}{more}", c::cyan(&u.url))
         }
     }
@@ -351,7 +363,11 @@ fn cmd_show(args: &[String]) -> R {
     }
     for u in &s.urls {
         let label = u.label.as_deref().map(|l| format!(" {}", c::dim(l))).unwrap_or_default();
-        let note = if u.local_only { c::dim(if s.machine.is_some() { " (bound to localhost there: not reachable from here)" } else { " (localhost only)" }) } else { String::new() };
+        let note = match &u.via {
+            Some(m) => c::dim(&format!(" (forwarded from {m} over the encrypted link; port {})", u.port.map(|p| p.to_string()).unwrap_or_default())),
+            None if u.local_only => c::dim(if s.machine.is_some() { " (bound to localhost there: not reachable from here)" } else { " (localhost only)" }),
+            None => String::new(),
+        };
         kv.push(("url", format!("{}{label}{note}", c::cyan(&u.url))));
     }
     if let Some(hb) = &s.config.heartbeat {
@@ -543,7 +559,7 @@ fn cmd_edit(args: &[String]) -> R {
     Ok(())
 }
 
-fn confirm(q: &str) -> bool {
+pub(crate) fn confirm(q: &str) -> bool {
     print!("{q} [y/N] ");
     let _ = std::io::stdout().flush();
     let mut s = String::new();
@@ -783,8 +799,13 @@ fn print_remote(v: &serde_json::Value) {
     println!("  {:<9} {}{pw}", c::dim("login"), v["username"].as_str().unwrap_or("?"));
     let tfa = if v["totp"].as_bool().unwrap_or(false) { c::green("on (authenticator code required)") } else { c::dim("off — lstack remote 2fa on") };
     println!("  {:<9} {tfa}", c::dim("2fa"));
-    let access = if v["allowControl"].as_bool().unwrap_or(false) { "view + start/stop/restart" } else { "read-only" };
-    println!("  {:<9} {access}", c::dim("access"));
+    if web {
+        let access = if v["allowControl"].as_bool().unwrap_or(false) { "view + start/stop/restart" } else { "read-only" };
+        println!("  {:<9} {access}", c::dim("web"));
+    }
+    if share {
+        println!("  {:<9} {} paired Mac(s) — lstack remote peers", c::dim("paired"), v["pairedMachines"].as_u64().unwrap_or(0));
+    }
     if let Some(e) = v["error"].as_str() {
         println!("  {:<9} {}", c::dim("error"), c::red(e));
     }
@@ -792,10 +813,13 @@ fn print_remote(v: &serde_json::Value) {
         println!("  {:<9} {}", c::dim("web"), c::cyan(u.as_str().unwrap_or("")));
     }
     for u in v["shareUrls"].as_array().into_iter().flatten() {
-        println!("  {:<9} {}", c::dim("share"), c::cyan(u.as_str().unwrap_or("")));
+        println!("  {:<9} {}", c::dim("link"), c::cyan(u.as_str().unwrap_or("")));
     }
-    if running && (share || v["webRemote"].as_bool().unwrap_or(false)) {
-        println!("{}", c::dim("  Plain HTTP: use on a trusted network or over a VPN such as Tailscale."));
+    if share {
+        println!("{}", c::dim("  Paired Macs connect over an encrypted, key-pinned link (Noise) on the link port."));
+    }
+    if web && v["webRemote"].as_bool().unwrap_or(false) {
+        println!("{}", c::dim("  The web dashboard is plain HTTP: use it on a trusted network or over a VPN such as Tailscale."));
     }
 }
 
@@ -808,6 +832,8 @@ fn cmd_remote(args: &[String]) -> R {
             ("bind", "", true),
             ("allow-control", "", false),
             ("read-only", "", false),
+            ("link-port", "", true),
+            ("tunnel", "", true),
             ("password-stdin", "", false),
             ("code", "", true),
             ("json", "", false),
@@ -817,8 +843,8 @@ fn cmd_remote(args: &[String]) -> R {
     )?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("status");
-    if matches!(sub, "pair" | "peers") {
-        return crate::cli_more::cmd_remote_peers(&cl, sub, &a.pos[1..], a.has("json"));
+    if matches!(sub, "pair" | "peers" | "grant" | "revoke" | "activity") {
+        return crate::cli_more::cmd_remote_peers(&cl, sub, &a.pos[1..], a.get("tunnel"), a.has("json"));
     }
     if matches!(sub, "2fa" | "totp" | "otp") {
         return remote_2fa(&cl, a.pos.get(1).map(String::as_str).unwrap_or("status"), a.get("code"));
@@ -833,6 +859,9 @@ fn cmd_remote(args: &[String]) -> R {
     }
     if let Some(b) = a.get("bind") {
         patch.insert("bind".into(), json!(b));
+    }
+    if let Some(p) = a.get("link-port") {
+        patch.insert("linkPort".into(), json!(p.parse::<u16>().map_err(|_| format!("invalid port {p}"))?));
     }
     if a.has("allow-control") {
         patch.insert("allowControl".into(), json!(true));

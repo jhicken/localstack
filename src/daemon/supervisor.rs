@@ -1068,7 +1068,7 @@ fn service_urls(m: &Managed, listen: &HashMap<i32, Vec<procinfo::Listen>>) -> Ve
             label: u.label().map(String::from),
             port: url_port(u.url()),
             source: "config".into(),
-            local_only: false,
+            ..Default::default()
         })
         .collect();
     if m.cfg.detect_urls == Some(false) {
@@ -1083,9 +1083,10 @@ fn service_urls(m: &Managed, listen: &HashMap<i32, Vec<procinfo::Listen>>) -> Ve
     for (port, local_only) in ports {
         if let Some(c) = out.iter_mut().find(|u| u.port == Some(port)) {
             c.local_only = local_only;
+            c.listening = true;
             continue;
         }
-        out.push(ServiceUrl { url: format!("http://localhost:{port}"), label: None, port: Some(port), source: "detected".into(), local_only });
+        out.push(ServiceUrl { url: format!("http://localhost:{port}"), port: Some(port), source: "detected".into(), local_only, listening: true, ..Default::default() });
     }
     out
 }

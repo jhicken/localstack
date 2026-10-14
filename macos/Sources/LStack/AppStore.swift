@@ -589,19 +589,24 @@ final class AppStore {
 
     // MARK: machines
 
-    func addMachine(url: String, code: String?, username: String?, password: String?, totp: String?, name: String?) async -> String? {
-        guard let client else { return DaemonError.notRunning.localizedDescription }
-        var body: [String: String] = ["url": url]
-        if let code, !code.isEmpty { body["code"] = code }
-        if let username, !username.isEmpty { body["username"] = username }
-        if let password, !password.isEmpty { body["password"] = password }
+    /// Pair with another Mac: its one-time code plus its dashboard login (+2FA). Returns the result or an error.
+    func addMachine(address: String, code: String, username: String, password: String, totp: String?, name: String?) async -> Result<PairResult, Error> {
+        guard let client else { return .failure(DaemonError.notRunning) }
+        var body: [String: String] = ["address": address, "code": code, "username": username, "password": password]
         if let totp, !totp.isEmpty { body["totp"] = totp }
         if let name, !name.isEmpty { body["name"] = name }
         do {
-            let m = try await client.send("POST", "/api/machines", body: body, as: Machine.self)
-            if !machines.contains(where: { $0.name == m.name }) { machines.append(m); machines.sort { $0.name < $1.name } }
-            return nil
-        } catch { return error.localizedDescription }
+            let r = try await client.send("POST", "/api/machines", body: body, as: PairResult.self)
+            await refreshMachines()
+            return .success(r)
+        } catch { return .failure(error) }
+    }
+
+    func refreshMachines() async {
+        struct List: Decodable { let machines: [Machine] }
+        if let l = try? await client?.send("GET", "/api/machines", as: List.self) {
+            machines = l.machines.sorted { $0.name < $1.name }
+        }
     }
 
     func removeMachine(_ name: String) async -> String? {
@@ -626,8 +631,44 @@ final class AppStore {
         return try await client.send("POST", "/api/remote/pair-code", as: PairCode.self)
     }
 
-    func peerTokens() async -> [PeerToken] {
-        (try? await client?.send("GET", "/api/remote/peers", as: [PeerToken].self)) ?? []
+    func sharedPeers() async -> [SharedPeer] {
+        (try? await client?.send("GET", "/api/remote/peers", as: [SharedPeer].self)) ?? []
+    }
+
+    func setGrants(_ id: String, _ grants: PeerGrants) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            _ = try await client.send("PATCH", "/api/remote/peers/\(id.urlPath)", body: grants, as: [SharedPeer].self)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func linkActivity() async -> LinkActivity? {
+        try? await client?.send("GET", "/api/remote/activity", as: LinkActivity.self)
+    }
+
+    func linkIdentity() async -> LinkIdentity? {
+        try? await client?.send("GET", "/api/identity", as: LinkIdentity.self)
+    }
+
+    func rekey() async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            _ = try await client.send("POST", "/api/identity/rekey", as: LinkIdentity.self)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    func forwards() async -> [ForwardInfo] {
+        (try? await client?.send("GET", "/api/forwards", as: [ForwardInfo].self)) ?? []
+    }
+
+    func setForwardPaused(_ f: ForwardInfo, _ paused: Bool) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            _ = try await client.send("POST", "/api/forwards/\(paused ? "pause" : "resume")", body: ["machine": f.machine, "service": f.service], as: [ForwardInfo].self)
+            return nil
+        } catch { return error.localizedDescription }
     }
 
     func revokePeer(_ id: String) async -> String? {

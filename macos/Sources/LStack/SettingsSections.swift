@@ -186,27 +186,41 @@ struct SecretsSettings: View {
 
 struct MachinesSettings: View {
     @Environment(AppStore.self) private var store
-    @State private var url = ""
-    @State private var method = 0
+    @State private var address = ""
     @State private var code = ""
-    @State private var user = ""
+    @State private var user = "admin"
     @State private var pass = ""
     @State private var totp = ""
     @State private var label = ""
     @State private var busy = false
     @State private var error: String?
+    @State private var paired: PairResult?
     @State private var pair: PairCode?
-    @State private var tokens: [PeerToken] = []
+    @State private var peers: [SharedPeer] = []
+    @State private var identity: LinkIdentity?
+    @State private var forwards: [ForwardInfo] = []
+    @State private var activity: LinkActivity?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             SettingsCard {
                 SetupRow(icon: "desktopcomputer", tint: .blue, title: "Watch another Mac",
-                         detail: "See its services and busy processes here, in the CLI and the web dashboard. On the other Mac turn on “Share this Mac” (Settings → Machines), then use its pairing code or its dashboard login.") {
+                         detail: "See its services and busy processes here, in the CLI and the web dashboard, and reach its web servers on localhost through an encrypted link. On the other Mac turn on “Share this Mac”, show a pairing code, then enter it here with that Mac's dashboard login.") {
                     EmptyView()
                 }
                 Divider().padding(.leading, 52)
                 addForm.padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
+                if let paired {
+                    Divider().padding(.leading, 52)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label("Paired with \(paired.name)", systemImage: "lock.fill").font(.system(size: 12, weight: .semibold))
+                        if let p = paired.phrase {
+                            Text("Check that the other Mac shows the same words: **\(p)**").font(.system(size: 11))
+                        }
+                        if let g = paired.grants { Text("Access: \(g.summary)").font(.system(size: 10)).foregroundStyle(.secondary) }
+                    }
+                    .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
+                }
             }
             if !store.machines.isEmpty {
                 SettingsCard {
@@ -214,6 +228,15 @@ struct MachinesSettings: View {
                         if i > 0 { Divider().padding(.leading, 12) }
                         machineRow(m)
                     }
+                }
+            }
+            if !forwards.isEmpty {
+                SettingsCard {
+                    VStack(alignment: .leading, spacing: 4) {
+                        sectionTitle("Forwarded to this Mac")
+                        ForEach(forwards) { f in forwardRow(f) }
+                    }
+                    .padding(12)
                 }
             }
             SettingsCard {
@@ -232,10 +255,6 @@ struct MachinesSettings: View {
                 if sharing, let r = store.remote {
                     Divider().padding(.leading, 52)
                     VStack(alignment: .leading, spacing: 6) {
-                        Toggle("Paired Macs can start / stop / restart (also applies to the web dashboard)", isOn: Binding(
-                            get: { r.allowControl },
-                            set: { v in Task { error = await store.updateRemote(RemotePatch(allowControl: v)) } }))
-                            .toggleStyle(.checkbox).font(.system(size: 11))
                         if let e = r.error { Text(e).font(.system(size: 11)).foregroundStyle(.red) }
                         ForEach(r.shareUrls ?? [], id: \.self) { u in
                             Label(u, systemImage: "network").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
@@ -257,85 +276,79 @@ struct MachinesSettings: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Expires ") + Text(Date(timeIntervalSince1970: pair.expiresAt / 1000), style: .relative)
                             if let u = pair.urls.first { Text("Address: \(u)").textSelection(.enabled) }
+                            Text(pair.totp == true ? "Also needs this Mac's dashboard login and a 2FA code." : "Also needs this Mac's dashboard login.")
                         }
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     }
                     .padding(.leading, 52).padding(.vertical, 10)
                 }
-                if !tokens.isEmpty {
+                if !peers.isEmpty {
                     Divider().padding(.leading, 52)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Watched by").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).textCase(.uppercase)
-                        ForEach(tokens) { t in
-                            HStack {
-                                Image(systemName: "eye").font(.system(size: 10)).foregroundStyle(.secondary)
-                                Text(t.name).font(.system(size: 12))
-                                Group {
-                                    if let s = t.lastSeen {
-                                        Text("seen ") + Text(Date(timeIntervalSince1970: s / 1000), style: .relative) + Text(" ago")
-                                    } else {
-                                        Text("never connected")
-                                    }
-                                }
-                                .font(.system(size: 10)).foregroundStyle(.secondary)
-                                Spacer()
-                                Button("Revoke", role: .destructive) {
-                                    Task {
-                                        error = await store.revokePeer(t.id)
-                                        tokens = await store.peerTokens()
-                                    }
-                                }
-                                .controlSize(.small)
-                            }
-                        }
+                    VStack(alignment: .leading, spacing: 8) {
+                        sectionTitle("Paired Macs")
+                        ForEach(peers) { p in peerRow(p) }
                     }
                     .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
                 }
+                if let a = activity, !(a.events.isEmpty && a.tunnels.isEmpty) {
+                    Divider().padding(.leading, 52)
+                    activityView(a).padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
+                }
+                Divider().padding(.leading, 52)
+                identityRow.padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
             }
             ErrorText(text: error)
         }
         .task {
             await store.refreshRemote()
-            tokens = await store.peerTokens()
+            while !Task.isCancelled {
+                await reload()
+                try? await Task.sleep(for: .seconds(5))
+            }
         }
+    }
+
+    private func reload() async {
+        peers = await store.sharedPeers()
+        identity = await store.linkIdentity()
+        forwards = await store.forwards()
+        activity = sharing ? await store.linkActivity() : nil
     }
 
     private var sharing: Bool { store.remote?.sharing ?? false }
 
     private var pairDetail: String {
         if !sharing {
-            return "Let other Macs watch this one's services and busy processes. Independent of the web dashboard; paired Macs never see secrets."
+            return "Let other Macs watch this one and reach the services you allow. Needs the web dashboard's login (Settings → General) — pairing asks for it plus a one-time code. Paired Macs never see secrets."
         }
-        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below, or sign in there with this Mac's dashboard login. Plain HTTP — use a trusted network or a VPN like Tailscale."
+        let port = store.remote?.linkPort.map { " (port \($0))" } ?? ""
+        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below and this Mac's dashboard login. Everything between paired Macs is end-to-end encrypted\(port) and tied to each Mac's own key."
+    }
+
+    private func sectionTitle(_ t: String) -> some View {
+        Text(t).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).textCase(.uppercase)
     }
 
     private var addForm: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                TextField("Address, e.g. studio.tail1234.ts.net or 192.168.1.20:7380", text: $url)
+                TextField("Address, e.g. studio.local or 192.168.1.20", text: $address)
                 TextField("Name (optional)", text: $label).frame(width: 120)
             }
-            Picker("", selection: $method) {
-                Text("Pairing code").tag(0)
-                Text("Dashboard login").tag(1)
-            }
-            .pickerStyle(.segmented).labelsHidden().frame(width: 260)
             HStack(spacing: 6) {
-                if method == 0 {
-                    TextField("XXXX-XXXX", text: $code).font(.system(size: 12, design: .monospaced)).frame(width: 120)
-                } else {
-                    TextField("Username", text: $user).frame(width: 110)
-                    SecureField("Password", text: $pass).frame(width: 120)
-                    TextField("2FA code", text: $totp).frame(width: 80)
-                }
+                TextField("Code XXXX-XXXX", text: $code).font(.system(size: 12, design: .monospaced)).frame(width: 120)
+                TextField("Username", text: $user).frame(width: 90)
+                SecureField("Password", text: $pass).frame(width: 110)
+                TextField("2FA", text: $totp).frame(width: 60)
                 Spacer()
                 Button {
                     add()
                 } label: {
-                    if busy { ProgressView().controlSize(.small) } else { Text("Add Machine") }
+                    if busy { ProgressView().controlSize(.small) } else { Text("Pair") }
                 }
-                .disabled(busy || url.isEmpty || (method == 0 ? code.isEmpty : pass.isEmpty))
+                .disabled(busy || address.isEmpty || code.isEmpty || pass.isEmpty)
             }
+            Text("Leave 2FA empty if that Mac doesn't use it.").font(.system(size: 10)).foregroundStyle(.tertiary)
         }
         .textFieldStyle(.roundedBorder)
         .controlSize(.small)
@@ -345,12 +358,22 @@ struct MachinesSettings: View {
         HStack(spacing: 8) {
             MachineHeader(name: m.name, status: m.status, detail: nil).fixedSize()
             VStack(alignment: .leading, spacing: 1) {
-                Text(m.url ?? "").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                Text(m.address ?? m.url ?? "").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
                 Text(statusLine(m)).font(.system(size: 10)).foregroundStyle(m.online ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange)).lineLimit(2)
+                if let f = m.fingerprint {
+                    Text(f).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary).textSelection(.enabled)
+                }
             }
             Spacer()
+            if m.needsRepair {
+                Button("Pair Again") {
+                    address = m.address ?? m.hostname ?? m.name
+                    label = m.name
+                }
+                .controlSize(.small)
+            }
             Button(role: .destructive) {
-                Task { error = await store.removeMachine(m.name) }
+                Task { error = await store.removeMachine(m.name); await reload() }
             } label: { Text("Remove") }
                 .controlSize(.small)
         }
@@ -358,21 +381,147 @@ struct MachinesSettings: View {
     }
 
     private func statusLine(_ m: Machine) -> String {
+        if m.status == "repair" { return "Paired with an older LStack — pair again (needs a new code)" }
         if !m.online { return m.error ?? m.status }
         let n = m.services?.count ?? 0
-        return "\(n) service\(n == 1 ? "" : "s") · \(m.canControl ? "can control" : "read-only")\(m.version.map { " · v\($0)" } ?? "")"
+        let access = m.grants?.summary ?? (m.canControl ? "can control" : "read-only")
+        return "🔒 \(n) service\(n == 1 ? "" : "s") · \(access)\(m.version.map { " · v\($0)" } ?? "")"
+    }
+
+    private func forwardRow(_ f: ForwardInfo) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: f.paused ? "pause.circle" : (f.online ? "lock.fill" : "lock.slash"))
+                .font(.system(size: 10)).foregroundStyle(f.online && !f.paused ? Color.teal : .secondary)
+            Text("\(f.service)@\(f.machine)").font(.system(size: 12))
+            Text(":\(f.port)").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+            Image(systemName: "arrow.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+            if let u = f.url, !f.paused {
+                Button(u) { if let url = URL(string: u) { NSWorkspace.shared.open(url) } }
+                    .buttonStyle(.link).font(.system(size: 11, design: .monospaced))
+            } else {
+                Text(f.paused ? "paused" : (f.error ?? "—")).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            if f.connections > 0 { Text("\(f.connections) open").font(.system(size: 10)).foregroundStyle(.tertiary) }
+            Spacer()
+            Button(f.paused ? "Resume" : "Pause") {
+                Task { error = await store.setForwardPaused(f, !f.paused); forwards = await store.forwards() }
+            }
+            .controlSize(.small)
+        }
+    }
+
+    private func peerRow(_ p: SharedPeer) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Circle().fill(p.online == true ? Color.green : Color.gray).frame(width: 7, height: 7)
+                Text(p.name).font(.system(size: 12, weight: .medium))
+                Group {
+                    if p.online == true {
+                        Text("connected\(p.address.map { " from \($0)" } ?? "")")
+                    } else if let s = p.lastSeen {
+                        Text("seen ") + Text(Date(timeIntervalSince1970: s / 1000), style: .relative) + Text(" ago")
+                    } else {
+                        Text("never connected")
+                    }
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                Button("Revoke", role: .destructive) {
+                    Task { error = await store.revokePeer(p.id); await reload() }
+                }
+                .controlSize(.small)
+            }
+            HStack(spacing: 12) {
+                Toggle("Start / stop / restart", isOn: Binding(get: { p.grants.control }, set: { v in
+                    var g = p.grants
+                    g.control = v
+                    update(p, g)
+                }))
+                Toggle("Tunnels to its services", isOn: Binding(get: { p.grants.tunnel != .none }, set: { v in
+                    var g = p.grants
+                    g.tunnel = v ? .all : .none
+                    update(p, g)
+                }))
+                if case .only(let l) = p.grants.tunnel {
+                    Text("(only \(l.joined(separator: ", ")))").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.checkbox).font(.system(size: 11)).padding(.leading, 13)
+            if let f = p.fingerprint {
+                Text([f, p.phrase].compactMap { $0 }.joined(separator: " · "))
+                    .font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary).textSelection(.enabled).padding(.leading, 13)
+            }
+        }
+    }
+
+    private func update(_ p: SharedPeer, _ g: PeerGrants) {
+        Task {
+            error = await store.setGrants(p.id, g)
+            peers = await store.sharedPeers()
+        }
+    }
+
+    private func activityView(_ a: LinkActivity) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            sectionTitle("Activity")
+            ForEach(a.tunnels, id: \.self) { t in
+                Text("\(t.peer) → \(t.service):\(t.port) · \(t.connections) connection\(t.connections == 1 ? "" : "s") · \(ByteCountFormatter.string(fromByteCount: Int64(t.bytes), countStyle: .file))")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            ForEach(Array(a.events.prefix(8).enumerated()), id: \.offset) { _, e in
+                HStack(spacing: 4) {
+                    Text(Date(timeIntervalSince1970: e.at / 1000), style: .time).foregroundStyle(.tertiary)
+                    Text(describe(e)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .font(.system(size: 10))
+            }
+        }
+    }
+
+    private func describe(_ e: LinkActivity.Event) -> String {
+        var parts = [e.event.replacingOccurrences(of: "-", with: " ")]
+        if let p = e.peer { parts.append(p) }
+        if let s = e.service { parts.append(e.port.map { "\(s):\($0)" } ?? s) }
+        if let a = e.address { parts.append("from \(a)") }
+        if let r = e.reason { parts.append("— \(r)") }
+        return parts.joined(separator: " ")
+    }
+
+    private var identityRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "key.fill").font(.system(size: 10)).foregroundStyle(.secondary)
+            Text("This Mac's key").font(.system(size: 11))
+            Text(identity?.fingerprint ?? "…").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+            Spacer()
+            Button("New Key…") {
+                let a = NSAlert()
+                a.messageText = "Replace this Mac's key?"
+                a.informativeText = "Every Mac paired with this one (in both directions) will have to pair again."
+                a.addButton(withTitle: "Replace Key")
+                a.addButton(withTitle: "Cancel")
+                a.alertStyle = .warning
+                guard a.runModal() == .alertFirstButtonReturn else { return }
+                Task { error = await store.rekey(); await reload() }
+            }
+            .controlSize(.small)
+        }
     }
 
     private func add() {
         busy = true
         error = nil
+        paired = nil
         Task {
-            error = await store.addMachine(url: url, code: method == 0 ? code : nil,
-                                           username: method == 1 ? user : nil, password: method == 1 ? pass : nil,
-                                           totp: method == 1 ? totp : nil, name: label)
-            busy = false
+            switch await store.addMachine(address: address, code: code, username: user, password: pass, totp: totp, name: label) {
+            case .success(let r):
+                paired = r
+                address = ""; code = ""; totp = ""; label = ""
+            case .failure(let e):
+                error = e.localizedDescription
+            }
             pass = ""
-            if error == nil { url = ""; code = ""; totp = ""; label = "" }
+            busy = false
+            await reload()
         }
     }
 }

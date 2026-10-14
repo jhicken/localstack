@@ -45,7 +45,7 @@ struct PopoverView: View {
                             ProcessList(processes: store.processes, key: Self.localKey)
                         }
                         ForEach(store.machines) { m in
-                            MachineHeader(name: m.name, status: m.status, detail: m.online ? (m.canControl ? nil : "read-only") : (m.error ?? m.status),
+                            MachineHeader(name: m.name, status: m.status, detail: m.online ? (m.canControl ? nil : "view only") : (m.status == "repair" ? "pair again in Settings" : (m.error ?? m.status)),
                                           count: m.services?.count ?? 0, collapsed: isCollapsed(m.name)) { toggle(m.name) }
                                 .padding(.top, 10)
                             if !isCollapsed(m.name) {
@@ -357,6 +357,7 @@ struct MachineHeader: View {
         case "online": return .green
         case "connecting": return .yellow
         case "unauthorized": return .red
+        case "repair": return .orange
         default: return .gray
         }
     }

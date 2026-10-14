@@ -212,6 +212,12 @@ pub struct ServiceUrl {
     /// Bound to loopback only: reachable from this machine but not from other machines.
     #[serde(default)]
     pub local_only: bool,
+    /// A socket of the service's own processes is listening on this port right now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub listening: bool,
+    /// Reached through the encrypted link to this machine (a local forward); the URL is on this Mac.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub via: Option<String>,
 }
 
 /// Outcome of the latest healthchecks.io ping.

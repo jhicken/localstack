@@ -118,6 +118,8 @@ struct ServiceURL: Codable, Hashable {
     let port: Int?
     let source: String
     let localOnly: Bool?
+    /// Forwarded from this paired Mac over the encrypted link: the URL is on this Mac.
+    var via: String? = nil
 
     var display: String {
         if let label, !label.isEmpty { return label }
@@ -148,10 +150,14 @@ struct Machine: Codable, Identifiable, Equatable {
     var id: String { name }
     var name: String
     var url: String?
+    var address: String?
     var status: String
     var error: String?
     var hostname: String?
     var version: String?
+    var fingerprint: String?
+    /// What that Mac lets this one do (control + tunnels); `allowControl` mirrors `grants.control`.
+    var grants: PeerGrants?
     var allowControl: Bool?
     var lastSeen: Double?
     var services: [ServiceState]?
@@ -161,6 +167,57 @@ struct Machine: Codable, Identifiable, Equatable {
 
     var online: Bool { status == "online" }
     var canControl: Bool { allowControl ?? false }
+    /// Paired with an older LStack (before the encrypted link): must pair again.
+    var needsRepair: Bool { status == "repair" || status == "unauthorized" }
+}
+
+/// Per-Mac permissions: `{control, tunnel: "all" | "none" | [services]}`.
+struct PeerGrants: Codable, Equatable, Hashable {
+    enum Tunnel: Equatable, Hashable {
+        case all, none
+        case only([String])
+    }
+    var control: Bool
+    var tunnel: Tunnel
+
+    init(control: Bool, tunnel: Tunnel) {
+        self.control = control
+        self.tunnel = tunnel
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        control = (try? c.decode(Bool.self, forKey: .control)) ?? false
+        if let s = try? c.decode(String.self, forKey: .tunnel) {
+            tunnel = s == "all" ? .all : .none
+        } else if let list = try? c.decode([String].self, forKey: .tunnel) {
+            tunnel = list.isEmpty ? .none : .only(list)
+        } else {
+            tunnel = .none
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(control, forKey: .control)
+        switch tunnel {
+        case .all: try c.encode("all", forKey: .tunnel)
+        case .none: try c.encode("none", forKey: .tunnel)
+        case .only(let l): try c.encode(l, forKey: .tunnel)
+        }
+    }
+
+    enum CodingKeys: String, CodingKey { case control, tunnel }
+
+    var summary: String {
+        let t: String
+        switch tunnel {
+        case .all: t = "tunnels to all services"
+        case .none: t = "no tunnels"
+        case .only(let l): t = "tunnels to \(l.joined(separator: ", "))"
+        }
+        return "\(control ? "view + control" : "view only") · \(t)"
+    }
 }
 
 struct MachinesEvent: Decodable {
@@ -241,13 +298,73 @@ struct PairCode: Decodable {
     let code: String
     let expiresAt: Double
     let urls: [String]
+    /// A 2FA code is needed too.
+    var totp: Bool?
 }
 
-struct PeerToken: Decodable, Identifiable {
+/// What `POST /api/machines` returns: the new machine plus the pairing's confirmation phrase.
+struct PairResult: Decodable {
+    let name: String
+    let phrase: String?
+    let fingerprint: String?
+    let grants: PeerGrants?
+}
+
+/// A Mac paired with this one (this Mac's side, `GET /api/remote/peers`).
+struct SharedPeer: Decodable, Identifiable, Equatable {
     let id: String
     let name: String
+    let fingerprint: String?
+    let phrase: String?
+    let grants: PeerGrants
     let createdAt: Double
     let lastSeen: Double?
+    let online: Bool?
+    let address: String?
+    let streams: Int?
+}
+
+/// This install's link key.
+struct LinkIdentity: Decodable {
+    let name: String
+    let fingerprint: String
+}
+
+/// A paired Mac's service forwarded to localhost (`GET /api/forwards`).
+struct ForwardInfo: Decodable, Identifiable, Hashable {
+    var id: String { "\(machine)/\(service)/\(port)" }
+    let machine: String
+    let service: String
+    let port: Int
+    let localPort: Int?
+    let url: String?
+    let paused: Bool
+    let online: Bool
+    let connections: Int
+    let error: String?
+}
+
+/// Recent link activity on this Mac (`GET /api/remote/activity`).
+struct LinkActivity: Decodable {
+    struct Event: Decodable, Hashable {
+        let event: String
+        let at: Double
+        let peer: String?
+        let service: String?
+        let port: Int?
+        let address: String?
+        let reason: String?
+    }
+    struct Tunnel: Decodable, Hashable {
+        let peer: String
+        let service: String
+        let port: Int
+        let connections: Int
+        let bytes: Double
+        let lastAt: Double
+    }
+    let events: [Event]
+    let tunnels: [Tunnel]
 }
 
 /// Result of `POST /api/split-command`: leading `cd`/env/`source` steps peeled off a command.
@@ -403,6 +520,8 @@ struct RemoteStatus: Codable, Equatable {
     /// Paired Macs can watch this one.
     var sharing: Bool?
     var shareUrls: [String]?
+    var linkPort: Int?
+    var pairedMachines: Int?
 }
 
 struct RemotePatch: Encodable {
@@ -413,6 +532,7 @@ struct RemotePatch: Encodable {
     var username: String?
     var password: String?
     var allowControl: Bool?
+    var linkPort: Int?
 }
 
 struct TotpSetup: Decodable {

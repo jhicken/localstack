@@ -327,6 +327,70 @@ pub fn all_pids() -> Vec<i32> {
     buf
 }
 
+/// The pid (of this user's processes) holding the client end of a local TCP connection
+/// `127.0.0.1:client_port → :server_port`. Other users' processes can't be inspected, so `None` also
+/// means "not this user". `hint` pids are checked first.
+pub fn tcp_client_owner(client_port: u16, server_port: u16, hint: &[i32]) -> Option<i32> {
+    const PROC_PIDLISTFDS: libc::c_int = 1;
+    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    const PROX_FDTYPE_SOCKET: u32 = 2;
+    const SOCKINFO_TCP: i32 = 2;
+    // Offsets in `struct socket_fdinfo` (sys/proc_info.h), stable since 10.x.
+    const SIZE: usize = 792;
+    const SOI_KIND: usize = 256;
+    const FPORT: usize = 264;
+    const LPORT: usize = 268;
+    let me = unsafe { libc::getuid() };
+    let owns = |pid: i32| -> bool {
+        let mut bi: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, &mut bi as *mut _ as *mut libc::c_void, size) };
+        if n != size || bi.pbi_uid != me {
+            return false;
+        }
+        let mut fds = vec![0u64; 512];
+        let n = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.as_mut_ptr() as *mut libc::c_void, (fds.len() * 8) as libc::c_int) };
+        if n <= 0 {
+            return false;
+        }
+        let count = n as usize / 8;
+        let count = if count == fds.len() {
+            fds = vec![0u64; 8192];
+            let n = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.as_mut_ptr() as *mut libc::c_void, (fds.len() * 8) as libc::c_int) };
+            if n <= 0 {
+                return false;
+            }
+            n as usize / 8
+        } else {
+            count
+        };
+        let mut info = vec![0u8; SIZE];
+        for raw in &fds[..count] {
+            // struct proc_fdinfo { int32_t proc_fd; uint32_t proc_fdtype; }
+            let fd = (*raw & 0xffff_ffff) as i32;
+            let kind = (*raw >> 32) as u32;
+            if kind != PROX_FDTYPE_SOCKET {
+                continue;
+            }
+            let n = unsafe { libc::proc_pidfdinfo(pid, fd, PROC_PIDFDSOCKETINFO, info.as_mut_ptr() as *mut libc::c_void, SIZE as libc::c_int) };
+            if n as usize != SIZE {
+                continue;
+            }
+            let rd = |o: usize| i32::from_ne_bytes([info[o], info[o + 1], info[o + 2], info[o + 3]]);
+            if rd(SOI_KIND) != SOCKINFO_TCP {
+                continue;
+            }
+            let (lport, fport) = (u16::from_be(rd(LPORT) as u16), u16::from_be(rd(FPORT) as u16));
+            if lport == client_port && fport == server_port {
+                return true;
+            }
+        }
+        false
+    };
+    let rest = all_pids();
+    hint.iter().copied().chain(rest.into_iter().filter(|p| !hint.contains(p))).find(|&p| p != std::process::id() as i32 && owns(p))
+}
+
 /// Short process name (as in Activity Monitor), or None if we can't see the process.
 pub fn proc_name(pid: i32) -> Option<String> {
     let mut buf = [0u8; 256];
@@ -341,5 +405,19 @@ mod pid_tests {
         let me = std::process::id() as i32;
         assert!(super::all_pids().contains(&me));
         assert!(super::proc_name(me).is_some());
+    }
+
+    #[test]
+    fn finds_client_socket_owner() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        // The client side lives in a child process so it isn't this (excluded) pid.
+        let mut child = std::process::Command::new("/usr/bin/nc").args(["127.0.0.1", &port.to_string()]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        let (_s, peer) = l.accept().unwrap();
+        let owner = super::tcp_client_owner(peer.port(), port, &[]);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(owner, Some(child.id() as i32));
+        assert_eq!(super::tcp_client_owner(1, port, &[]), None);
     }
 }
