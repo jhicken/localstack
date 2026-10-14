@@ -5,6 +5,7 @@
 //! (`forwards.rs`) to the services it lets us tunnel to.
 use super::forwards::{self, Forwards};
 use super::link::{self, Mux};
+use super::remote::Transport;
 use super::server::ApiErr;
 use super::supervisor::{Event, Sup};
 use crate::paths::{self, now_ms};
@@ -23,8 +24,19 @@ use tokio::runtime::Handle;
 #[serde(rename_all = "camelCase", default)]
 pub struct PeerCfg {
     pub name: String,
-    /// Link address, e.g. studio.local:7381
+    /// Link address, e.g. studio.local:7381 (as entered when pairing).
     pub addr: String,
+    /// More LAN addresses it reported (`/peer/api/info`), tried in order after `addr`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
+    /// How the link travels. The other Mac's record wins: it's adopted from `/peer/api/info`.
+    pub transport: Transport,
+    /// Its tailnet (MagicDNS) name, when Tailscale is on there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tailnet_name: Option<String>,
+    /// A transport this Mac asked for that the other Mac hasn't applied yet (asked again on each connect).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_transport: Option<Transport>,
     /// The other Mac's install key (hex), pinned at pairing.
     pub public_key: String,
     pub added_at: i64,
@@ -48,6 +60,57 @@ impl PeerCfg {
             self.addr.clone()
         }
     }
+    /// LAN addresses to try, in order.
+    pub fn lan_addrs(&self) -> Vec<String> {
+        let mut v = vec![self.address()];
+        for a in &self.addrs {
+            if !v.contains(a) {
+                v.push(a.clone());
+            }
+        }
+        v
+    }
+    /// Its link address inside the tailnet.
+    pub fn tailnet_addr(&self) -> Option<String> {
+        self.tailnet_name.as_ref().map(|n| format!("{n}:{}", super::tailnet::TAILNET_PORT))
+    }
+}
+
+/// Open the link to a paired Mac over its transport: the tailnet helper, or each LAN address in turn.
+/// Returns the link and how/where it connected.
+pub async fn dial_link(cfg: &PeerCfg, id: &link::Identity, their: &[u8; 32], hello: Value) -> std::io::Result<(Arc<Mux>, Value, &'static str, String)> {
+    use std::io::{Error, ErrorKind};
+    let mut last = Error::new(ErrorKind::NotFound, "no address");
+    if cfg.transport == Transport::Tailscale {
+        let res = match cfg.tailnet_addr() {
+            None => Err(Error::new(ErrorKind::NotFound, "its Tailscale name isn't known yet — turn Tailscale on there")),
+            Some(target) => match super::tailnet::dial(&target).await {
+                Ok(s) => link::connect_over(s, id, their, hello.clone()).await.map(|(m, v)| (m, v, "tailscale", target)),
+                Err(e) => Err(Error::new(ErrorKind::ConnectionRefused, e)),
+            },
+        };
+        match res {
+            Ok(r) => return Ok(r),
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Err(e),
+            // Tailscale is down here (or restarting): on the same network the other Mac still accepts the LAN.
+            Err(e) => last = e,
+        }
+        for a in cfg.lan_addrs() {
+            if let Ok(Ok((m, v))) = tokio::time::timeout(Duration::from_secs(3), link::connect(&a, id, their, hello.clone())).await {
+                return Ok((m, v, "lan", a));
+            }
+        }
+        return Err(last);
+    }
+    for a in cfg.lan_addrs() {
+        match link::connect(&a, id, their, hello.clone()).await {
+            Ok((m, v)) => return Ok((m, v, "lan", a)),
+            // It answered and refused: another address won't change that.
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Err(e),
+            Err(e) => last = Error::new(e.kind(), format!("{a}: {e}")),
+        }
+    }
+    Err(last)
 }
 
 /// What the rest of the daemon publishes for one machine.
@@ -70,6 +133,12 @@ struct PeerState {
     last_seen: Option<i64>,
     stop: Arc<AtomicBool>,
     mux: Option<Arc<Mux>>,
+    /// How the current link connected ("lan" | "tailscale") and to which address.
+    via: Option<(&'static str, String)>,
+    /// Set to end the current wait or link and connect again right away.
+    kick: Arc<AtomicBool>,
+    /// A transport change in progress (or its last error): `{to, state, message}`.
+    change: Option<Value>,
 }
 
 pub struct Peers {
@@ -81,6 +150,37 @@ pub struct Peers {
 
 fn file() -> std::path::PathBuf {
     paths::home().join("peers.json")
+}
+
+/// An unpair notice still to be delivered to a Mac that was offline when it was removed here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Unpair {
+    addr: String,
+    public_key: String,
+    at: i64,
+    /// `addr` is inside the tailnet (reached through the helper).
+    #[serde(default)]
+    tailnet: bool,
+}
+
+fn unpairs_file() -> std::path::PathBuf {
+    paths::home().join("unpair.json")
+}
+
+fn load_unpairs() -> Vec<Unpair> {
+    std::fs::read(unpairs_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_unpairs(list: &[Unpair]) -> std::io::Result<()> {
+    if list.is_empty() {
+        return match std::fs::remove_file(unpairs_file()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(unpairs_file())?;
+    f.write_all(serde_json::to_string_pretty(list).unwrap_or_default().as_bytes())
 }
 
 fn load() -> Vec<PeerCfg> {
@@ -168,6 +268,8 @@ impl Peers {
         for cfg in load() {
             p.attach(cfg);
         }
+        let me = p.clone();
+        std::thread::Builder::new().name("peer-unpairs".into()).spawn(move || me.deliver_unpairs()).ok();
         p
     }
 
@@ -177,6 +279,7 @@ impl Peers {
 
     fn attach(self: &Arc<Self>, cfg: PeerCfg) {
         let stop = Arc::new(AtomicBool::new(false));
+        let kick = Arc::new(AtomicBool::new(false));
         let name = cfg.name.clone();
         self.inner.lock().unwrap().insert(
             name.clone(),
@@ -192,10 +295,13 @@ impl Peers {
                 last_seen: None,
                 stop: stop.clone(),
                 mux: None,
+                via: None,
+                kick: kick.clone(),
+                change: None,
             },
         );
         let me = self.clone();
-        std::thread::Builder::new().name(format!("peer-{name}")).spawn(move || me.run(&name, &stop)).ok();
+        std::thread::Builder::new().name(format!("peer-{name}")).spawn(move || me.run(&name, &stop, &kick)).ok();
     }
 
     fn set_status(&self, name: &str, status: &'static str, error: Option<String>) {
@@ -220,17 +326,58 @@ impl Peers {
     }
 
     fn sleep(stop: &AtomicBool, secs: u64) -> bool {
+        Self::wait(stop, None, secs)
+    }
+
+    /// Sleep up to `secs`; a kick ends it early. False when stopping.
+    fn wait(stop: &AtomicBool, kick: Option<&AtomicBool>, secs: u64) -> bool {
         for _ in 0..secs * 10 {
             if stop.load(Ordering::Relaxed) {
                 return false;
+            }
+            if kick.is_some_and(|k| k.swap(false, Ordering::SeqCst)) {
+                break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         !stop.load(Ordering::Relaxed)
     }
 
+    /// Connect to `name` again now: ends its backoff wait, or its current link when `drop_link`.
+    fn kick(&self, name: &str, drop_link: bool) {
+        let g = self.inner.lock().unwrap();
+        let Some(p) = g.get(name) else { return };
+        p.kick.store(true, Ordering::SeqCst);
+        if drop_link {
+            if let Some(m) = &p.mux {
+                m.shutdown();
+            }
+        }
+    }
+
+    /// Redial machines whose link is down now (after wake or a network change), skipping their backoff.
+    pub fn reconnect_down(&self) -> usize {
+        let g = self.inner.lock().unwrap();
+        let mut n = 0;
+        for p in g.values().filter(|p| !p.cfg.legacy() && p.mux.as_ref().is_none_or(|m| m.is_closed())) {
+            p.kick.store(true, Ordering::SeqCst);
+            n += 1;
+        }
+        n
+    }
+
+    fn set_change(&self, name: &str, change: Option<Value>) {
+        let summary = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(p) = g.get_mut(name) else { return };
+            p.change = change;
+            summary(p)
+        };
+        self.emit(name, "machine", summary);
+    }
+
     /// Connection loop for one peer (own thread; blocking on link I/O).
-    fn run(self: Arc<Self>, name: &str, stop: &AtomicBool) {
+    fn run(self: Arc<Self>, name: &str, stop: &AtomicBool, kick: &AtomicBool) {
         let mut backoff = 2u64;
         while !stop.load(Ordering::Relaxed) {
             let Some(cfg) = self.cfg(name) else { return };
@@ -241,10 +388,37 @@ impl Peers {
             }
             let r = self.session(name, &cfg, stop);
             let mux = self.inner.lock().unwrap().get_mut(name).and_then(|p| p.mux.take());
+            let farewell = mux.as_ref().and_then(|m| m.farewell());
             if let Some(m) = mux {
                 m.shutdown();
             }
             self.forwards.set_link(name, None);
+            // The other Mac changed how this link travels: follow it and redial now.
+            if let Some(t) = farewell.as_deref().and_then(|f| f.strip_prefix(link::BYE_TRANSPORT)).and_then(Transport::parse) {
+                println!("{} peers: {name} switched this link to {}", paths::iso(now_ms()), t.as_str());
+                self.update_cfg(name, |c| {
+                    c.transport = t;
+                    c.pending_transport = None;
+                });
+                self.set_change(name, None);
+                kick.store(true, Ordering::SeqCst);
+            }
+            if kick.swap(false, Ordering::SeqCst) {
+                backoff = 2;
+                self.set_status(name, "connecting", None);
+                if !Self::sleep(stop, 0) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            let revoked = farewell.as_deref() == Some(link::BYE_REVOKED) || matches!(&r, Err((401, e)) if e.contains(link::REFUSED_REVOKED));
+            if revoked {
+                // The other Mac unpaired this one: forget it here too (its tunnels close with it).
+                println!("{} peers: {name} revoked this Mac's access — forgetting it", paths::iso(now_ms()));
+                let _ = self.remove(name);
+                return;
+            }
             match r {
                 Ok(()) => backoff = 2,
                 Err((401, e)) => {
@@ -256,7 +430,7 @@ impl Peers {
                     backoff = (backoff * 2).min(60);
                 }
             }
-            if !Self::sleep(stop, backoff) {
+            if !Self::wait(stop, Some(kick), backoff) {
                 return;
             }
         }
@@ -279,20 +453,40 @@ impl Peers {
         let their = link::unhex32(&cfg.public_key).ok_or((401, "the saved key for this machine is invalid".to_string()))?;
         let addr = cfg.address();
         let hello = json!({ "name": local_name(), "version": paths::VERSION });
-        let (mux, _) = self.rt.block_on(link::connect(&addr, &id, &their, hello)).map_err(|e| {
+        let (mux, _, via, dialed) = self.rt.block_on(dial_link(cfg, &id, &their, hello)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 (401, e.to_string())
+            } else if cfg.transport == Transport::Tailscale {
+                (0, format!("can't reach it over Tailscale: {e}"))
             } else {
                 (0, format!("can't reach {addr}: {e}"))
             }
         })?;
         if let Some(p) = self.inner.lock().unwrap().get_mut(name) {
             p.mux = Some(mux.clone());
+            p.via = Some((via, dialed));
         } else {
             mux.shutdown();
             return Ok(());
         }
-        let info = self.request(&mux, "GET", "/info", None)?;
+        let mut info = self.request(&mux, "GET", "/info", None)?;
+        if let Some(t) = cfg.pending_transport.filter(|t| info["transport"].as_str().and_then(Transport::parse) != Some(*t)) {
+            // Asked for while it was offline (or waiting for approval there): ask again.
+            match self.request(&mux, "POST", "/transport", Some(&json!({ "transport": t.as_str() }))) {
+                Ok(r) if r["applied"] == true => {
+                    info["transport"] = json!(t.as_str());
+                    self.update_cfg(name, |c| c.pending_transport = None);
+                    self.set_change(name, None);
+                }
+                Ok(_) => self.set_change(name, Some(json!({ "to": t.as_str(), "state": "waiting-approval", "message": format!("waiting for {name} to allow the switch") }))),
+                Err((_, e)) => self.set_change(name, Some(json!({ "to": t.as_str(), "state": "error", "message": e }))),
+            }
+        } else if cfg.pending_transport.is_some() {
+            // Approved while we were reconnecting.
+            self.update_cfg(name, |c| c.pending_transport = None);
+            self.set_change(name, None);
+        }
+        self.learn(name, &info);
         let system = self.request(&mux, "GET", "/system", None).unwrap_or(Value::Null);
         let procs: Vec<ProcInfo> = self.request(&mux, "GET", "/processes", None).ok().and_then(|v| serde_json::from_value(v["processes"].clone()).ok()).unwrap_or_default();
         {
@@ -332,6 +526,53 @@ impl Peers {
                     p.last_seen = Some(now_ms());
                 }
             }
+        }
+    }
+
+    /// Change a saved machine (memory and peers.json). Returns whether anything changed.
+    fn update_cfg(&self, name: &str, f: impl FnOnce(&mut PeerCfg)) -> bool {
+        let new = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(p) = g.get_mut(name) else { return false };
+            let mut c = p.cfg.clone();
+            f(&mut c);
+            if serde_json::to_value(&c).ok() == serde_json::to_value(&p.cfg).ok() {
+                return false;
+            }
+            p.cfg = c.clone();
+            c
+        };
+        let mut all = load();
+        if let Some(e) = all.iter_mut().find(|c| c.name == name) {
+            *e = new;
+            let _ = save(&all);
+        }
+        true
+    }
+
+    /// Remember how else the machine can be reached, and the transport it has on record for this Mac.
+    fn learn(&self, name: &str, info: &Value) {
+        let t = &info["transports"];
+        let lan: Vec<String> = t["local"]["addrs"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|a| normalize_addr(a).is_ok() && !super::remote::is_tailscale_host(a)).take(8).map(str::to_string).collect())
+            .unwrap_or_default();
+        let ts_name = t["tailscale"]["dnsName"].as_str().filter(|d| !d.is_empty()).map(str::to_string);
+        let theirs = info["transport"].as_str().and_then(Transport::parse);
+        let changed = self.update_cfg(name, |c| {
+            if t.is_object() {
+                let own = c.address();
+                c.addrs = lan.into_iter().filter(|a| *a != own).collect();
+            }
+            if ts_name.is_some() {
+                c.tailnet_name = ts_name;
+            }
+            if let Some(tr) = theirs.filter(|_| c.pending_transport.is_none()) {
+                c.transport = tr;
+            }
+        });
+        if changed {
+            println!("{} peers: {name}: updated its addresses/transport ({})", paths::iso(now_ms()), self.cfg(name).map(|c| c.transport.as_str()).unwrap_or(""));
         }
     }
 
@@ -489,7 +730,15 @@ impl Peers {
         if code.trim().is_empty() {
             return Err(ApiErr::new(400, "pairing code required (Share this Mac → Show pairing code on the other Mac)"));
         }
-        let paired = link::pair_client(&addr, code, auth, &local_name()).await.map_err(|e| ApiErr::new(403, e))?;
+        // A tailnet name/IP is paired through the Tailscale helper, and the machine starts on that transport.
+        let over_tailnet = super::remote::is_tailscale_host(&addr);
+        let paired = if over_tailnet {
+            let s = super::tailnet::dial(&addr).await.map_err(|e| ApiErr::new(502, format!("{e} (pairing with a Tailscale address needs Tailscale on here: lstack tailnet on)")))?;
+            link::pair_client_over(s, &addr, code, auth, &local_name()).await
+        } else {
+            link::pair_client(&addr, code, auth, &local_name()).await
+        }
+        .map_err(|e| ApiErr::new(403, e))?;
         let key = link::key_hex(&paired.public);
         let host = host_of(&addr);
         let old: Vec<PeerCfg> = load().into_iter().filter(|c| c.public_key == key || c.address() == addr || (c.legacy() && host_of(&c.address()) == host)).collect();
@@ -507,7 +756,11 @@ impl Peers {
             name = format!("{base}-{i}");
             i += 1;
         }
-        let cfg = PeerCfg { name: name.clone(), addr, public_key: key, added_at: now_ms(), ..Default::default() };
+        let mut cfg = PeerCfg { name: name.clone(), addr, public_key: key, added_at: now_ms(), ..Default::default() };
+        if over_tailnet {
+            cfg.transport = Transport::Tailscale;
+            cfg.tailnet_name = Some(host_of(&cfg.addr));
+        }
         let mut all = load();
         all.push(cfg.clone());
         save(&all).map_err(|e| ApiErr::new(500, format!("cannot save peers.json: {e}")))?;
@@ -517,6 +770,73 @@ impl Peers {
         v["grants"] = paired.grants;
         v["remoteVersion"] = json!(paired.version);
         Ok(v)
+    }
+
+    /// Unpair `name` on purpose: tell it so it forgets this Mac too — now over the link, or (when it's
+    /// offline) the next time it can be reached.
+    pub fn unpair(&self, name: &str) -> Result<(), ApiErr> {
+        let (cfg, mux) = {
+            let mut g = self.inner.lock().unwrap();
+            let p = g.get_mut(name).ok_or_else(|| ApiErr::new(404, format!("no machine named {name:?}")))?;
+            // Taken out so `remove` doesn't cut the link before the goodbye is flushed (`bye` closes it).
+            (p.cfg.clone(), p.mux.take().filter(|m| !m.is_closed()))
+        };
+        match mux {
+            Some(m) => m.bye(link::BYE_REVOKED),
+            None if !cfg.legacy() => {
+                let mut list = load_unpairs();
+                list.retain(|u| u.public_key != cfg.public_key);
+                let ts = cfg.transport == Transport::Tailscale && cfg.tailnet_addr().is_some();
+                let addr = if ts { cfg.tailnet_addr().unwrap_or_default() } else { cfg.address() };
+                list.push(Unpair { addr, public_key: cfg.public_key.clone(), at: now_ms(), tailnet: ts });
+                let _ = save_unpairs(&list);
+            }
+            None => {}
+        }
+        self.remove(name)
+    }
+
+    /// Deliver unpair notices queued while those Macs were offline (own thread; retries every minute
+    /// for up to 30 days).
+    fn deliver_unpairs(self: Arc<Self>) {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let list = load_unpairs();
+            if list.is_empty() {
+                continue;
+            }
+            let Ok(id) = link::identity() else { continue };
+            let mut keep = vec![];
+            for u in list {
+                if now_ms() - u.at > 30 * 86_400_000 {
+                    continue;
+                }
+                let Some(their) = link::unhex32(&u.public_key) else { continue };
+                // Paired again since: nothing to deliver.
+                if load().iter().any(|c| c.public_key == u.public_key) {
+                    continue;
+                }
+                let hello = json!({ "name": local_name(), "version": paths::VERSION });
+                let res = self.rt.block_on(async {
+                    if u.tailnet {
+                        let s = super::tailnet::dial(&u.addr).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
+                        link::connect_over(s, &id, &their, hello).await
+                    } else {
+                        link::connect(&u.addr, &id, &their, hello).await
+                    }
+                });
+                match res {
+                    Ok((m, _)) => {
+                        m.bye(link::BYE_REVOKED);
+                        println!("{} peers: told {} this Mac unpaired it", paths::iso(now_ms()), u.addr);
+                    }
+                    // It already forgot this Mac.
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+                    Err(_) => keep.push(u),
+                }
+            }
+            let _ = save_unpairs(&keep);
+        }
     }
 
     pub fn remove(&self, name: &str) -> Result<(), ApiErr> {
@@ -568,6 +888,202 @@ impl Peers {
         };
         self.emit(machine, "snapshot", snap);
         Ok(())
+    }
+
+    /// Switch how the link to `name` travels (blocking). Upgrading to Tailscale runs in the background
+    /// (`transportChange` on the machine shows progress); downgrading first checks the LAN reaches it, and
+    /// needs `force` when it doesn't.
+    pub fn set_transport(self: &Arc<Self>, name: &str, t: Transport, force: bool, tailnet: Arc<super::tailnet::Tailnet>) -> Result<Value, ApiErr> {
+        let cfg = self.cfg(name).ok_or_else(|| ApiErr::new(404, format!("no machine named {name:?}")))?;
+        if cfg.legacy() {
+            return Err(ApiErr::new(409, format!("{name} must be paired again first")));
+        }
+        let busy = self.inner.lock().unwrap().get(name).and_then(|p| p.change.clone()).is_some_and(|c| matches!(c["state"].as_str(), Some("preparing" | "waiting-login" | "switching")));
+        if busy {
+            return Err(ApiErr::new(409, format!("already switching {name}")));
+        }
+        match t {
+            Transport::Tailscale => {
+                if cfg.transport == Transport::Tailscale && cfg.pending_transport.is_none() {
+                    return self.get(name);
+                }
+                if !tailnet.running() {
+                    return Err(ApiErr::new(
+                        409,
+                        match tailnet.phase() {
+                            "off" => "turn on Tailscale on this Mac first".to_string(),
+                            "needs-login" => "sign in to Tailscale on this Mac first".to_string(),
+                            p => format!("Tailscale on this Mac isn't ready yet ({p})"),
+                        },
+                    ));
+                }
+                self.live(name)?;
+                self.set_change(name, Some(json!({ "to": "tailscale", "state": "preparing", "message": format!("asking {name} to turn on Tailscale") })));
+                let (me, n) = (self.clone(), name.to_string());
+                std::thread::Builder::new()
+                    .name(format!("upgrade-{name}"))
+                    .spawn(move || {
+                        let change = match me.upgrade(&n, &tailnet) {
+                            Ok(c) => c,
+                            Err(e) => Some(json!({ "to": "tailscale", "state": "error", "message": e })),
+                        };
+                        me.set_change(&n, change);
+                    })
+                    .ok();
+                self.get(name)
+            }
+            Transport::Local => {
+                if cfg.transport == Transport::Local && cfg.pending_transport.is_none() {
+                    return self.get(name);
+                }
+                if !force && !self.lan_reachable(&cfg) {
+                    return Err(ApiErr::new(
+                        409,
+                        format!(
+                            "can't reach {name} on this network ({}) — it may be away, asleep, or a VPN may be blocking the local network. Switch anyway?",
+                            cfg.lan_addrs().join(", ")
+                        ),
+                    ));
+                }
+                self.update_cfg(name, |c| {
+                    c.transport = Transport::Local;
+                    c.pending_transport = Some(Transport::Local);
+                });
+                if let Ok((mux, _)) = self.live(name) {
+                    match self.request(&mux, "POST", "/transport", Some(&json!({ "transport": "local" }))) {
+                        Ok(r) if r["applied"] == true => {
+                            self.update_cfg(name, |c| c.pending_transport = None);
+                            self.set_change(name, None);
+                        }
+                        Ok(_) => self.set_change(name, Some(json!({ "to": "local", "state": "waiting-approval", "message": format!("waiting for {name} to allow the switch") }))),
+                        Err((_, e)) => self.set_change(name, Some(json!({ "to": "local", "state": "error", "message": e }))),
+                    }
+                }
+                // Over the LAN from now on (the request is repeated on connect if it didn't go through).
+                self.kick(name, true);
+                self.get(name)
+            }
+        }
+    }
+
+    /// This Mac's Tailscale helper was updated to `version`: ask each machine on the Tailscale transport to
+    /// update too (up to 2 min), then reconnect over the new helpers. Machines that can't stay connected
+    /// on their old helper (versions are compatible) and show a warning.
+    pub fn follow_helper_update(self: &Arc<Self>, version: &str) {
+        let names: Vec<String> = self.inner.lock().unwrap().values().filter(|p| p.cfg.transport == Transport::Tailscale).map(|p| p.cfg.name.clone()).collect();
+        for name in names {
+            let (me, v) = (self.clone(), version.to_string());
+            std::thread::Builder::new()
+                .name(format!("helper-update-{name}"))
+                .spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                    let warn = |msg: String| me.set_change(&name, Some(json!({ "to": "tailscale", "state": "warning", "message": msg })));
+                    // Our own helper is restarting: wait for the link to come back.
+                    let mut asked = false;
+                    loop {
+                        if std::time::Instant::now() > deadline {
+                            return warn(format!("{name} didn't update its Tailscale helper to {v}; still connected on its current one"));
+                        }
+                        if let Ok((mux, _)) = me.live(&name) {
+                            if !asked {
+                                match me.request(&mux, "POST", "/tailnet/prepare", Some(&json!({ "minVersion": v }))) {
+                                    Ok(_) => asked = true,
+                                    Err((404, _)) => return,
+                                    Err((403, e)) => return warn(e),
+                                    Err(_) => {}
+                                }
+                            } else if let Ok(info) = me.request(&mux, "GET", "/info", None) {
+                                let ts = &info["transports"]["tailscale"];
+                                let theirs = ts["helperVersion"].as_str().unwrap_or("");
+                                if ts["phase"] == "running" && !theirs.is_empty() && super::tailnet::version_cmp(theirs, &v).is_ge() {
+                                    println!("{} peers: {name} updated its Tailscale helper to {theirs}; reconnecting", paths::iso(now_ms()));
+                                    me.kick(&name, true);
+                                    return;
+                                }
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(3));
+                    }
+                })
+                .ok();
+        }
+    }
+
+    /// Whether a Noise handshake to any of its LAN addresses succeeds (2 s each).
+    fn lan_reachable(&self, cfg: &PeerCfg) -> bool {
+        let (Ok(id), Some(their)) = (link::identity(), link::unhex32(&cfg.public_key)) else { return false };
+        self.rt.block_on(probe_lan(&cfg.lan_addrs(), &id, &their, Duration::from_secs(2)))
+    }
+
+    /// Upgrade flow: the other Mac turns Tailscale on, we test a link over the tailnet, then switch.
+    /// Returns the change to show afterwards (None when done).
+    fn upgrade(self: &Arc<Self>, name: &str, tailnet: &super::tailnet::Tailnet) -> Result<Option<Value>, String> {
+        let req = |method: &str, path: &str, body: Option<&Value>| -> Result<Value, String> {
+            let (mux, _) = self.live(name).map_err(|e| e.1)?;
+            self.request(&mux, method, path, body).map_err(|(c, e)| if c == 404 { format!("{name} runs an older LStack without Tailscale — update it there first") } else { e })
+        };
+        let state = |st: &str, msg: String| self.set_change(name, Some(json!({ "to": "tailscale", "state": st, "message": msg })));
+        req("POST", "/tailnet/prepare", Some(&json!({ "minVersion": tailnet.version() })))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        let info = loop {
+            let info = req("GET", "/info", None)?;
+            let ts = &info["transports"]["tailscale"];
+            match ts["phase"].as_str().unwrap_or("off") {
+                "running" if ts["dnsName"].as_str().is_some_and(|d| !d.is_empty()) => break info,
+                "needs-login" => state("waiting-login", format!("waiting for {name} to sign in to Tailscale (a notification is showing there)")),
+                "error" => return Err(format!("Tailscale on {name}: {}", ts["error"].as_str().unwrap_or("failed to start"))),
+                "off" if ts["enabled"] != true => return Err(format!("{name} didn't turn Tailscale on (it may not auto-approve changes)")),
+                p => state("preparing", format!("Tailscale on {name}: {p}…")),
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!("gave up waiting for Tailscale on {name}"));
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        };
+        if let (Some(mine), Some(theirs)) = (tailnet.tailnet_name(), info["transports"]["tailscale"]["tailnet"].as_str()) {
+            if !theirs.is_empty() && mine != theirs {
+                return Err(format!("{name} is signed in to tailnet {theirs:?}, this Mac to {mine:?} — sign both in to the same one"));
+            }
+        }
+        self.learn(name, &info);
+        state("switching", format!("connecting to {name} over Tailscale"));
+        let r = req("POST", "/transport", Some(&json!({ "transport": "tailscale" })))?;
+        if r["applied"] != true {
+            self.update_cfg(name, |c| c.pending_transport = Some(Transport::Tailscale));
+            return Ok(Some(json!({ "to": "tailscale", "state": "waiting-approval", "message": format!("waiting for {name} to allow the switch") })));
+        }
+        // Prove the tailnet path before leaving the LAN.
+        let mut test = self.cfg(name).ok_or("machine removed")?;
+        test.transport = Transport::Tailscale;
+        let target = test.tailnet_addr().ok_or("its Tailscale name is unknown")?;
+        let id = link::identity()?;
+        let their = link::unhex32(&test.public_key).ok_or("invalid key")?;
+        let hello = json!({ "name": local_name(), "version": paths::VERSION, "probe": true });
+        let probe = self.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let s = super::tailnet::dial(&target).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
+                link::connect_over(s, &id, &their, hello).await
+            })
+            .await
+        });
+        match probe {
+            Ok(Ok((m, _))) => m.shutdown(),
+            res => {
+                let e = match res {
+                    Ok(Err(e)) => e.to_string(),
+                    _ => "timed out".into(),
+                };
+                let _ = req("POST", "/transport", Some(&json!({ "transport": "local" })));
+                return Err(format!("couldn't connect to {name} over Tailscale ({e}) — staying on the local network"));
+            }
+        }
+        self.update_cfg(name, |c| {
+            c.transport = Transport::Tailscale;
+            c.pending_transport = None;
+        });
+        println!("{} peers: {name}: switched to Tailscale", paths::iso(now_ms()));
+        self.kick(name, true);
+        Ok(None)
     }
 
     /// Reconnect every machine (e.g. after this install's key changed).
@@ -630,6 +1146,23 @@ impl Peers {
     }
 }
 
+/// Whether the paired Mac answers the link handshake at any of `addrs`.
+async fn probe_lan(addrs: &[String], id: &link::Identity, their: &[u8; 32], each: Duration) -> bool {
+    for a in addrs {
+        let hello = json!({ "name": local_name(), "version": paths::VERSION, "probe": true });
+        match tokio::time::timeout(each, link::connect(a, id, their, hello)).await {
+            Ok(Ok((m, _))) => {
+                m.shutdown();
+                return true;
+            }
+            // It answered (and refused this source): the network path works.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn summary(p: &PeerState) -> Value {
     json!({
         "name": p.cfg.name,
@@ -645,6 +1178,13 @@ fn summary(p: &PeerState) -> Value {
         "allowControl": p.info["grants"]["control"].as_bool().unwrap_or(false),
         "lastSeen": p.last_seen,
         "addedAt": p.cfg.added_at,
+        "transport": p.cfg.transport.as_str(),
+        "tailnetName": p.cfg.tailnet_name,
+        "addrs": p.cfg.lan_addrs(),
+        "via": p.via.as_ref().filter(|_| p.mux.as_ref().is_some_and(|m| !m.is_closed())).map(|(v, a)| json!({ "kind": v, "address": a })),
+        "pendingTransport": p.cfg.pending_transport.map(Transport::as_str),
+        "transportChange": p.change,
+        "tailscaleAvailable": p.info["transports"]["tailscale"]["enabled"].as_bool().unwrap_or(false),
     })
 }
 
@@ -664,6 +1204,46 @@ fn full(p: &PeerState) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_entries_load() {
+        // Saved before transports existed: LAN only, no extra addresses.
+        let c: PeerCfg = serde_json::from_value(json!({ "name": "studio", "addr": "studio.lan:7381", "publicKey": "ab", "addedAt": 1 })).unwrap();
+        assert_eq!(c.transport, Transport::Local);
+        assert_eq!(c.lan_addrs(), vec!["studio.lan:7381"]);
+        assert!(c.tailnet_addr().is_none() && c.pending_transport.is_none());
+        let c = PeerCfg { addrs: vec!["studio.lan:7381".into(), "192.168.1.5:7381".into()], tailnet_name: Some("lstack-studio.t.ts.net".into()), ..c };
+        assert_eq!(c.lan_addrs(), vec!["studio.lan:7381", "192.168.1.5:7381"]);
+        assert_eq!(c.tailnet_addr().unwrap(), "lstack-studio.t.ts.net:7381");
+        let saved = serde_json::to_value(&c).unwrap();
+        assert_eq!(saved["transport"], "local");
+        assert!(saved.get("pendingTransport").is_none());
+    }
+
+    #[tokio::test]
+    async fn downgrade_probe() {
+        use tokio::io::AsyncReadExt;
+        let (me, them) = (link::Identity::generate(), link::Identity::generate());
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let quick = Duration::from_millis(500);
+        assert!(!probe_lan(&[dead.clone()], &me, &them.public, quick).await);
+        // A link listener that refuses this Mac still proves the LAN path.
+        for trust in [true, false] {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let live = l.local_addr().unwrap().to_string();
+            let server = them.clone();
+            tokio::spawn(async move {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut magic = [0u8; 6];
+                s.read_exact(&mut magic).await.unwrap();
+                let _ = link::accept(s, &server, |_, _| if trust { Ok(json!({})) } else { Err("not paired".into()) }).await;
+            });
+            assert!(probe_lan(&[dead.clone(), live], &me, &them.public, quick).await, "trust={trust}");
+        }
+    }
 
     #[test]
     fn urls() {

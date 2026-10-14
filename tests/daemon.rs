@@ -45,6 +45,10 @@ fn wait_until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
 
 impl Daemon {
     fn start(home: &Path) -> Daemon {
+        Self::start_with(home, &[])
+    }
+
+    fn start_with(home: &Path, env: &[(&str, String)]) -> Daemon {
         let port = free_port();
         std::fs::create_dir_all(home.join("services")).unwrap();
         let child = Command::new(BIN)
@@ -52,6 +56,7 @@ impl Daemon {
             .env("LSTACK_HOME", home)
             .env("LSTACK_PORT", port.to_string())
             .env("LSTACK_KEYCHAIN", "file")
+            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -372,19 +377,128 @@ fn machines_pair_and_proxy() {
     let (ok, out) = host.cli(&["machine", "ls"]);
     assert!(ok && out.contains("studio"), "{out}");
 
-    // Revoking on the client cuts the host off.
+    // Revoking on the client tells the host, which forgets the client too (and its forwards).
     client.call("DELETE", &format!("/api/remote/peers/{id}"), None).unwrap();
-    wait_until("host marks unauthorized", 30, || host.get("/api/machines/studio").unwrap()["status"] == "unauthorized");
-    assert!(host.get("/api/machines/studio/services/web").is_err());
+    wait_until("host forgets the revoked machine", 30, || host.get("/api/machines/studio").is_err_and(|e| e.0 == 404));
+    wait_until("host peers.json updated", 5, || !std::fs::read_to_string(base.join("host/peers.json")).unwrap().contains("studio"));
+    assert!(host.get("/api/forwards").unwrap().as_array().unwrap().is_empty());
 
-    // Pairing again replaces the old entry (keeping its name); machines can be renamed.
+    // Pairing again works; machines can be renamed (renaming doesn't unpair).
     let code4 = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
-    let m = host.post("/api/machines", Some(json!({ "address": addr, "code": code4 }))).unwrap();
+    let m = host.post("/api/machines", Some(json!({ "address": addr, "code": code4, "name": "studio" }))).unwrap();
     assert_eq!(m["name"], "studio");
     assert_eq!(host.get("/api/machines").unwrap()["machines"].as_array().unwrap().len(), 1);
     host.call("PATCH", "/api/machines/studio", Some(json!({ "name": "lab" }))).unwrap();
     assert!(host.get("/api/machines/lab").is_ok());
     assert!(std::fs::read_to_string(base.join("host/peers.json")).unwrap().contains("\"lab\""));
+    wait_until("link back up after rename", 30, || host.get("/api/machines/lab").unwrap()["status"] == "online");
+    assert_eq!(client.get("/api/remote/peers").unwrap().as_array().unwrap().len(), 1);
+
+    // Removing the machine on the host tells the client, which forgets the host too.
+    host.call("DELETE", "/api/machines/lab", None).unwrap();
+    wait_until("client forgets the host", 15, || client.get("/api/remote/peers").unwrap().as_array().unwrap().is_empty());
+    drop(host);
+    drop(client);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Both Macs on a fake tailnet (`tests/fake_tailnet.py` stands in for the Tailscale helper): upgrade with the other
+/// Mac turning Tailscale on and signing in, downgrades from either side, approval when auto-approve is off, and
+/// unpairing over the tailnet.
+#[test]
+fn tailscale_transport() {
+    // Short paths: unix socket paths are limited to 104 bytes.
+    let base = PathBuf::from(format!("/tmp/lsts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_tailnet.py");
+    let env = |name: &str| {
+        vec![
+            ("LSTACK_TAILNET_BIN", fake.to_string_lossy().into_owned()),
+            ("FAKE_TAILNET_REGISTRY", base.join("reg").to_string_lossy().into_owned()),
+            ("LSTACK_TAILNET_HOSTNAME", name.to_string()),
+        ]
+    };
+    let host = Daemon::start_with(&base.join("h"), &env("lstack-host"));
+    let client = Daemon::start_with(&base.join("c"), &env("lstack-client"));
+    let lport = free_port();
+    client.call("PUT", "/api/remote", Some(json!({ "enabled": false, "sharing": true, "bind": "127.0.0.1", "linkPort": lport }))).unwrap();
+    let addr = format!("127.0.0.1:{lport}");
+    wait_until("link listener", 10, || std::net::TcpStream::connect(&addr).is_ok());
+    let code = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
+    host.post("/api/machines", Some(json!({ "address": addr, "code": code, "name": "studio" }))).unwrap();
+    let m = || host.get("/api/machines/studio").unwrap();
+    wait_until("link up", 30, || m()["status"] == "online");
+    assert_eq!(m()["transport"], "local");
+    assert_eq!(m()["via"]["kind"], "lan");
+
+    // Upgrading needs Tailscale here first; turning it on needs the exposure acknowledged.
+    let up = || host.post("/api/machines/studio/transport", Some(json!({ "transport": "tailscale" })));
+    assert_eq!(up().unwrap_err().0, 409);
+    assert_eq!(host.post("/api/tailnet", Some(json!({ "enabled": true }))).unwrap_err().0, 409);
+    host.post("/api/tailnet", Some(json!({ "enabled": true, "acknowledged": true }))).unwrap();
+    wait_until("helper needs login", 20, || host.get("/api/tailnet").unwrap()["phase"] == "needs-login");
+    assert!(host.get("/api/tailnet").unwrap()["authURL"].as_str().unwrap().starts_with("https://"));
+    host.post("/api/tailnet/login", Some(json!({}))).unwrap();
+    wait_until("helper running", 20, || host.get("/api/tailnet").unwrap()["phase"] == "running");
+    let addrs = host.get("/api/remote/addresses").unwrap();
+    assert!(addrs.as_array().unwrap().iter().any(|a| a["kind"] == "tailscale" && a["address"] == "lstack-host.fake.ts.net"), "{addrs}");
+
+    // Upgrade: the other Mac turns Tailscale on by itself (auto-approve), then waits for someone to sign in there.
+    up().unwrap();
+    wait_until("waiting for the other Mac to sign in", 30, || m()["transportChange"]["state"] == "waiting-login");
+    assert_eq!(client.get("/api/tailnet").unwrap()["enabled"], true);
+    client.post("/api/tailnet/login", Some(json!({}))).unwrap();
+    wait_until("switched to tailscale", 60, || {
+        let v = m();
+        v["transport"] == "tailscale" && v["via"]["kind"] == "tailscale" && v["status"] == "online" && v["transportChange"].is_null()
+    });
+    assert_eq!(m()["tailnetName"], "lstack-client.fake.ts.net");
+    let peer = || client.get("/api/remote/peers").unwrap()[0].clone();
+    wait_until("shared side sees the tailnet link", 10, || peer()["via"] == "tailscale");
+    assert_eq!(peer()["transport"], "tailscale");
+    assert_eq!(peer()["tailnet"]["tailnet"], "fake.ts.net");
+    assert!(std::fs::read_to_string(base.join("h/peers.json")).unwrap().contains("\"tailscale\""));
+    assert!(host.get("/api/machines/studio/services/nope").is_err_and(|e| e.0 == 404), "peer API works over the tailnet");
+
+    // The shared Mac moves it back to the local network on its own: the watcher follows.
+    let id = peer()["id"].as_str().unwrap().to_string();
+    client.post(&format!("/api/remote/peers/{id}/transport"), Some(json!({ "transport": "local" }))).unwrap();
+    wait_until("followed the shared Mac to the LAN", 30, || {
+        let v = m();
+        v["transport"] == "local" && v["via"]["kind"] == "lan" && v["status"] == "online"
+    });
+    // A Mac on the local transport isn't accepted over the tailnet.
+    let refused = client.get("/api/remote/activity").unwrap();
+    assert!(refused["events"].as_array().unwrap().iter().all(|e| e["event"] != "link-refused"), "{refused}");
+
+    // Upgrade again (both sides already signed in: no waiting), then downgrade from the watcher with approval.
+    up().unwrap();
+    wait_until("tailscale again", 60, || m()["transport"] == "tailscale" && m()["via"]["kind"] == "tailscale");
+    client.call("PUT", "/api/remote", Some(json!({ "autoApproveTransport": false }))).unwrap();
+    host.post("/api/machines/studio/transport", Some(json!({ "transport": "local" }))).unwrap();
+    wait_until("waiting for approval", 30, || m()["transportChange"]["state"] == "waiting-approval");
+    assert_eq!(m()["pendingTransport"], "local");
+    let rs = client.get("/api/remote").unwrap();
+    assert_eq!(rs["transportRequests"][0]["transport"], "local", "{rs}");
+    assert_eq!(peer()["transport"], "tailscale", "not applied before approval");
+    client.post(&format!("/api/remote/transport-requests/{id}/allow"), None).unwrap();
+    wait_until("approved downgrade applied", 30, || {
+        let v = m();
+        v["transport"] == "local" && v["pendingTransport"].is_null() && v["transportChange"].is_null() && v["status"] == "online"
+    });
+    assert_eq!(peer()["transport"], "local");
+    assert!(client.get("/api/remote").unwrap()["transportRequests"].as_array().unwrap().is_empty());
+
+    // Over Tailscale again, unpairing still tells the other Mac.
+    client.call("PUT", "/api/remote", Some(json!({ "autoApproveTransport": true }))).unwrap();
+    up().unwrap();
+    wait_until("tailscale for unpair", 60, || m()["transport"] == "tailscale" && m()["via"]["kind"] == "tailscale" && m()["status"] == "online");
+    let (ok, out) = host.cli(&["machine", "ls"]);
+    assert!(ok && out.contains("tailscale"), "{out}");
+    let (ok, out) = host.cli(&["tailnet", "status"]);
+    assert!(ok && out.contains("running") && out.contains("lstack-client.fake.ts.net"), "{out}");
+    host.call("DELETE", "/api/machines/studio", None).unwrap();
+    wait_until("client forgets the host", 15, || client.get("/api/remote/peers").unwrap().as_array().unwrap().is_empty());
     drop(host);
     drop(client);
     let _ = std::fs::remove_dir_all(&base);

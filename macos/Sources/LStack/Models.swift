@@ -164,11 +164,44 @@ struct Machine: Codable, Identifiable, Equatable {
     var processes: [ProcInfo]?
     var configErrors: [String]?
     var system: MachineSystem?
+    /// How the link travels: "local" (LAN) or "tailscale".
+    var transport: String?
+    /// Its Tailscale device name (e.g. lstack-studio.tailnet.ts.net), once known.
+    var tailnetName: String?
+    /// The live link's path: kind "lan" or "tailscale" + the address dialed.
+    var via: LinkVia?
+    /// Transport asked for but not yet confirmed by that Mac.
+    var pendingTransport: String?
+    var transportChange: TransportChange?
+    /// That Mac has Tailscale turned on.
+    var tailscaleAvailable: Bool?
 
     var online: Bool { status == "online" }
+    var onTailscale: Bool { transport == "tailscale" }
+    /// "LAN" / "Tailscale" plus what the live link is going through, for tooltips.
+    var linkDescription: String {
+        let t = onTailscale ? "Tailscale" : "local network"
+        guard online, let v = via else { return "Connects over the \(t)" }
+        return "Connected over \(v.kind == "tailscale" ? "Tailscale" : "the local network") (\(v.address))"
+    }
     var canControl: Bool { allowControl ?? false }
     /// Paired with an older LStack (before the encrypted link): must pair again.
     var needsRepair: Bool { status == "repair" || status == "unauthorized" }
+}
+
+struct LinkVia: Codable, Equatable {
+    let kind: String
+    let address: String
+}
+
+/// A transport switch in progress or stuck: `state` is preparing, waiting-login, waiting-approval, switching, error
+/// or warning.
+struct TransportChange: Codable, Equatable {
+    let to: String
+    let state: String
+    let message: String?
+
+    var busy: Bool { ["preparing", "waiting-login", "waiting-approval", "switching"].contains(state) }
 }
 
 /// Per-Mac permissions: `{control, tunnel: "all" | "none" | [services]}`.
@@ -322,6 +355,10 @@ struct SharedPeer: Decodable, Identifiable, Equatable {
     let online: Bool?
     let address: String?
     let streams: Int?
+    /// "local" or "tailscale" (what this Mac accepts from it).
+    let transport: String?
+    /// The live link: "lan" or "tailscale".
+    let via: String?
 }
 
 /// This install's link key.
@@ -520,8 +557,82 @@ struct RemoteStatus: Codable, Equatable {
     /// Paired Macs can watch this one.
     var sharing: Bool?
     var shareUrls: [String]?
+    /// The address chosen to show for this Mac (nil = automatic).
+    var shareAddress: String?
     var linkPort: Int?
     var pairedMachines: Int?
+    /// Transport changes asked for by paired Macs are applied without asking (default on).
+    var autoApproveTransport: Bool?
+    var transportRequests: [TransportRequest]?
+}
+
+/// A paired Mac asked to change how it connects (waiting for Allow/Deny here).
+struct TransportRequest: Codable, Equatable, Identifiable {
+    var id: String { peerId }
+    let peerId: String
+    let name: String
+    let transport: String
+    let at: Double
+}
+
+/// `GET /api/tailnet`: this Mac's Tailscale helper.
+struct TailnetStatus: Decodable, Equatable {
+    struct SelfNode: Decodable, Equatable {
+        let dnsName: String?
+        let ips: [String]?
+    }
+    struct Peer: Decodable, Equatable, Identifiable {
+        var id: String { dnsName }
+        let dnsName: String
+        let hostName: String?
+        let ips: [String]?
+        let online: Bool?
+        let os: String?
+        let isLStack: Bool?
+        /// "direct", "relay" or "" (no traffic yet).
+        let path: String?
+        let relay: String?
+    }
+    let enabled: Bool
+    /// off, installing, starting, needs-login, running, error
+    let phase: String
+    let error: String?
+    let autoUpdate: Bool?
+    let acknowledged: Bool?
+    let installedVersion: String?
+    let version: String?
+    let lastCheck: Double?
+    let checking: Bool?
+    let devBinary: Bool?
+    let deviceName: String?
+    let authURL: String?
+    let `self`: SelfNode?
+    let tailnet: String?
+    let user: String?
+    let health: [String]?
+    let peers: [Peer]?
+
+    var running: Bool { phase == "running" }
+}
+
+/// `GET /api/network`: an active VPN can block the local network or push Tailscale onto a relay.
+struct VpnStatus: Decodable, Equatable {
+    let active: Bool
+    let interface: String?
+    let fullTunnel: Bool?
+    let tailscaleApp: Bool?
+}
+
+/// `GET /api/remote/addresses`: a way other Macs might reach this one, checked by resolving it.
+struct ShareAddress: Decodable, Identifiable, Hashable {
+    let address: String
+    /// ip, dns, bonjour or tailscale
+    let kind: String
+    let source: String?
+    let resolves: [String]
+    let pointsHere: Bool
+    let selected: Bool
+    var id: String { address }
 }
 
 struct RemotePatch: Encodable {
@@ -533,6 +644,9 @@ struct RemotePatch: Encodable {
     var password: String?
     var allowControl: Bool?
     var linkPort: Int?
+    /// "" = automatic.
+    var shareAddress: String?
+    var autoApproveTransport: Bool?
 }
 
 struct TotpSetup: Decodable {

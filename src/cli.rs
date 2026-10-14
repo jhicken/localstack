@@ -33,7 +33,8 @@ fn help() -> String {
   lstack terminal cmux --fix     let LStack open cmux workspaces (socket password mode)
   lstack secret set|ls|rm|rotate-key|unlock   write-only secrets passed to services as env vars
   lstack ps [--machine <m>]      busy processes (over the CPU/mem/net thresholds), per machine
-  lstack machine ls|add|rm|rename   watch other Macs (their services show up everywhere)
+  lstack machine ls|add|rm|rename|transport   watch other Macs (their services show up everywhere)
+  lstack tailnet on|off|status|login|logout|update   Tailscale transport for paired Macs (see below)
   lstack heartbeat [status|key|machine|set|off|test]   healthchecks.io-compatible pings
   lstack daemon run|start|stop|restart|status|logs
   lstack reload                  re-read {}
@@ -64,11 +65,15 @@ fn help() -> String {
   lstack remote share on|off     let paired Macs see this machine's services
   lstack remote passwd [--user <name>] [--password-stdin]
   lstack remote share on|off [--link-port 7381]
+  lstack remote address [<name>|auto]   ways to reach this Mac (DNS, Bonjour, IPs, checked) / pick the one shown
   lstack remote pair             one-time code another Mac uses to pair with this one (needs sharing)
   lstack remote peers            Macs paired with this one, their access and link state
   lstack remote grant <mac> [control|no-control] [--tunnel all|none|svc,svc]   what a paired Mac may do
-  lstack remote revoke <mac>     unpair a Mac now (its link and tunnels drop)
+  lstack remote revoke <mac>     unpair a Mac now (its link and tunnels drop; it forgets this Mac too)
   lstack remote activity         recent links, pairings, tunnels and refusals
+  lstack remote auto-approve on|off   paired Macs may switch their transport (LAN ↔ Tailscale) without asking
+  lstack remote requests         transport changes waiting for approval   lstack remote allow|deny <mac>
+  lstack remote transport <mac> local|tailscale   change how a paired Mac reaches this one (it follows)
 
 {}
   lstack machine pair studio.local --code K7QP-3M9X [--totp 123456] [--name studio]
@@ -80,6 +85,12 @@ fn help() -> String {
   lstack logs api@studio -f      lstack restart worker@studio
   lstack forwards                services of paired Macs forwarded to localhost (encrypted link)
   lstack forwards pause|resume web@studio
+  lstack machine transport studio tailscale [--yes]   reach studio over Tailscale (it turns Tailscale on too)
+  lstack machine transport studio local [--yes]       back to the local network (checks it's reachable)
+  lstack machine reconnect       redial machines that are offline now
+  lstack tailnet on [--yes]      install + start LStack's Tailscale helper (its own device, lstack-<host>)
+  lstack tailnet login [--auth-key tskey-…]   sign in (opens the browser, or uses a key)
+  lstack tailnet update | logout | off | status
 
 {}
   lstack heartbeat key                           healthchecks.io project ping key (stored encrypted)
@@ -139,6 +150,7 @@ pub fn main(argv: Vec<String>) -> i32 {
         "terminal" => cmd_terminal(&rest),
         "secret" | "secrets" => crate::cli_more::cmd_secret(&rest),
         "machine" | "machines" => crate::cli_more::cmd_machine(&rest),
+        "tailnet" | "tailscale" => crate::cli_more::cmd_tailnet(&rest),
         "forwards" | "forward" | "tunnels" => crate::cli_more::cmd_forwards(&rest),
         "ps" | "processes" => crate::cli_more::cmd_ps(&rest),
         "heartbeat" | "heartbeats" | "hc" => crate::cli_more::cmd_heartbeat(&rest),
@@ -810,6 +822,11 @@ fn print_remote(v: &serde_json::Value) {
     }
     if share {
         println!("  {:<9} {} paired Mac(s) — lstack remote peers", c::dim("paired"), v["pairedMachines"].as_u64().unwrap_or(0));
+        let auto = v["autoApproveTransport"].as_bool().unwrap_or(true);
+        println!("  {:<9} {}", c::dim("transport"), if auto { "paired Macs may switch LAN ↔ Tailscale (auto-approved)" } else { "changes need approval — lstack remote requests" });
+        for r in v["transportRequests"].as_array().into_iter().flatten() {
+            println!("  {:<9} {} asks to use {} — lstack remote allow|deny {}", c::dim("request"), c::bold(r["name"].as_str().unwrap_or("?")), r["transport"].as_str().unwrap_or("?"), r["name"].as_str().unwrap_or("?"));
+        }
     }
     if let Some(e) = v["error"].as_str() {
         println!("  {:<9} {}", c::dim("error"), c::red(e));
@@ -817,8 +834,10 @@ fn print_remote(v: &serde_json::Value) {
     for u in v["urls"].as_array().into_iter().flatten() {
         println!("  {:<9} {}", c::dim("web"), c::cyan(u.as_str().unwrap_or("")));
     }
-    for u in v["shareUrls"].as_array().into_iter().flatten() {
-        println!("  {:<9} {}", c::dim("link"), c::cyan(u.as_str().unwrap_or("")));
+    let preferred = v["shareAddress"].as_str();
+    for (i, u) in v["shareUrls"].as_array().into_iter().flatten().enumerate() {
+        let tag = if i == 0 && preferred.is_some() { c::dim("  (shown address — lstack remote address)") } else { String::new() };
+        println!("  {:<9} {}{tag}", c::dim("link"), c::cyan(u.as_str().unwrap_or("")));
     }
     if share {
         println!("{}", c::dim("  Paired Macs connect over an encrypted, key-pinned link (Noise) on the link port."));
@@ -848,6 +867,9 @@ fn cmd_remote(args: &[String]) -> R {
     )?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("status");
+    if matches!(sub, "requests" | "transport-requests" | "allow" | "deny" | "transport") {
+        return crate::cli_more::cmd_remote_transport(&cl, sub, &a.pos[1..], a.has("json"));
+    }
     if matches!(sub, "pair" | "peers" | "grant" | "revoke" | "activity") {
         return crate::cli_more::cmd_remote_peers(&cl, sub, &a.pos[1..], a.get("tunnel"), a.has("json"));
     }
@@ -912,6 +934,43 @@ fn cmd_remote(args: &[String]) -> R {
             }
             _ => return Err("usage: lstack remote web local|network".into()),
         },
+        "address" | "addresses" => match arg {
+            None | Some("ls" | "list") => {
+                let list: serde_json::Value = cl.req("GET", "/api/remote/addresses", None)?;
+                if a.has("json") {
+                    println!("{}", serde_json::to_string_pretty(&list).unwrap_or_default());
+                    return Ok(());
+                }
+                let auto = current["shareAddress"].is_null();
+                println!("{} automatic{}", if auto { c::green("●") } else { c::dim("○") }, c::dim("  (LAN IPs, then the host name)"));
+                for x in list.as_array().into_iter().flatten() {
+                    let sel = x["selected"].as_bool().unwrap_or(false);
+                    let ips: Vec<&str> = x["resolves"].as_array().into_iter().flatten().filter_map(|i| i.as_str()).filter(|i| !i.starts_with("fe80") && *i != "127.0.0.1" && *i != "::1").collect();
+                    let check = if x["pointsHere"].as_bool().unwrap_or(false) { c::green("✓ reaches this Mac") } else if ips.is_empty() { c::red("✗ doesn't resolve") } else { c::red("✗ points elsewhere") };
+                    println!(
+                        "{} {:<34} {:<9} {check}{}",
+                        if sel { c::green("●") } else { c::dim("○") },
+                        x["address"].as_str().unwrap_or(""),
+                        x["kind"].as_str().unwrap_or(""),
+                        if x["kind"] == "ip" { String::new() } else { c::dim(&format!("  {}{}", ips[..ips.len().min(3)].join(", "), if ips.len() > 3 { ", …" } else { "" })) }
+                    );
+                }
+                println!("{}", c::dim("  Choose the one shown to other Macs: lstack remote address <name>|auto"));
+                return Ok(());
+            }
+            Some(addr) => {
+                patch.insert("shareAddress".into(), json!(addr));
+            }
+        },
+        "auto-approve" | "autoapprove" => match arg {
+            Some("on") => {
+                patch.insert("autoApproveTransport".into(), json!(true));
+            }
+            Some("off") => {
+                patch.insert("autoApproveTransport".into(), json!(false));
+            }
+            _ => return Err("usage: lstack remote auto-approve on|off".into()),
+        },
         "share" | "sharing" => match arg {
             Some("on") => {
                 patch.insert("sharing".into(), json!(true));
@@ -921,7 +980,7 @@ fn cmd_remote(args: &[String]) -> R {
             }
             _ => return Err("usage: lstack remote share on|off".into()),
         },
-        other => return Err(format!("unknown remote command {other:?} (on, off, web, share, passwd, status)")),
+        other => return Err(format!("unknown remote command {other:?} (on, off, web, share, address, auto-approve, requests, transport, passwd, status)")),
     }
     let v: serde_json::Value = cl.req("PUT", "/api/remote", Some(serde_json::Value::Object(patch)))?;
     print_remote(&v);

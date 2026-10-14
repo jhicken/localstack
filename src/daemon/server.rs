@@ -124,6 +124,51 @@ pub fn router(st: AppState) -> Router {
                     ok()
                 }),
         )
+        // How a paired Mac may reach this one (changed here: it's told and redials).
+        .route(
+            "/api/remote/peers/:id/transport",
+            post(|State(st): State<AppState>, Path(id): Path<String>, body: Bytes| async move {
+                let v = parse_body(&body)?;
+                let t = v["transport"].as_str().and_then(super::remote::Transport::parse).ok_or_else(|| ApiErr::new(400, "transport must be \"local\" or \"tailscale\""))?;
+                Ok::<_, ApiErr>(Json(st.remote.set_peer_transport(&st, &id, t, "here", true)?))
+            }),
+        )
+        .route(
+            "/api/remote/transport-requests/:id/:decision",
+            post(|State(st): State<AppState>, Path((id, d)): Path<(String, String)>| async move {
+                let allow = match d.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    _ => return Err(ApiErr::new(404, "use allow or deny")),
+                };
+                Ok::<_, ApiErr>(Json(st.remote.decide_transport(&st, &id, allow)?))
+            }),
+        )
+        .route(
+            "/api/remote/addresses",
+            get(|State(st): State<AppState>| async move {
+                let sel = st.remote.config().share_address;
+                let mut found = tokio::task::spawn_blocking(move || super::remote::discover_addresses(sel.as_deref())).await.unwrap_or_default();
+                // The Tailscale helper's own name: reachable from anywhere on the tailnet.
+                if let Some((dns, ips)) = st.remote.tailnet.self_addrs() {
+                    found.retain(|v| v["address"] != dns.as_str());
+                    let pos = found.iter().position(|v| v["pointsHere"] != true).unwrap_or(found.len());
+                    found.insert(pos, json!({ "address": dns, "kind": "tailscale", "source": "tailscale helper", "resolves": ips, "pointsHere": true }));
+                }
+                Json(found)
+            }),
+        )
+        .route(
+            "/api/tailnet",
+            get(|State(st): State<AppState>| async move { Json(st.remote.tailnet.status(&st.remote.config().tailnet)) }).post(|State(st): State<AppState>, body: Bytes| async move {
+                let p: super::tailnet::TailnetPatch = serde_json::from_slice(if body.is_empty() { b"{}" } else { &body }).map_err(|_| ApiErr::new(400, "invalid JSON body"))?;
+                Ok::<_, ApiErr>(Json(super::tailnet::api_update(&st.remote, &st, p).await?))
+            }),
+        )
+        .route("/api/tailnet/login", post(|State(st): State<AppState>, body: Bytes| async move { Ok::<_, ApiErr>(Json(super::tailnet::api_login(&st.remote, &parse_body(&body)?).await?)) }))
+        .route("/api/tailnet/logout", post(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(super::tailnet::api_logout(&st.remote).await?)) }))
+        .route("/api/tailnet/update", post(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(super::tailnet::api_check_update(&st.remote).await?)) }))
+        .route("/api/network", get(|| async { Json(json!({ "vpn": tokio::task::spawn_blocking(super::remote::vpn_status).await.unwrap_or_default() })) }))
         .route("/api/remote/activity", get(|State(st): State<AppState>| async move { Json(st.remote.activity()) }))
         .route("/api/identity", get(identity))
         .route("/api/identity/rekey", post(identity_rekey))
@@ -142,6 +187,17 @@ pub fn router(st: AppState) -> Router {
         .route("/api/heartbeat/test", post(heartbeat_test))
         .route("/api/machines", get(machines_list).post(machine_add))
         .route("/api/machines/:m", get(machine_get).patch(machine_patch).delete(machine_remove))
+        .route("/api/machines/reconnect", post(|State(st): State<AppState>| async move { Json(json!({ "reconnecting": st.peers.reconnect_down() })) }))
+        .route(
+            "/api/machines/:m/transport",
+            post(|State(st): State<AppState>, Path(m): Path<String>, body: Bytes| async move {
+                let v = parse_body(&body)?;
+                let t = v["transport"].as_str().and_then(super::remote::Transport::parse).ok_or_else(|| ApiErr::new(400, "transport must be \"local\" or \"tailscale\""))?;
+                let force = v["force"].as_bool().unwrap_or(false);
+                let (peers, tn) = (st.peers.clone(), st.remote.tailnet.clone());
+                Ok::<_, ApiErr>(Json(blocking(move || peers.set_transport(&m, t, force, tn)).await?))
+            }),
+        )
         .route("/api/machines/:m/services/:name", get(m_service))
         .route("/api/machines/:m/services/:name/logs", get(m_logs))
         .route("/api/machines/:m/services/:name/logs/stream", get(m_log_stream))
@@ -323,6 +379,8 @@ pub(super) async fn events_stream(st: AppState, redact: bool, with_peers: bool, 
                     Ok(Event::Processes(p)) => sse_msg("processes", &json!({ "processes": *p })),
                     Ok(Event::Peer(p)) if with_peers => sse_msg("peer", &json!({ "machine": p.machine, "event": p.event, "data": p.data })),
                     Ok(Event::Peer(_)) => continue,
+                    Ok(Event::Notice(n)) if with_peers => sse_msg("notice", &*n),
+                    Ok(Event::Notice(_)) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => snapshot(&sup),
                     Err(_) => break,
                 },
@@ -586,7 +644,7 @@ async fn machine_patch(State(st): State<AppState>, Path(m): Path<String>, body: 
 }
 
 async fn machine_remove(State(st): State<AppState>, Path(m): Path<String>) -> Res {
-    st.peers.remove(&m)?;
+    st.peers.unpair(&m)?;
     ok()
 }
 

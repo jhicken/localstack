@@ -29,6 +29,8 @@ pub enum Event {
     Processes(Arc<Vec<crate::types::ProcInfo>>),
     /// Something changed on another machine (see `peers.rs`).
     Peer(Arc<super::peers::PeerMsg>),
+    /// Something the user should be told about (the app shows a notification): `{title, body}`.
+    Notice(Arc<serde_json::Value>),
 }
 
 /// ~15 minutes of whole-machine samples at the 3 s cadence.
@@ -226,6 +228,12 @@ impl Drop for BusyGuard {
 }
 
 impl Sup {
+    /// Tell the user something (the app shows it as a notification; also logged).
+    pub fn notice(&self, title: &str, body: &str) {
+        println!("{} notice: {title}: {body}", super::paths::iso(super::now_ms()));
+        let _ = self.events.send(Event::Notice(Arc::new(serde_json::json!({ "title": title, "body": body }))));
+    }
+
     pub fn new() -> rusqlite::Result<Arc<Self>> {
         paths::ensure_dirs();
         let (events, _) = broadcast::channel(1024);

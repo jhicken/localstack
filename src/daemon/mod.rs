@@ -15,6 +15,7 @@ pub mod server;
 pub mod share;
 pub mod store;
 pub mod supervisor;
+pub mod tailnet;
 pub mod terminal;
 pub mod totp;
 
@@ -106,6 +107,39 @@ async fn serve() -> i32 {
     };
     write_info(&info);
     log(&format!("lstack daemon v{VERSION} listening on 127.0.0.1:{port} (pid {})", info.pid));
+    {
+        // Follow the Tailscale helper: reconnect machines once it's up, and have paired Macs update with it.
+        let (tn, peers) = (remote.tailnet.clone(), peers.clone());
+        let mut updated = tn.updated.subscribe();
+        tokio::spawn(async move {
+            let mut was = false;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            // The monotonic clock stops while the Mac sleeps; the wall clock doesn't.
+            let mut mono = std::time::Instant::now();
+            let mut wall = now_ms();
+            loop {
+                tokio::select! {
+                    v = updated.recv() => match v {
+                        Ok(v) => {
+                            let p = peers.clone();
+                            tokio::task::spawn_blocking(move || p.follow_helper_update(&v));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => return,
+                    },
+                    _ = tick.tick() => {
+                        let now = tn.running();
+                        let slept = (now_ms() - wall) - mono.elapsed().as_millis() as i64 > 5_000;
+                        (mono, wall) = (std::time::Instant::now(), now_ms());
+                        if (now && !was) || slept {
+                            peers.reconnect_down();
+                        }
+                        was = now;
+                    }
+                }
+            }
+        });
+    }
     tokio::spawn(async move { remote.apply(&remote_state).await });
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, server::router(state)).await {

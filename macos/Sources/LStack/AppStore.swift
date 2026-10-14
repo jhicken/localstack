@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
+import Network
 import Observation
+import UserNotifications
 
 @MainActor
 @Observable
@@ -119,6 +121,74 @@ final class AppStore {
 
     init() {
         Task { await eventLoop() }
+        watchNetwork()
+    }
+
+    // MARK: reconnecting
+
+    @ObservationIgnored private var pathMonitor: NWPathMonitor?
+    @ObservationIgnored private var lastPath: String?
+
+    /// After sleep or a network change (Wi-Fi, a VPN going on or off), machines that are down are redialed now
+    /// instead of after their backoff.
+    private func watchNetwork() {
+        guard ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT"] == nil else { return }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.networkChanged() }
+        }
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { [weak self] path in
+            let key = "\(path.status)|" + path.availableInterfaces.map(\.name).joined(separator: ",")
+            Task { @MainActor in
+                guard let self else { return }
+                let first = self.lastPath == nil
+                if self.lastPath != key {
+                    self.lastPath = key
+                    if !first { self.networkChanged() }
+                }
+            }
+        }
+        m.start(queue: .global(qos: .utility))
+        pathMonitor = m
+    }
+
+    private func networkChanged() {
+        Task {
+            // Give the new network a moment (DHCP, VPN routes) before dialing.
+            try? await Task.sleep(for: .seconds(1))
+            await reconnectMachines()
+            await refreshNetwork()
+        }
+    }
+
+    func reconnectMachines() async {
+        _ = try? await client?.send("POST", "/api/machines/reconnect", as: EmptyResponse.self)
+    }
+
+    // MARK: notifications
+
+    @ObservationIgnored private var notificationsAsked = false
+
+    /// The daemon's notices (a paired Mac switched transport, asks to, or needs Tailscale signed in here).
+    private func notify(title: String, body: String) {
+        // Notifications need a real app bundle (not `swift run`).
+        guard Bundle.main.bundleIdentifier != nil, Bundle.main.bundleURL.pathExtension == "app" else {
+            flash("\(title): \(body)")
+            return
+        }
+        let center = UNUserNotificationCenter.current()
+        let post = {
+            let c = UNMutableNotificationContent()
+            c.title = title
+            c.body = body
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+        }
+        if notificationsAsked {
+            post()
+        } else {
+            notificationsAsked = true
+            center.requestAuthorization(options: [.alert, .sound]) { ok, _ in if ok { post() } }
+        }
     }
 
     // MARK: derived
@@ -171,6 +241,11 @@ final class AppStore {
         case "peer":
             guard let e = try? dec.decode(PeerEvent.self, from: data) else { return }
             handlePeer(e.machine, e.event, e.data.data)
+        case "notice":
+            struct Notice: Decodable { let title: String; let body: String }
+            guard let n = try? dec.decode(Notice.self, from: data) else { return }
+            notify(title: n.title, body: n.body)
+            Task { await refreshRemote(); await refreshTailnet() }
         case "service":
             guard let s = try? dec.decode(ServiceState.self, from: data) else { return }
             if let i = services.firstIndex(where: { $0.name == s.name }) {
@@ -774,6 +849,10 @@ final class AppStore {
         } catch { return error.localizedDescription }
     }
 
+    func shareAddresses() async -> [ShareAddress] {
+        (try? await client?.send("GET", "/api/remote/addresses", as: [ShareAddress].self)) ?? []
+    }
+
     func linkActivity() async -> LinkActivity? {
         try? await client?.send("GET", "/api/remote/activity", as: LinkActivity.self)
     }
@@ -798,6 +877,108 @@ final class AppStore {
         guard let client else { return DaemonError.notRunning.localizedDescription }
         do {
             _ = try await client.send("POST", "/api/forwards/\(paused ? "pause" : "resume")", body: ["machine": f.machine, "service": f.service], as: [ForwardInfo].self)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    // MARK: transports (LAN / Tailscale)
+
+    var tailnet: TailnetStatus?
+    var vpn: VpnStatus?
+
+    func refreshTailnet() async {
+        guard let client else { tailnet = nil; return }
+        tailnet = try? await client.send("GET", "/api/tailnet", as: TailnetStatus.self)
+    }
+
+    func refreshNetwork() async {
+        struct N: Decodable { let vpn: VpnStatus? }
+        vpn = (try? await client?.send("GET", "/api/network", as: N.self))?.vpn
+    }
+
+    /// Turn Tailscale on/off (on needs `acknowledged` the first time) or change auto-update.
+    func setTailnet(enabled: Bool? = nil, acknowledged: Bool? = nil, autoUpdate: Bool? = nil) async -> String? {
+        var body: [String: Bool] = [:]
+        body["enabled"] = enabled
+        body["acknowledged"] = acknowledged
+        body["autoUpdate"] = autoUpdate
+        return await tailnetCall("POST", "/api/tailnet", body)
+    }
+
+    /// Sign in: with an auth key, or (none) get a login URL, which is opened in the browser.
+    func tailnetLogin(authKey: String? = nil) async -> String? {
+        var body: [String: String] = [:]
+        if let authKey, !authKey.isEmpty { body["authKey"] = authKey }
+        if let e = await tailnetCall("POST", "/api/tailnet/login", body) { return e }
+        if authKey?.isEmpty ?? true, let u = tailnet?.authURL, let url = URL(string: u), !u.isEmpty { NSWorkspace.shared.open(url) }
+        return nil
+    }
+
+    func tailnetLogout() async -> String? { await tailnetCall("POST", "/api/tailnet/logout", nil as [String: String]?) }
+
+    /// Check for a newer helper now. Returns an error, or a message about the result.
+    func tailnetUpdate() async -> (error: String?, message: String?) {
+        guard let client else { return (DaemonError.notRunning.localizedDescription, nil) }
+        struct R: Decodable { let updated: String? }
+        do {
+            let r = try await client.send("POST", "/api/tailnet/update", as: R.self)
+            await refreshTailnet()
+            return (nil, r.updated.map { "Updated the Tailscale helper to \($0); paired Macs are updated too." } ?? "The Tailscale helper is up to date.")
+        } catch { return (error.localizedDescription, nil) }
+    }
+
+    private func tailnetCall<B: Encodable>(_ method: String, _ path: String, _ body: B?) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            tailnet = try await client.send(method, path, body: body, as: TailnetStatus.self)
+            return nil
+        } catch {
+            await refreshTailnet()
+            return error.localizedDescription
+        }
+    }
+
+    enum TransportResult: Equatable {
+        case ok
+        case error(String)
+        /// Switching to the LAN, but it doesn't answer there right now.
+        case unreachable(String)
+    }
+
+    /// Move a machine's link to "local" or "tailscale" (`force`: even if it doesn't answer on the LAN).
+    func setTransport(_ machine: String, _ transport: String, force: Bool = false) async -> TransportResult {
+        guard let client else { return .error(DaemonError.notRunning.localizedDescription) }
+        struct Body: Encodable { let transport: String; let force: Bool }
+        do {
+            let m = try await client.send("POST", "/api/machines/\(machine.urlPath)/transport", body: Body(transport: transport, force: force), as: Machine.self)
+            if let i = machines.firstIndex(where: { $0.name == m.name }) {
+                var next = m
+                next.services = machines[i].services
+                next.processes = machines[i].processes
+                next.system = machines[i].system
+                machines[i] = next
+            }
+            return .ok
+        } catch DaemonError.http(409, let msg) where msg.hasSuffix("Switch anyway?") {
+            return .unreachable(msg)
+        } catch { return .error(error.localizedDescription) }
+    }
+
+    /// This Mac's side: allow or deny a paired Mac's transport request.
+    func decideTransport(_ peerId: String, allow: Bool) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            _ = try await client.send("POST", "/api/remote/transport-requests/\(peerId.urlPath)/\(allow ? "allow" : "deny")", as: EmptyResponse.self)
+            await refreshRemote()
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    /// This Mac's side: change how a paired Mac connects (it follows).
+    func setPeerTransport(_ peerId: String, _ transport: String) async -> String? {
+        guard let client else { return DaemonError.notRunning.localizedDescription }
+        do {
+            _ = try await client.send("POST", "/api/remote/peers/\(peerId.urlPath)/transport", body: ["transport": transport], as: EmptyResponse.self)
             return nil
         } catch { return error.localizedDescription }
     }

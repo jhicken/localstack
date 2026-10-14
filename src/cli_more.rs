@@ -102,7 +102,7 @@ fn machine_status(s: &str) -> String {
 pub fn cmd_machine(args: &[String]) -> R {
     let a = Args::parse(
         args,
-        &[("code", "", true), ("name", "", true), ("totp", "", true), ("json", "", false), ("yes", "y", false)],
+        &[("code", "", true), ("name", "", true), ("totp", "", true), ("json", "", false), ("yes", "y", false), ("force", "", false)],
     )?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("ls");
@@ -132,12 +132,17 @@ pub fn cmd_machine(args: &[String]) -> R {
                     machine_status(m["status"].as_str().unwrap_or("?")),
                     format!("{running}/{n} running"),
                     if m["grants"].is_null() { c::dim("—") } else { grants_text(&m["grants"]) },
+                    transport_text(m),
                 ]);
             }
-            println!("{}", c::table(&rows, &["MACHINE", "ADDRESS", "STATUS", "SERVICES", "ACCESS"]));
+            rows[0].push(c::dim("—"));
+            println!("{}", c::table(&rows, &["MACHINE", "ADDRESS", "STATUS", "SERVICES", "ACCESS", "TRANSPORT"]));
             for m in v["machines"].as_array().into_iter().flatten() {
                 if let Some(e) = m["error"].as_str() {
                     eprintln!("{}", c::dim(&format!("  {}: {e}", m["name"].as_str().unwrap_or("?"))));
+                }
+                if let Some(msg) = m["transportChange"]["message"].as_str() {
+                    eprintln!("{}", c::dim(&format!("  {}: {msg}", m["name"].as_str().unwrap_or("?"))));
                 }
             }
             if v["machines"].as_array().is_none_or(Vec::is_empty) {
@@ -209,7 +214,7 @@ pub fn cmd_machine(args: &[String]) -> R {
             let n = a.pos.get(1).ok_or("usage: lstack machine rm <name>")?;
             let _: Value = cl.req("DELETE", &format!("/api/machines/{}", client::enc(n)), None)?;
             println!("{} forgot {n}", c::green("✓"));
-            println!("{}", c::dim("  To cut it off on that Mac too: `lstack remote revoke <name>` there."));
+            println!("{}", c::dim("  That Mac is told to forget this one too (now, or when it's next reachable)."));
             Ok(())
         }
         "rename" | "mv" => {
@@ -218,8 +223,223 @@ pub fn cmd_machine(args: &[String]) -> R {
             println!("{} {n} → {to}", c::green("✓"));
             Ok(())
         }
-        other => Err(format!("unknown machine command {other:?} (ls, pair, id, rekey, rm, rename)")),
+        "transport" => {
+            let (Some(n), Some(t)) = (a.pos.get(1), a.pos.get(2)) else { return Err("usage: lstack machine transport <name> local|tailscale [--yes]".into()) };
+            let t = match t.as_str() {
+                "local" | "lan" => "local",
+                "tailscale" | "tailnet" => "tailscale",
+                _ => return Err("transport must be local or tailscale".into()),
+            };
+            let path = format!("/api/machines/{}/transport", client::enc(n));
+            if t == "tailscale" {
+                let st: Value = cl.req("GET", "/api/tailnet", None)?;
+                if st["phase"] != "running" {
+                    return Err(format!("Tailscale on this Mac is {} — run `lstack tailnet on` (and `lstack tailnet login`) first", st["phase"].as_str().unwrap_or("off")));
+                }
+                println!("{}", c::dim(&format!("  {n} turns Tailscale on too (if it auto-approves transport changes); someone may need to sign in there.")));
+            }
+            let mut m: Value = match cl.req("POST", &path, Some(json!({ "transport": t, "force": a.has("force") }))) {
+                Ok(m) => m,
+                Err(e) if e.ends_with("Switch anyway?") => {
+                    eprintln!("{}", c::red(&e));
+                    if !a.has("yes") && !confirm("Switch to the local network anyway?") {
+                        return Ok(());
+                    }
+                    cl.req("POST", &path, Some(json!({ "transport": t, "force": true })))?
+                }
+                Err(e) => return Err(e),
+            };
+            // Upgrades run in the background: follow them.
+            let mut last = String::new();
+            for _ in 0..600 {
+                let ch = &m["transportChange"];
+                let state = ch["state"].as_str().unwrap_or("");
+                if let Some(msg) = ch["message"].as_str().filter(|m| *m != last) {
+                    println!("  {msg}");
+                    last = msg.to_string();
+                }
+                match state {
+                    "error" => return Err(last),
+                    "waiting-approval" => {
+                        println!("{}", c::dim(&format!("  {n} will switch once it's allowed there (lstack remote allow <this mac>).")));
+                        return Ok(());
+                    }
+                    "preparing" | "waiting-login" | "switching" => {}
+                    _ if m["transport"] == t => break,
+                    _ => {}
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                m = cl.req("GET", &format!("/api/machines/{}", client::enc(n)), None)?;
+            }
+            if m["transport"] == t {
+                println!("{} {n} now connects {}", c::green("✓"), if t == "tailscale" { "over Tailscale" } else { "over the local network" });
+            }
+            Ok(())
+        }
+        "reconnect" => {
+            let v: Value = cl.req("POST", "/api/machines/reconnect", None)?;
+            println!("{} redialing {} machine(s)", c::green("✓"), v["reconnecting"].as_u64().unwrap_or(0));
+            Ok(())
+        }
+        other => Err(format!("unknown machine command {other:?} (ls, pair, id, rekey, rm, rename, transport, reconnect)")),
     }
+}
+
+/// "tailscale · direct" etc. for a watched machine.
+fn transport_text(m: &Value) -> String {
+    let t = m["transport"].as_str().unwrap_or("local");
+    let label = if t == "tailscale" { c::cyan("tailscale") } else { "local".to_string() };
+    match m["via"]["kind"].as_str() {
+        Some(v) if v != (if t == "tailscale" { "tailscale" } else { "lan" }) => format!("{label} {}", c::dim(&format!("(via {v})"))),
+        _ => label,
+    }
+}
+
+/// `lstack remote requests|allow|deny|transport` (transport changes asked by paired Macs).
+pub fn cmd_remote_transport(cl: &client::Client, sub: &str, rest: &[String], json_out: bool) -> R {
+    match sub {
+        "requests" | "transport-requests" => {
+            let v: Value = cl.req("GET", "/api/remote", None)?;
+            let list = v["transportRequests"].as_array().cloned().unwrap_or_default();
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&list).unwrap_or_default());
+            } else if list.is_empty() {
+                println!("{}", c::dim("No transport changes waiting."));
+            } else {
+                for r in list {
+                    println!("{} asks to use {}  — lstack remote allow|deny {}", c::bold(r["name"].as_str().unwrap_or("?")), r["transport"].as_str().unwrap_or("?"), r["name"].as_str().unwrap_or("?"));
+                }
+            }
+            Ok(())
+        }
+        "allow" | "deny" => {
+            let m = rest.first().ok_or_else(|| format!("usage: lstack remote {sub} <mac>"))?;
+            let peers: Value = cl.req("GET", "/api/remote/peers", None)?;
+            let id = peers.as_array().into_iter().flatten().find(|p| p["name"] == m.as_str() || p["id"] == m.as_str()).and_then(|p| p["id"].as_str()).ok_or_else(|| format!("no paired machine {m:?}"))?;
+            let _: Value = cl.req("POST", &format!("/api/remote/transport-requests/{}/{sub}", client::enc(id)), None)?;
+            println!("{} {}", c::green("✓"), if sub == "allow" { format!("{m} switched") } else { format!("kept {m} as it was") });
+            Ok(())
+        }
+        _ => {
+            let (Some(m), Some(t)) = (rest.first(), rest.get(1)) else { return Err("usage: lstack remote transport <mac> local|tailscale".into()) };
+            let v: Value = cl.req("POST", &format!("/api/remote/peers/{}/transport", client::enc(m)), Some(json!({ "transport": t })))?;
+            println!("{} {m} now reaches this Mac {}", c::green("✓"), if v["transport"] == "tailscale" { "over Tailscale" } else { "on the local network only" });
+            Ok(())
+        }
+    }
+}
+
+/// `lstack tailnet on|off|status|login|logout|update`
+pub fn cmd_tailnet(args: &[String]) -> R {
+    let a = Args::parse(args, &[("auth-key", "", true), ("json", "", false), ("yes", "y", false), ("auto-update", "", true)])?;
+    let cl = client::connect(true)?;
+    let sub = a.pos.first().map(String::as_str).unwrap_or("status");
+    let mut v: Value = match sub {
+        "status" => cl.req("GET", "/api/tailnet", None)?,
+        "on" | "enable" => {
+            let st: Value = cl.req("GET", "/api/tailnet", None)?;
+            let mut body = json!({ "enabled": true });
+            if !st["acknowledged"].as_bool().unwrap_or(false) {
+                eprintln!("{}", c::bold("Turning on Tailscale"));
+                eprintln!("  LStack downloads its Tailscale helper (~16 MB, signed) and joins your tailnet as its own device.");
+                eprintln!("  Paired Macs you switch to Tailscale can then reach this one from anywhere — not just this network —");
+                eprintln!("  so this Mac's machine link is exposed to your tailnet (still key-pinned and encrypted end to end).");
+                if !a.has("yes") && !confirm("Turn it on?") {
+                    return Ok(());
+                }
+                body["acknowledged"] = json!(true);
+            }
+            if let Some(au) = a.get("auto-update") {
+                body["autoUpdate"] = json!(au == "on" || au == "true");
+            }
+            let mut v: Value = cl.req("POST", "/api/tailnet", Some(body))?;
+            for _ in 0..240 {
+                if !matches!(v["phase"].as_str(), Some("installing" | "starting" | "off")) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                v = cl.req("GET", "/api/tailnet", None)?;
+            }
+            v
+        }
+        "off" | "disable" => cl.req("POST", "/api/tailnet", Some(json!({ "enabled": false })))?,
+        "login" | "signin" => {
+            let v: Value = cl.req("POST", "/api/tailnet/login", Some(json!({ "authKey": a.get("auth-key").unwrap_or("") })))?;
+            if let Some(u) = v["authURL"].as_str().filter(|u| !u.is_empty()) {
+                println!("Sign in: {}", c::cyan(u));
+                let _ = std::process::Command::new("/usr/bin/open").arg(u).status();
+                let mut v = v;
+                for _ in 0..300 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    v = cl.req("GET", "/api/tailnet", None)?;
+                    if v["phase"] == "running" {
+                        break;
+                    }
+                }
+                v
+            } else {
+                v
+            }
+        }
+        "logout" | "signout" => cl.req("POST", "/api/tailnet/logout", None)?,
+        "update" => {
+            let v: Value = cl.req("POST", "/api/tailnet/update", None)?;
+            match v["updated"].as_str() {
+                Some(u) => println!("{} installed helper {u} (paired Macs on Tailscale are asked to update too)", c::green("✓")),
+                None => println!("{} helper is up to date", c::green("✓")),
+            }
+            v
+        }
+        other => return Err(format!("unknown tailnet command {other:?} (on, off, status, login, logout, update)")),
+    };
+    if a.has("json") {
+        v.as_object_mut().map(|o| o.remove("authURL"));
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(());
+    }
+    let phase = v["phase"].as_str().unwrap_or("off");
+    let dot = match phase {
+        "running" => c::green("●"),
+        "off" => c::dim("○"),
+        "error" => c::red("●"),
+        _ => c::yellow("●"),
+    };
+    println!("{dot} Tailscale  {}", phase.replace('-', " "));
+    let row = |k: &str, val: String| println!("  {:<9} {val}", c::dim(k));
+    if let Some(d) = v["self"]["dnsName"].as_str().filter(|d| !d.is_empty()) {
+        row("device", d.to_string());
+    } else if v["enabled"] == true {
+        row("device", v["deviceName"].as_str().unwrap_or("").to_string());
+    }
+    if let Some(t) = v["tailnet"].as_str().filter(|t| !t.is_empty()) {
+        row("tailnet", format!("{t}{}", v["user"].as_str().map(|u| format!("  ({u})")).unwrap_or_default()));
+    }
+    if let Some(ver) = v["version"].as_str().or(v["installedVersion"].as_str()) {
+        let au = if v["autoUpdate"].as_bool().unwrap_or(true) { "updates automatically" } else { "auto-update off" };
+        row("helper", format!("{ver}  {}", c::dim(au)));
+    }
+    if let Some(e) = v["error"].as_str() {
+        row("error", c::red(e));
+    }
+    for h in v["health"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        row("health", c::yellow(h));
+    }
+    let lstack: Vec<&Value> = v["peers"].as_array().into_iter().flatten().filter(|p| p["isLStack"] == true).collect();
+    for p in lstack {
+        let path = match p["path"].as_str() {
+            Some("direct") => "direct".to_string(),
+            Some("relay") => format!("relayed{}", p["relay"].as_str().map(|r| format!(" ({r})")).unwrap_or_default()),
+            _ => "".into(),
+        };
+        let on = if p["online"] == true { c::green("online") } else { c::dim("offline") };
+        row("mac", format!("{}  {on}  {}", p["dnsName"].as_str().unwrap_or("?").trim_end_matches('.'), c::dim(&path)));
+    }
+    match phase {
+        "needs-login" => println!("{}", c::dim("  Sign in: lstack tailnet login   (or --auth-key tskey-… from the Tailscale admin console)")),
+        "off" if v["enabled"] != true => println!("{}", c::dim("  Turn on: lstack tailnet on   then switch a machine: lstack machine transport <name> tailscale")),
+        _ => {}
+    }
+    Ok(())
 }
 
 /// "control + tunnel all" etc. from `{control, tunnel: "all" | "none" | [..]}`.

@@ -1,134 +1,152 @@
-# Tailscale integration (proposed, not scheduled)
+# Link transports: Local and Tailscale
 
-Status: design only. Nothing here is implemented yet.
+Each paired Mac connects over one **transport**:
 
-## Goal
+| Transport | Path | Who can reach the link port | Default |
+|---|---|---|---|
+| **Local** | Noise link over the LAN | Devices on the same local network | ✓ |
+| **Tailscale** | The same Noise link, inside Tailscale's WireGuard tunnel | Devices in your tailnet, from anywhere | opt-in |
 
-Let paired Macs reach each other from anywhere, reconnect quickly after sleep or a network change, and optionally keep
-the link port invisible to everything except your own tailnet. We do this by **using the Tailscale app that's already
-installed**, not by embedding Tailscale.
+Both transports share one pairing: the same code exchange, pinned Noise keys, grants and mutual revoke. Switching
+never needs a new pairing code. Tailscale only changes how the two Macs reach each other. The link inside is still
+end-to-end encrypted and authenticated with each Mac's own key, so Tailscale never sees the plaintext.
 
-## What works today (no code)
+Nothing is downloaded and nothing reaches the tailnet until you turn Tailscale on.
 
-Install Tailscale on both Macs and pair using the other Mac's Tailscale name:
+## The helper (`lstack-tailnet`)
 
-```sh
-lstack machine pair studio.tail1234.ts.net --code XXXX-XXXX
+LStack ships its own small Tailscale node, built on Tailscale's [`tsnet`](https://tailscale.com/kb/1244/tsnet)
+library (source in [`tailnet/`](../tailnet)):
+
+- **Userspace.** It needs no root and adds no system VPN, `utun` device or routes. It doesn't conflict with the
+  Tailscale app or another VPN, and it's used even when the Tailscale app is installed.
+- **Its own device.** It joins your tailnet as `lstack-<LocalHostName>`. Its state lives in `~/.localstack/tailnet/`.
+  Sign in once, in the browser or with an auth key.
+- **Run by the daemon.** The daemon starts and supervises it, and it exits when the daemon goes away.
+- **Two local sockets.** The daemon talks to it over Unix sockets in a `0700` directory, and both ends check the
+  peer's uid:
+  - `ctl.sock`: status, login/logout, and `CONNECT host:port`, which gives a raw stream to a tailnet peer.
+  - `link.sock`: each tailnet connection to `:7381`, preceded by one JSON line `{src, node, user, tailnet}`. The
+    helper fills that line in with Tailscale's whois for the caller.
+
+### Install and updates
+
+- **Download on demand.** When you turn Tailscale on, the daemon downloads the helper from the latest GitHub release
+  (`tailnet-manifest.json` + `.sig` + `lstack-tailnet-<ver>-darwin-universal.tar.gz`, about 25 MB).
+- **Strict checks.** Before installing, it checks all of these:
+  - The manifest's ed25519 signature, against the public key compiled into lstack.
+  - The tarball's SHA-256 against the manifest.
+  - `codesign --verify` on the binary.
+  - That the binary reports the manifest's version.
+- **Refusals.** It never installs an older version than the current one, or one that needs a newer LStack
+  (`minLStack`).
+- **Layout.** Versions live in `~/.localstack/bin/lstack-tailnet-<ver>`, with a `current` symlink. The previous
+  version is kept.
+- **Daily updates.** It checks once a day ("Update automatically", on by default), or when you run
+  `lstack tailnet update`. After updating, it restarts the helper; the node identity is kept.
+- **Paired Macs follow.** After an update it asks each Mac on the Tailscale transport to update to at least the same
+  version, waits up to 2 minutes for each, then reconnects. A Mac that can't update stays connected on its old helper,
+  which is compatible, and shows a warning.
+
+## Switching transport
+
+On the watching Mac, use **Settings → Machines → Use Tailscale / Use Local Network**, or
+`lstack machine transport <m> tailscale|local`.
+
+**Upgrade (Local → Tailscale)**
+1. Tailscale must be on and signed in on this Mac. Turning it on the first time shows the exposure warning (below).
+2. The other Mac is asked to *prepare*: it turns its helper on and installs or updates it. If it isn't signed in
+   yet, it shows a notification, and this Mac shows "waiting for <m> to sign in". Signing in is the one step that
+   always needs a person on that Mac (or an auth key).
+3. Both Macs must be on the same tailnet; otherwise the switch stops and explains why.
+4. The other Mac is asked to switch, then a test link is made over the tailnet. If that fails, the other Mac is moved
+   back to Local and nothing changes. Only after it succeeds does the link move to the tailnet.
+
+**Downgrade (Tailscale → Local)**
+1. First a Noise handshake is tried against each LAN address (2 s each).
+2. If none answers: "<m> doesn't answer on this network — Keep Tailscale / Switch anyway". The CLI asks the same
+   question; `--force` skips it.
+3. The other Mac is asked to switch, and the link redials over the LAN.
+
+**From the shared Mac.** On the shared Mac, "Local Only" next to a paired Mac (or `lstack remote transport <peer>
+local`) moves it back to the LAN. The link is closed with a reason, and the watching Mac follows on its own.
+
+**Approval.** The shared Mac applies upgrade and downgrade requests automatically and posts a notification. This is
+"Allow paired Macs to switch between LAN and Tailscale without asking", on by default
+(`lstack remote auto-approve on|off`). With it off, requests wait under Share this Mac (or `lstack remote requests`)
+until you choose Allow or Deny. The "prepare" request (turning Tailscale on there) also needs auto-approve.
+
+## What the shared Mac accepts
+
+The shared Mac checks every link it accepts against that peer's transport:
+
+| Arrives via | Local peer | Tailscale peer |
+|---|---|---|
+| TCP from this Mac's own LAN subnet, loopback, or IPv6 link-local | ✓ | ✓ (fallback while Tailscale reconnects) |
+| TCP from anywhere else: a VPN subnet (even 10.x), 100.64/10, Tailscale's ULA | ✗ | ✗ |
+| `link.sock` (the helper) | ✗ | ✓ if from the tailnet recorded when it switched |
+
+"LAN" means the subnet of a physical interface (`en*`). Being RFC 1918 isn't enough, because a corporate VPN's 10.x
+network must not count as local. Refusals are audited (Share this Mac → Activity) and the dialing Mac is told why.
+
+## Staying connected
+
+- The app asks the daemon to redial machines that are down right away after wake, a network change, or a VPN going
+  on or off. The daemon also notices sleep by itself (a wall-clock jump), and redials when its helper comes up.
+- Machines on the Tailscale transport try the tailnet first, then their LAN addresses.
+- Tailscale picks a direct path whenever it can, including on the same LAN. The machine row shows
+  "Tailscale · direct" or "relayed (DERP <region>)".
+
+## VPNs
+
+The helper uses no OS routes, so it doesn't fight other VPNs for the routing table.
+
+| VPN type | Tailscale transport | Local transport |
+|---|---|---|
+| Split tunnel (company subnets only) | No effect | No effect |
+| Full tunnel, LAN access allowed | Stays direct after a short re-probe | Works |
+| Full tunnel, LAN blocked | Falls back to a DERP relay over HTTPS through the VPN (slower, still works) | Breaks until the VPN is off |
+| Blocks Tailscale (UDP + DERP, or TLS inspection) | Offline; the helper's health warning is shown | Breaks if the LAN is blocked |
+
+LStack detects an active VPN from the default route (`GET /api/network`). When a Local machine is offline, it says
+the VPN may be blocking the local network. When a Tailscale link is relayed, it says that the VPN is why.
+
+## Security
+
+- **A wider door.** Turning Tailscale on makes this Mac's link port reachable from your whole tailnet, over the
+  internet. The link is still Noise-encrypted and only accepts paired keys, and each peer is checked against its
+  transport and tailnet. You confirm this the first time you turn Tailscale on.
+- **Signing key custody.** Only manifests signed with LStack's ed25519 key are installed:
+  - The private key lives in the release Mac's login keychain (`dev.lstack.tailnet-signing`) and in the
+    `TAILNET_SIGNING_KEY` GitHub Actions secret. To set the secret, run
+    `security find-generic-password -s dev.lstack.tailnet-signing -w | gh secret set TAILNET_SIGNING_KEY`.
+  - The public key is `PUBLIC_KEY_HEX` in `src/daemon/tailnet.rs`. Rotating it needs an LStack release that ships
+    the new public key.
+- **Tailnet ACLs.** Helpers are subject to your tailnet's ACLs. The default policy allows everything. With a custom
+  policy, allow your own devices to reach `lstack-*` devices on TCP `7381`. For example:
+  ```json
+  {"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:7381"]}
+  ```
+- **Isolated surfaces.** Auth URLs and Tailscale status are served only on the local API: never over the link and
+  never to the web dashboard.
+
+## CLI
+
+```bash
+lstack tailnet on | off | status | update
+lstack tailnet login [--auth-key tskey-…]     # opens the sign-in page and waits
+lstack tailnet logout
+lstack machine transport studio tailscale     # or local [--force] [--yes]
+lstack machine ls                             # TRANSPORT column
+lstack remote auto-approve on|off
+lstack remote requests | allow <peer> | deny <peer>
 ```
 
-The Noise link (port 7381) then runs inside Tailscale's WireGuard tunnel. The existing reconnect loop handles drops.
-Retries back off from 2 s up to 60 s, and a dead link is detected after 45 s.
+## Development and tests
 
-Gaps this leaves:
-- A Mac has exactly one address. Pairing over the LAN breaks when you leave home, and pairing over Tailscale means
-  traffic goes through Tailscale even at home.
-- After sleep or a network change, reconnecting can take up to about a minute.
-- You have to look up and type the Tailscale name yourself.
-- The link port listens on every interface (LAN included) whenever sharing is on.
-
-## Options considered
-
-| Option | Verdict |
-|---|---|
-| 1. Documentation only (pair with the Tailscale name) | Works today; leaves the gaps above |
-| 2. **Built-in awareness of the installed Tailscale** | **Chosen**: small, no new dependencies, fixes the gaps |
-| 3. Embed Tailscale (`libtailscale`/tsnet via C bindings) | Rejected for now: adds ~20 MB, a Go runtime and a second Tailscale login. Only worth it if users can't install the Tailscale app. |
-
-## Design (option 2)
-
-### 1. Detect Tailscale (`src/daemon/tailscale.rs`, new)
-- Find the CLI at `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, then `tailscale` on `PATH`. Run
-  `status --json` with a 3 s timeout, cache the result for 30 s, and refresh it on network change (see §5).
-- Parse: `BackendState` (Running?), `Self.DNSName`, `Self.TailscaleIPs`, `Self.UserID`, `MagicDNSSuffix`, and
-  `Peer{}` (HostName, DNSName, TailscaleIPs, Online, OS, UserID).
-- Fall back to interface scanning: any 100.64.0.0/10 or fd7a:115c:a1e0::/48 address on a `utun*` interface means
-  Tailscale is up, even if the CLI can't be found (App Store build sandboxing).
-- `GET /api/tailscale` → `{installed, running, name, ips, user, peers: [{name, dnsName, ips, online, os, lstack?}]}`.
-  This is local only (never served over the link), and peers are listed only when sharing or pairing UI asks.
-
-### 2. Better addresses when sharing
-- `shareUrls` (remote.rs ~574) lists the Tailscale DNS name and its 100.x address first, labelled "Tailscale",
-  then the LAN addresses. The pairing code screen shows the same.
-- `lstack remote status` / `remote pair` print them with labels.
-
-### 3. Find Macs to pair with
-- **Add machine** (Settings → Machines, `lstack machine pair` with no address) lists online tailnet peers with
-  `OS == "macOS"`.
-- A cheap probe marks the ones running LStack. It's a TCP connect to `:7381` that reads the Noise listener's banner
-  frame (or just checks that the connect succeeds), with a 1 s timeout, run in parallel and capped at 32 peers.
-- Picking one fills in the address; the code and 2FA steps stay exactly as they are.
-
-### 4. Several addresses per Mac
-- `PeerCfg.addr` becomes `addrs: Vec<String>`. Old configs load `addr` as a one-element list.
-- At pairing, the shared Mac sends its known addresses inside the encrypted pairing session (LAN IPs, `.local` name,
-  Tailscale name and IPs). The host stores them, putting the one it actually used first.
-- The shared Mac can refresh them over the link (`info` already round-trips; add `addresses`) so a DHCP change on
-  the LAN is picked up the next time the link is up.
-- To dial, try the addresses in order with a short connect timeout (LAN first, 1.5 s), or race them happy-eyeballs
-  style with ~250 ms staggering. The first Noise handshake that completes wins. Because the pinned key is checked on
-  every address, a wrong or hijacked address simply fails.
-- `lstack machine ls` and Settings show which path is in use: "LAN" / "Tailscale" / "Other".
-- `lstack machine addr <m> add|rm|ls <address>` for manual edits.
-
-### 5. Reconnect quickly
-- Redial every peer right away (resetting the backoff) when any of these happens:
-  - wake from sleep: the app forwards `NSWorkspace.didWakeNotification` → `POST /api/machines/reconnect`; the
-    daemon also checks for a wall-clock jump (> 2× the tick) as a fallback;
-  - a network path change: the app uses `NWPathMonitor` and posts the same endpoint; the daemon fallback is a 10 s
-    poll of the interface list;
-  - Tailscale going from not running to running.
-- `Peers::reconnect_all` already exists; it only needs a "skip the backoff sleep" signal (a condvar or generation
-  bump instead of `sleep(stop, n)`).
-- Expected result: back up within seconds of wake or a Wi-Fi switch.
-
-### 6. "Tailscale only" option for the link port
-- `remote.json` gets `linkBind: "all" | "tailscale" | "loopback"` (default `all`).
-- `tailscale`: bind the link listener to the Tailscale IPs only (v4 + v6). If Tailscale isn't up, the listener
-  stays down with a clear status ("waiting for Tailscale") and retries when it comes up (§5).
-- Settings → Share this Mac: "Reachable from: Any network / Tailscale only". In the CLI:
-  `lstack remote share on --via tailscale`.
-- This is also where the item "optional Tailscale-only bind" from Phase 5 for the web dashboard could share code.
-
-### 7. Optional tailnet identity check (defense in depth)
-- When a link connects from a 100.x address, ask Tailscale who owns that address (LocalAPI
-  `whois?addr=ip:port`; for the CLI, `tailscale whois --json ip:port`).
-- New grant setting per paired Mac: **"Only over my tailnet"**. The link is refused unless it arrives over Tailscale
-  *and* from the same tailnet user as this Mac (or a specific user recorded at pairing).
-- This sits on top of the Noise keys and doesn't replace them. Refusals are audited like other refusals.
-
-## Security notes
-- Noise IK keys stay the only thing that authorizes a link. Tailscale adds reachability, an optional bind
-  restriction and an optional extra identity check; it never loosens anything.
-- Address lists come either from inside the encrypted pairing session or over the authenticated link, never from
-  unauthenticated sources. Even so, a bad address can only cause a failed handshake.
-- The probe in §3 sends no secrets and learns only "something answers on 7381".
-- `/api/tailscale` is served only on the local daemon API, never to paired Macs or the web dashboard.
-
-## Surfaces
-| Where | Change |
-|---|---|
-| Settings → Machines | Tailnet Macs to pick from; the path in use per Mac; "Only over my tailnet" checkbox per paired Mac |
-| Settings → Share this Mac | Tailscale address first; "Reachable from" picker; "waiting for Tailscale" state |
-| CLI | `machine pair` (interactive picker), `machine addr`, `machine ls` path column, `remote share on --via tailscale` |
-| Menu bar | Machine header tooltip shows the path (LAN / Tailscale) |
-| Web / TUI | Path shown in the machine header (read only) |
-
-## Work items
-1. `tailscale.rs`: detection, status parsing, cache, `/api/tailscale`; interface-scan fallback.
-2. Show Tailscale names and IPs in `shareUrls` and on the pairing screen.
-3. Multiple addresses per Mac: config migration, exchange at pairing and over `info`, ordered/raced dialing,
-   showing the path in use, `machine addr`.
-4. Quick reconnect: backoff interrupt, `POST /api/machines/reconnect`, app wake/`NWPathMonitor` hooks, daemon
-   fallbacks.
-5. Discovery: list tailnet Macs with an LStack probe; the add-machine UI and CLI picker.
-6. `linkBind` (all / tailscale / loopback) with a waiting state and rebind on change.
-7. Optional tailnet whois check as a grant setting.
-8. Tests: status JSON fixtures, address-order dialing (one dead address, one live), backoff interrupt,
-   `linkBind` selection, migration from `addr`. Docs: README "Other machines".
-
-Order: 1 → 2, 1 → 5, 1 → 6, 1 → 7; 3 and 4 are independent and give most of the benefit even without Tailscale.
-
-## Open questions
-- Should `linkBind` default to `tailscale` when Tailscale is detected at the moment sharing is turned on?
-- Should the "Only over my tailnet" check be on by default for Macs paired over Tailscale?
-- Is it worth supporting Headscale (self-hosted control servers)? The status JSON is the same, so probably free.
+- `LSTACK_TAILNET_BIN=<path>` runs that binary instead of installing one, and disables updates.
+  `LSTACK_TAILNET_HOSTNAME` overrides the device name.
+- `tests/fake_tailnet.py` stands in for the helper. It's a fake tailnet between daemons on one machine, used by the
+  `tailscale_transport` end-to-end test, which covers upgrade with sign-in, following the shared Mac, approval and
+  unpairing over Tailscale.
+- `cd tailnet && go test ./...` tests the helper's header and CONNECT proxy.

@@ -21,6 +21,10 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Semaphore};
 use zeroize::Zeroizing;
 
+/// Any byte stream a link can run over: TCP on the LAN, or a Unix socket to the tailnet helper.
+pub trait Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn for T {}
+
 pub const DEFAULT_PORT: u16 = 7381;
 pub const MAGIC_LINK: &[u8; 6] = b"LSTKL1";
 pub const MAGIC_PAIR: &[u8; 6] = b"LSTKP1";
@@ -38,6 +42,21 @@ const IDENTITY_SECRET: &str = "LSTACK_IDENTITY";
 pub struct Identity {
     private: Zeroizing<Vec<u8>>,
     pub public: [u8; 32],
+}
+
+#[cfg(test)]
+impl Identity {
+    pub fn generate() -> Identity {
+        let (private, public) = generate();
+        Identity { private, public }
+    }
+}
+
+#[cfg(test)]
+impl Clone for Identity {
+    fn clone(&self) -> Identity {
+        Identity { private: self.private.clone(), public: self.public }
+    }
 }
 
 static IDENTITY: Mutex<Option<Arc<Identity>>> = Mutex::new(None);
@@ -174,13 +193,35 @@ async fn timed<T>(d: Duration, f: impl std::future::Future<Output = io::Result<T
     tokio::time::timeout(d, f).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out"))?
 }
 
+/// Connect to `host:port`, trying every address a name resolves to with its own timeout, IPv4 first.
+/// Router/mDNS names often also return IPv6 addresses that are stale (Macs rotate them) or that the
+/// link (bound to 0.0.0.0 by default) doesn't listen on; one hanging address mustn't use up the budget.
+async fn dial(addr: &str) -> io::Result<TcpStream> {
+    let mut addrs: Vec<std::net::SocketAddr> = timed(Duration::from_secs(5), async { Ok(tokio::net::lookup_host(addr).await?.collect()) }).await?;
+    addrs.sort_by_key(|a| a.is_ipv6());
+    addrs.dedup();
+    let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{addr} didn't resolve to any address"));
+    for a in addrs {
+        match timed(Duration::from_secs(4), TcpStream::connect(a)).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 // ------------------------------------------------------------------ handshake
 
 /// Dial a paired machine's link port. Fails unless it holds the private key matching `their`
 /// and has pinned our key.
 pub async fn connect(addr: &str, id: &Identity, their: &[u8; 32], hello: Value) -> io::Result<(Arc<Mux>, Value)> {
-    let mut tcp = timed(Duration::from_secs(8), TcpStream::connect(addr)).await?;
+    let tcp = dial(addr).await?;
     let _ = tcp.set_nodelay(true);
+    connect_over(tcp, id, their, hello).await
+}
+
+/// `connect` over an already open stream (e.g. through the tailnet helper).
+pub async fn connect_over<S: Conn>(mut tcp: S, id: &Identity, their: &[u8; 32], hello: Value) -> io::Result<(Arc<Mux>, Value)> {
     let mut hs = snow::Builder::new(NOISE.parse().unwrap())
         .local_private_key(&id.private)
         .remote_public_key(their)
@@ -218,8 +259,7 @@ pub struct Accepted {
 
 /// Server half of the link handshake (after `MAGIC_LINK` was read). `authorize` maps the caller's static
 /// key to a reply payload, or refuses with a message.
-pub async fn accept(mut tcp: TcpStream, id: &Identity, authorize: impl FnOnce(&[u8; 32], &Value) -> Result<Value, String>) -> io::Result<Accepted> {
-    let _ = tcp.set_nodelay(true);
+pub async fn accept<S: Conn>(mut tcp: S, id: &Identity, authorize: impl FnOnce(&[u8; 32], &Value) -> Result<Value, String>) -> io::Result<Accepted> {
     let mut hs = snow::Builder::new(NOISE.parse().unwrap()).local_private_key(&id.private).prologue(PROLOGUE).build_responder().map_err(ioerr)?;
     let msg = timed(Duration::from_secs(10), read_frame(&mut tcp)).await?;
     let mut buf = vec![0u8; MAX_MSG];
@@ -254,6 +294,17 @@ const F_RESET: u8 = 4;
 const F_WINDOW: u8 = 5;
 const F_PING: u8 = 6;
 const F_PONG: u8 = 7;
+/// Last frame before a deliberate close: `{"reason": …}`. `revoked` means "forget each other" (either side
+/// unpaired). Older LStack drops the link on an unknown frame, which ends it just the same.
+const F_BYE: u8 = 8;
+
+/// `F_BYE` reason: the pairing was removed on the sending side; the receiver should forget it too.
+pub const BYE_REVOKED: &str = "revoked";
+/// Link goodbye reason prefix: the shared Mac changed how this link travels (`transport-local` / `transport-tailscale`);
+/// the watching Mac switches and redials.
+pub const BYE_TRANSPORT: &str = "transport-";
+/// Link refusal text for a key the shared Mac revoked while that Mac was offline.
+pub const REFUSED_REVOKED: &str = "revoked this Mac's access";
 
 /// A stream opened by the other side.
 pub struct Incoming {
@@ -280,6 +331,8 @@ pub struct Mux {
     dead: AtomicBool,
     incoming: Mutex<Option<mpsc::Sender<Incoming>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// What the other side said in its `F_BYE`, if it closed the link deliberately.
+    farewell: Mutex<Option<Value>>,
     pub opened_at: i64,
 }
 
@@ -292,7 +345,7 @@ fn frame(kind: u8, id: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 impl Mux {
-    fn start(tcp: TcpStream, ts: snow::TransportState, client: bool, incoming: Option<mpsc::Sender<Incoming>>) -> Arc<Mux> {
+    fn start<S: Conn>(tcp: S, ts: snow::TransportState, client: bool, incoming: Option<mpsc::Sender<Incoming>>) -> Arc<Mux> {
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
         let mux = Arc::new(Mux {
             out: out_tx,
@@ -302,10 +355,11 @@ impl Mux {
             dead: AtomicBool::new(false),
             incoming: Mutex::new(incoming),
             tasks: Mutex::new(vec![]),
+            farewell: Mutex::new(None),
             opened_at: now_ms(),
         });
         let ts = Arc::new(Mutex::new(ts));
-        let (mut rd, mut wr) = tcp.into_split();
+        let (mut rd, mut wr) = tokio::io::split(tcp);
         let wts = ts.clone();
         let wm = mux.clone();
         let writer = tokio::spawn(async move {
@@ -321,7 +375,7 @@ impl Mux {
                     Ok(n) => n,
                     Err(_) => break,
                 };
-                if write_frame(&mut wr, &buf[..n]).await.is_err() {
+                if write_frame(&mut wr, &buf[..n]).await.is_err() || plain.first() == Some(&F_BYE) {
                     break;
                 }
             }
@@ -398,6 +452,10 @@ impl Mux {
                 true
             }
             F_PONG => true,
+            F_BYE => {
+                *self.farewell.lock().unwrap() = Some(serde_json::from_slice(payload).unwrap_or(Value::Null));
+                false
+            }
             _ => false,
         }
     }
@@ -506,6 +564,35 @@ impl Mux {
         for t in self.tasks.lock().unwrap().drain(..) {
             t.abort();
         }
+    }
+
+    /// Close the link deliberately, telling the other side why (see `F_BYE`). Frames already queued go
+    /// out first; the link is cut after 2 s even if the other side stopped reading.
+    pub fn bye(self: &Arc<Self>, reason: &str) {
+        if self.is_closed() || self.out.try_send(frame(F_BYE, 0, json!({ "reason": reason }).to_string().as_bytes())).is_err() {
+            self.shutdown();
+            return;
+        }
+        let me = self.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    me.shutdown();
+                });
+            }
+            Err(_) => {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    me.shutdown();
+                });
+            }
+        }
+    }
+
+    /// The reason the other side gave for closing the link (`F_BYE`), if any.
+    pub fn farewell(&self) -> Option<String> {
+        self.farewell.lock().unwrap().as_ref().map(|v| v["reason"].as_str().unwrap_or("").to_string())
     }
 
     pub fn stream_count(&self) -> usize {
@@ -669,9 +756,14 @@ pub struct Paired {
 
 /// Host side: pair with the machine at `addr` using its one-time code (`auth` may carry a 2FA `totp` code).
 pub async fn pair_client(addr: &str, code: &str, auth: Value, host_name: &str) -> Result<Paired, String> {
+    let tcp = dial(addr).await.map_err(|e| format!("can't reach {addr}: {e} (is “Share this Mac” on there?)"))?;
+    pair_client_over(tcp, addr, code, auth, host_name).await
+}
+
+/// `pair_client` over an already open stream; `addr` is only used in messages.
+pub async fn pair_client_over<S: Conn>(mut tcp: S, addr: &str, code: &str, auth: Value, host_name: &str) -> Result<Paired, String> {
     use spake2::{Ed25519Group, Password, Spake2};
     let id = identity()?;
-    let mut tcp = timed(Duration::from_secs(8), TcpStream::connect(addr)).await.map_err(|e| format!("can't reach {addr}: {e} (is “Share this Mac” on there?)"))?;
     let (a, b) = spake_ids();
     let (st, msg) = Spake2::<Ed25519Group>::start_a(&Password::new(normalize_code(code)), &a, &b);
     let io = async {
@@ -724,7 +816,7 @@ fn pair_io_error(addr: &str, e: &io::Error) -> String {
 }
 
 /// Shared-Mac side: refuse a pairing attempt with a message the other Mac can show.
-pub async fn pair_refuse(mut tcp: TcpStream, msg: &str) {
+pub async fn pair_refuse<S: Conn>(mut tcp: S, msg: &str) {
     // Read what was sent first: closing with unread data makes the kernel reset the connection, which can
     // throw away the reply before the other Mac reads it.
     let _ = timed(Duration::from_secs(5), read_frame(&mut tcp)).await;
@@ -746,7 +838,7 @@ pub trait PairPolicy: Send + Sync {
 }
 
 /// Shared-Mac side of pairing (after `MAGIC_PAIR` was read).
-pub async fn pair_server<P: PairPolicy>(mut tcp: TcpStream, policy: &P) -> io::Result<()> {
+pub async fn pair_server<P: PairPolicy, S: Conn>(mut tcp: S, policy: &P) -> io::Result<()> {
     use spake2::{Ed25519Group, Password, Spake2};
     let first = timed(Duration::from_secs(10), read_frame(&mut tcp)).await?;
     let Some(first) = as_plain(&first) else { return Ok(()) };
@@ -861,6 +953,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bye_tells_the_other_side_why() {
+        for client_says_bye in [true, false] {
+            let (client, server) = pair_of_links(true).await.unwrap();
+            let (from, to) = if client_says_bye { (client, server.mux) } else { (server.mux, client) };
+            from.bye(BYE_REVOKED);
+            tokio::time::timeout(Duration::from_secs(2), to.closed()).await.expect("receiver must close");
+            assert_eq!(to.farewell().as_deref(), Some(BYE_REVOKED));
+            tokio::time::timeout(Duration::from_secs(3), from.closed()).await.expect("sender must close");
+            assert_eq!(from.farewell(), None);
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_key_is_refused() {
         let err = pair_of_links(false).await.err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
@@ -911,6 +1016,15 @@ mod tests {
         let r = pair_client(&addr, code, json!({ "username": "me", "password": password }), "host").await;
         srv.await.unwrap();
         (r, pol.wrong.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn dial_resolves_names() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        // `localhost` resolves to ::1 as well, where nothing listens: it must fall through to 127.0.0.1.
+        assert!(dial(&format!("localhost:{port}")).await.is_ok());
+        assert!(dial("no-such-host.invalid:7381").await.is_err());
     }
 
     #[tokio::test]

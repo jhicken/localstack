@@ -230,17 +230,23 @@ lstack ps --machine studio
 lstack forwards                   # paired Macs' services forwarded to localhost
 lstack forwards pause web@studio  # or resume
 lstack machine rename studio mini
-lstack machine rm mini
+lstack machine transport studio tailscale   # or local; needs `lstack tailnet on` + sign-in first
+lstack machine rm mini            # unpair: mini forgets this Mac too
 
 # on the watched Mac
 lstack remote peers               # paired Macs, their access and link state
 lstack remote grant laptop control --tunnel web,api   # or no-control, --tunnel all|none
-lstack remote revoke laptop       # unpair now: its link and tunnels drop
+lstack remote revoke laptop       # unpair now: its link and tunnels drop, and laptop forgets this Mac too
+lstack remote address             # ways to reach this Mac (DNS name, Bonjour, IPs), each checked
+lstack remote address mini.lan    # the address to show other Macs (`auto` = IP address)
 lstack remote activity            # links, pairings, tunnels and refusals
 ```
 
 - **Access per Mac.** A new pairing can view and tunnel to all services but can't control them. On the watched Mac, change this per paired Mac: start/stop/restart, and tunnels to all services, none, or a list (Settings → Machines → Share this Mac, or `lstack remote grant`). Changes apply at once: the link reconnects with the new grants. Turning sharing off drops every link; pairings are kept.
 - **Forwards.** Forwards appear only for granted services and only for ports that service is listening on *right now*. The watched Mac checks this again for every connection, so another program sitting on a stopped service's port is refused. It only ever connects to its own loopback. On this Mac, forwards listen only on 127.0.0.1/::1 and keep the same port number when it's free (otherwise a remembered fallback, saved in `forwards.json`). Each connection must come from a process owned by your macOS user.
+- **Unpairing is mutual.** Removing a machine on either Mac (`machine rm`, `remote revoke`, or the Remove/Revoke buttons) tells the other Mac over the link, and it forgets the pairing too. If the other Mac is offline, it's told the next time either side can reach the other.
+- **Addresses.** Pair with an IP address or a name: router DNS names such as `studio.lan` and Bonjour `studio.local` keep working when the IP changes. **Settings → Machines → Share this Mac → Show this Mac as** (or `lstack remote address`) lists the names that lead to this Mac and lets you choose the one shown with the pairing code.
+- **Tailscale (optional).** To reach paired Macs away from home, turn on **Settings → Machines → Tailscale** (or `lstack tailnet on`). LStack downloads its own signed, userspace Tailscale helper (no VPN or admin rights; nothing is downloaded until you turn it on) and you sign in once. Then **Use Tailscale** on a machine (or `lstack machine transport studio tailscale`). The other Mac turns Tailscale on by itself; it auto-approves switches between LAN and Tailscale unless you turn that off. The same encrypted link runs inside Tailscale, and **Use Local Network** switches back after checking the Mac answers on the LAN. The helper updates daily and paired Macs follow. See [docs/TAILSCALE.md](docs/TAILSCALE.md).
 - **No secrets cross.** Secret values are never sent, env values and ping URLs are redacted, and logs are scrubbed on the watched Mac before they're sent.
 - **Upgrading from an older LStack.** Old pairings used bearer tokens over plain HTTP and are no longer accepted. They show as **pair again**: get a new code on the other Mac and pair again; the name is kept.
 
@@ -264,7 +270,9 @@ Each LStack install has its own X25519 key pair. The private key is kept in the 
 | Another app running as you | Can use forwards, just like your browser can (same trust as your user) |
 | A compromised paired Mac | Limited to its grants: granted services' own ports on the loopback; audited and revocable |
 
-Not supported: reverse tunnels, UDP, and relays or NAT traversal. Use the LAN or a VPN such as Tailscale to reach the link port.
+- **Over Tailscale.** A Mac on the Local transport is accepted only from this Mac's own LAN subnets (not VPN subnets or the tailnet). A Mac on the Tailscale transport is also accepted through the helper, and only from the tailnet it switched on. The Noise keys still authorize every link.
+
+Not supported: reverse tunnels, UDP, and LStack's own relays or NAT traversal (the Tailscale transport covers reaching Macs elsewhere).
 
 **Future: screen sharing.** The link's typed streams are built so that screen sharing can be added later as two more stream kinds, each with its own grant and a consent prompt on the shared Mac: `screen` (ScreenCaptureKit capture, VideoToolbox H.264/HEVC frames) and `input` (CGEvent injection; needs Accessibility). Those frames would use the same Noise link with no extra crypto. This isn't implemented yet.
 

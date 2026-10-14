@@ -46,7 +46,7 @@ struct PopoverView: View {
                         }
                         ForEach(store.machines) { m in
                             MachineHeader(name: m.name, status: m.status, detail: m.online ? (m.canControl ? nil : "view only") : (m.status == "repair" ? "pair again in Settings" : (m.error ?? m.status)),
-                                          count: m.services?.count ?? 0, collapsed: isCollapsed(m.name)) { toggle(m.name) }
+                                          help: m.linkDescription, count: m.services?.count ?? 0, collapsed: isCollapsed(m.name)) { toggle(m.name) }
                                 .padding(.top, 10)
                             if !isCollapsed(m.name) {
                                 ForEach(m.services ?? []) { s in
@@ -329,6 +329,8 @@ struct MachineHeader: View {
     let name: String
     let status: String
     let detail: String?
+    /// Extra tooltip line (e.g. how the link travels).
+    var help: String? = nil
     var count = 0
     var collapsed = false
     var toggle: () -> Void = {}
@@ -351,7 +353,7 @@ struct MachineHeader: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("\(name): \(status) — click to \(collapsed ? "expand" : "collapse")")
+        .help("\(name): \(status)\(help.map { " · \($0)" } ?? "") — click to \(collapsed ? "expand" : "collapse")")
     }
 
     private var color: Color {

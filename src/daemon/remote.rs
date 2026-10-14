@@ -61,6 +61,16 @@ pub struct RemoteConfig {
     pub link_port: u16,
     /// Macs paired with this one: their pinned public keys and what each may do.
     pub peers: Vec<SharedPeer>,
+    /// Keys revoked here while their Mac was offline (hex, newest last): when one connects again it's told,
+    /// so it forgets this Mac too. Cleared when that key pairs again.
+    pub revoked: Vec<String>,
+    /// Address shown first for reaching this Mac (pairing code, Settings) — e.g. a router DNS name that
+    /// survives DHCP changes. None = automatic (LAN IPs, then the host name).
+    pub share_address: Option<String>,
+    /// The Tailscale transport (helper on/off, updates).
+    pub tailnet: super::tailnet::TailnetConfig,
+    /// Paired Macs may switch their own transport (LAN ↔ Tailscale) without asking here. Missing = on.
+    pub auto_approve_transport: Option<bool>,
 }
 
 /// A Mac allowed to connect to this one over the link.
@@ -77,6 +87,49 @@ pub struct SharedPeer {
     pub phrase: String,
     pub created_at: i64,
     pub last_seen: Option<i64>,
+    /// How this Mac may reach us: over the local network only, or through the tailnet.
+    pub transport: Transport,
+    /// For `Tailscale`: the tailnet identity it must come from (set when it switched to Tailscale).
+    pub tailnet_id: Option<TailnetId>,
+}
+
+/// How a paired Mac's link travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    /// The LAN: link connections are accepted only from this Mac's physical network.
+    #[default]
+    Local,
+    /// The tailnet, through the `lstack-tailnet` helper (WireGuard; direct on the LAN, relayed elsewhere).
+    Tailscale,
+}
+
+impl Transport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Transport::Local => "local",
+            Transport::Tailscale => "tailscale",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Transport> {
+        match s {
+            "local" | "lan" => Some(Transport::Local),
+            "tailscale" | "tailnet" => Some(Transport::Tailscale),
+            _ => None,
+        }
+    }
+}
+
+/// Who a tailnet connection came from, as the helper's `whois` reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TailnetId {
+    /// The tailnet (e.g. `jeff@github` or `example.com`).
+    pub tailnet: String,
+    /// The owning user's login.
+    pub user: String,
+    /// The node's MagicDNS name (informational; nodes may be renamed).
+    pub node: String,
 }
 
 /// What one paired Mac may do here (viewing status is always allowed).
@@ -122,6 +175,10 @@ impl Default for RemoteConfig {
             totp_secret: String::new(),
             link_port: super::link::DEFAULT_PORT,
             peers: vec![],
+            revoked: vec![],
+            share_address: None,
+            tailnet: Default::default(),
+            auto_approve_transport: None,
         }
     }
 }
@@ -242,9 +299,20 @@ pub(super) struct LiveLink {
     pub peer_id: String,
     pub mux: Arc<super::link::Mux>,
     pub addr: SocketAddr,
+    pub via: super::share::Via,
 }
 
 type TunnelKey = (String, String, u16);
+
+/// A paired Mac asked to change how its link travels (kept until allowed or denied here).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportRequest {
+    pub peer_id: String,
+    pub name: String,
+    pub transport: Transport,
+    pub at: i64,
+}
 
 /// Owns the remote listener's lifecycle, its sessions and login throttling.
 pub struct Remote {
@@ -264,11 +332,15 @@ pub struct Remote {
     /// The link listener (sharing).
     link: Mutex<Option<Running>>,
     pub(super) links: Mutex<Vec<LiveLink>>,
+    /// Transport changes paired Macs asked for while auto-approve is off.
+    transport_requests: Mutex<Vec<TransportRequest>>,
     /// Recent link / tunnel events, newest last.
     activity: Mutex<std::collections::VecDeque<Value>>,
     /// Tunnel use per (peer, service, port): connections, bytes, last at.
     /// (peer, service, port) → (connections, bytes, last used).
     tunnel_stats: Mutex<HashMap<TunnelKey, (u64, u64, i64)>>,
+    /// The Tailscale helper.
+    pub tailnet: Arc<super::tailnet::Tailnet>,
 }
 
 #[derive(Deserialize, Default)]
@@ -283,6 +355,9 @@ pub struct RemotePatch {
     pub username: Option<String>,
     pub password: Option<String>,
     pub allow_control: Option<bool>,
+    /// Preferred address to show for this Mac; "" = automatic.
+    pub share_address: Option<String>,
+    pub auto_approve_transport: Option<bool>,
 }
 
 impl Remote {
@@ -299,8 +374,10 @@ impl Remote {
             pair_code: Mutex::new(None),
             link: Mutex::new(None),
             links: Mutex::new(vec![]),
+            transport_requests: Mutex::new(vec![]),
             activity: Mutex::new(Default::default()),
             tunnel_stats: Mutex::new(HashMap::new()),
+            tailnet: super::tailnet::Tailnet::new(),
         })
     }
 
@@ -382,6 +459,41 @@ impl Remote {
         f.get(&ip).map_or(0, |(_, last)| ((LOCKOUT_MS - (now_ms() - last)) / 1000).max(1))
     }
 
+    /// Change the Tailscale settings and save them.
+    pub fn set_tailnet(&self, f: impl FnOnce(&mut super::tailnet::TailnetConfig)) -> Result<super::tailnet::TailnetConfig, ApiErr> {
+        let mut cfg = self.config();
+        f(&mut cfg.tailnet);
+        let t = cfg.tailnet.clone();
+        self.save(cfg)?;
+        Ok(t)
+    }
+
+    /// Ways a paired Mac can reach this one: LAN addresses, and the tailnet node when Tailscale is on.
+    pub fn transports(&self) -> Value {
+        let cfg = self.config();
+        let addrs: Vec<String> = self.status()["shareUrls"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|u| u.as_str()).filter(|u| !is_tailscale_host(u)).map(str::to_string).collect())
+            .unwrap_or_default();
+        let ts = self.tailnet.status(&cfg.tailnet);
+        json!({
+            "local": { "addrs": addrs },
+            "tailscale": {
+                "enabled": cfg.tailnet.enabled,
+                "phase": ts["phase"],
+                "error": ts["error"],
+                "dnsName": ts["self"]["dnsName"],
+                "ips": ts["self"]["ips"],
+                "tailnet": ts["tailnet"],
+                "helperVersion": ts["version"],
+            },
+        })
+    }
+
+    pub fn auto_approve_transport(&self) -> bool {
+        self.cfg.lock().unwrap().auto_approve_transport.unwrap_or(true)
+    }
+
     fn save(&self, cfg: RemoteConfig) -> Result<(), ApiErr> {
         save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
         *self.cfg.lock().unwrap() = cfg;
@@ -390,14 +502,17 @@ impl Remote {
 
     /// Pin a newly paired Mac. A Mac pairing again under the same name or key replaces its old entry
     /// (keeping its grants if the key is the same).
-    pub(super) fn add_peer(&self, name: &str, public: &[u8; 32], phrase: &str) -> Result<SharedPeer, ApiErr> {
+    /// Pairing over the tailnet puts the new Mac on the Tailscale transport (tied to that tailnet identity).
+    pub(super) fn add_peer(&self, name: &str, public: &[u8; 32], phrase: &str, tailnet: Option<TailnetId>) -> Result<SharedPeer, ApiErr> {
         let mut cfg = self.config();
         let key = super::link::key_hex(public);
         let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
         let old: Vec<String> = cfg.peers.iter().filter(|p| p.public_key == key || p.name == name).map(|p| p.id.clone()).collect();
         let grants = cfg.peers.iter().find(|p| p.public_key == key).map(|p| p.grants.clone()).unwrap_or_else(Grants::new_pairing);
         cfg.peers.retain(|p| !old.contains(&p.id));
-        let peer = SharedPeer { id: random_hex(4), name, public_key: key, grants, phrase: phrase.to_string(), created_at: now_ms(), last_seen: None };
+        cfg.revoked.retain(|k| *k != key);
+        let transport = if tailnet.is_some() { Transport::Tailscale } else { Transport::Local };
+        let peer = SharedPeer { id: random_hex(4), name, public_key: key, grants, phrase: phrase.to_string(), created_at: now_ms(), last_seen: None, transport, tailnet_id: tailnet };
         cfg.peers.push(peer.clone());
         self.save(cfg)?;
         for id in old {
@@ -420,6 +535,43 @@ impl Remote {
     fn drop_links(&self, id: &str) {
         for l in self.links.lock().unwrap().iter().filter(|l| l.peer_id == id) {
             l.mux.shutdown();
+        }
+    }
+
+    /// Close a paired Mac's links telling it the pairing is gone, so it forgets this Mac too.
+    fn bye_links(&self, id: &str) -> bool {
+        let links = self.links.lock().unwrap();
+        let mut told = false;
+        for l in links.iter().filter(|l| l.peer_id == id) {
+            told |= !l.mux.is_closed();
+            l.mux.bye(super::link::BYE_REVOKED);
+        }
+        told
+    }
+
+    pub(super) fn is_revoked(&self, key: &[u8; 32]) -> bool {
+        let key = super::link::key_hex(key);
+        self.cfg.lock().unwrap().revoked.contains(&key)
+    }
+
+    /// A revoked Mac connected again and was told; no need to remember its key any longer.
+    pub(super) fn revocation_delivered(&self, key: &[u8; 32]) {
+        let key = super::link::key_hex(key);
+        let mut cfg = self.config();
+        if cfg.revoked.contains(&key) {
+            cfg.revoked.retain(|k| *k != key);
+            let _ = self.save(cfg);
+        }
+    }
+
+    /// The paired Mac removed this one on its side (it said so over the link): forget it here too.
+    pub(super) fn unpaired_by_peer(&self, id: &str) {
+        let mut cfg = self.config();
+        let Ok(i) = Self::find_peer(&cfg, id) else { return };
+        let p = cfg.peers.remove(i);
+        if self.save(cfg).is_ok() {
+            self.drop_links(&p.id);
+            self.audit(json!({ "event": "unpaired", "peer": p.name, "reason": "removed on that Mac" }));
         }
     }
 
@@ -446,6 +598,9 @@ impl Remote {
                     "lastSeen": p.last_seen,
                     "online": !live.is_empty(),
                     "address": live.first().map(|l| l.addr.ip().to_string()),
+                    "via": live.first().map(|l| l.via.label()),
+                    "transport": p.transport.as_str(),
+                    "tailnet": p.tailnet_id,
                     "streams": live.iter().map(|l| l.mux.stream_count()).sum::<usize>(),
                     "connectedSince": live.iter().map(|l| l.mux.opened_at).min(),
                 })
@@ -485,10 +640,99 @@ impl Remote {
         let mut cfg = self.config();
         let i = Self::find_peer(&cfg, id)?;
         let p = cfg.peers.remove(i);
+        let pending = !self.links.lock().unwrap().iter().any(|l| l.peer_id == p.id && !l.mux.is_closed());
+        if pending {
+            // Offline: tell it the next time it tries to connect.
+            cfg.revoked.retain(|k| *k != p.public_key);
+            cfg.revoked.push(p.public_key.clone());
+            let n = cfg.revoked.len();
+            cfg.revoked.drain(..n.saturating_sub(64));
+        }
         self.save(cfg)?;
-        self.drop_links(&p.id);
-        self.audit(json!({ "event": "revoked", "peer": p.name }));
+        self.bye_links(&p.id);
+        self.audit(json!({ "event": "revoked", "peer": p.name, "told": !pending }));
         Ok(())
+    }
+
+    /// Set how a paired Mac's link travels. `tell`: close its links with the new transport so it switches and
+    /// redials (when the change didn't come from that Mac's own request).
+    pub fn set_peer_transport(&self, app: &AppState, id: &str, t: Transport, by: &str, tell: bool) -> Result<Value, ApiErr> {
+        let mut cfg = self.config();
+        let i = Self::find_peer(&cfg, id)?;
+        if t == Transport::Tailscale && !self.tailnet.running() {
+            let phase = self.tailnet.phase();
+            return Err(ApiErr::new(
+                409,
+                match phase {
+                    "off" => format!("Tailscale is off on {} — turn it on there first", hostname()),
+                    "needs-login" => format!("Tailscale on {} needs signing in first", hostname()),
+                    p => format!("Tailscale on {} isn't ready yet ({p})", hostname()),
+                },
+            ));
+        }
+        let p = &mut cfg.peers[i];
+        let (pid, name) = (p.id.clone(), p.name.clone());
+        let changed = p.transport != t;
+        p.transport = t;
+        // Over Tailscale it must come from this Mac's own tailnet (the helpers only see each other there).
+        p.tailnet_id = (t == Transport::Tailscale).then(|| TailnetId { tailnet: self.tailnet.tailnet_name().unwrap_or_default(), ..Default::default() });
+        self.save(cfg)?;
+        self.transport_requests.lock().unwrap().retain(|r| r.peer_id != pid);
+        if changed {
+            self.audit(json!({ "event": "transport", "peer": name, "transport": t.as_str(), "by": by }));
+            let how = if t == Transport::Tailscale { "over Tailscale" } else { "on the local network only" };
+            let body = match by {
+                "request" => format!("{name} switched how it connects: it now reaches this Mac {how}."),
+                _ => format!("{name} now reaches this Mac {how}."),
+            };
+            app.sup.notice("Machine link changed", &body);
+        }
+        if tell {
+            let reason = format!("{}{}", super::link::BYE_TRANSPORT, t.as_str());
+            for l in self.links.lock().unwrap().iter().filter(|l| l.peer_id == pid) {
+                l.mux.bye(&reason);
+            }
+        }
+        Ok(json!({ "transport": t.as_str(), "applied": true }))
+    }
+
+    /// A paired Mac asks to change its transport: applied right away when auto-approve is on, else queued.
+    pub fn request_transport(&self, app: &AppState, id: &str, t: Transport) -> Result<Value, ApiErr> {
+        let cfg = self.config();
+        let p = &cfg.peers[Self::find_peer(&cfg, id)?];
+        if p.transport == t {
+            self.transport_requests.lock().unwrap().retain(|r| r.peer_id != p.id);
+            return Ok(json!({ "transport": t.as_str(), "applied": true }));
+        }
+        if self.auto_approve_transport() {
+            return self.set_peer_transport(app, id, t, "request", false);
+        }
+        let mut q = self.transport_requests.lock().unwrap();
+        let fresh = !q.iter().any(|r| r.peer_id == p.id && r.transport == t);
+        q.retain(|r| r.peer_id != p.id);
+        q.push(TransportRequest { peer_id: p.id.clone(), name: p.name.clone(), transport: t, at: now_ms() });
+        drop(q);
+        if fresh {
+            self.audit(json!({ "event": "transport-requested", "peer": p.name, "transport": t.as_str() }));
+            let how = if t == Transport::Tailscale { "over Tailscale" } else { "on the local network only" };
+            app.sup.notice("Machine link request", &format!("{} asks to connect {how}. Allow it in Settings → Machines.", p.name));
+        }
+        Ok(json!({ "transport": p.transport.as_str(), "applied": false, "pending": t.as_str() }))
+    }
+
+    /// Allow or deny a queued transport request (by the asking Mac's id).
+    pub fn decide_transport(&self, app: &AppState, id: &str, allow: bool) -> Result<Value, ApiErr> {
+        let r = {
+            let q = self.transport_requests.lock().unwrap();
+            q.iter().find(|r| r.peer_id == id).cloned().ok_or_else(|| ApiErr::new(404, "no such transport request"))?
+        };
+        if allow {
+            self.set_peer_transport(app, id, r.transport, "approved", true)?;
+        } else {
+            self.transport_requests.lock().unwrap().retain(|x| x.peer_id != id);
+            self.audit(json!({ "event": "transport-denied", "peer": r.name, "transport": r.transport.as_str() }));
+        }
+        Ok(self.status())
     }
 
     /// Forget every pairing (after this Mac's key changed, they can't connect anyway).
@@ -497,7 +741,7 @@ impl Remote {
         let ids: Vec<String> = cfg.peers.drain(..).map(|p| p.id).collect();
         let _ = self.save(cfg);
         for id in ids {
-            self.drop_links(&id);
+            self.bye_links(&id);
         }
     }
 
@@ -565,7 +809,20 @@ impl Remote {
         };
         let link = self.link.lock().unwrap();
         let share_urls: Vec<String> = match &*link {
-            Some(l) if l.bind == "0.0.0.0" || l.bind == "::" => local_addresses().into_iter().map(|ip| format!("{ip}:{}", l.port)).collect(),
+            Some(l) if l.bind == "0.0.0.0" || l.bind == "::" => {
+                let mut v: Vec<String> = local_addresses().into_iter().map(|ip| format!("{ip}:{}", l.port)).collect();
+                // Names work too (router DNS like `studio.lan`, or Bonjour `studio.local`) and survive DHCP changes.
+                let h = hostname();
+                if !v.is_empty() && h != "localhost" {
+                    v.push(format!("{}:{}", if h.contains('.') { h } else { format!("{h}.local") }, l.port));
+                }
+                if let Some(a) = &cfg.share_address {
+                    let first = format!("{}:{}", host_for_url(a), l.port);
+                    v.retain(|u| *u != first);
+                    v.insert(0, first);
+                }
+                v
+            }
             Some(l) => vec![format!("{}:{}", l.bind, l.port)],
             None => vec![],
         };
@@ -574,6 +831,7 @@ impl Remote {
             "webRemote": cfg.web_remote(),
             "sharing": cfg.sharing(),
             "shareUrls": share_urls,
+            "shareAddress": cfg.share_address,
             "linkPort": cfg.link_port,
             "pairedMachines": cfg.peers.len(),
             "running": running.is_some(),
@@ -582,6 +840,8 @@ impl Remote {
             "username": cfg.username,
             "hasPassword": !cfg.password_hash.is_empty(),
             "allowControl": cfg.allow_control,
+            "autoApproveTransport": cfg.auto_approve_transport.unwrap_or(true),
+            "transportRequests": *self.transport_requests.lock().unwrap(),
             "totp": !cfg.totp_secret.is_empty(),
             "hostname": hostname(),
             "urls": urls,
@@ -627,6 +887,19 @@ impl Remote {
         if let Some(c) = patch.allow_control {
             cfg.allow_control = c;
         }
+        if let Some(a) = patch.share_address {
+            let a = a.trim().trim_end_matches('.').to_ascii_lowercase();
+            cfg.share_address = if a.is_empty() || a == "auto" {
+                None
+            } else if valid_address(&a) {
+                Some(a)
+            } else {
+                return Err(ApiErr::new(400, format!("{a:?} is not a host name or IP address (no port)")));
+            };
+        }
+        if let Some(a) = patch.auto_approve_transport {
+            cfg.auto_approve_transport = Some(a);
+        }
         if let Some(e) = patch.enabled {
             cfg.enabled = e;
         }
@@ -654,6 +927,7 @@ impl Remote {
 
     /// Make the listeners match the config (called at boot and after every change).
     pub async fn apply(self: &Arc<Self>, app: &AppState) {
+        self.tailnet.apply(app, self);
         self.apply_link(app).await;
         let cfg = self.config();
         let old = self.running.lock().unwrap().take();
@@ -799,6 +1073,7 @@ impl Remote {
     }
 
     pub fn stop(&self) {
+        self.tailnet.stop();
         if let Some(r) = self.running.lock().unwrap().take() {
             r.task.abort();
         }
@@ -830,6 +1105,289 @@ pub fn hostname() -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// A host name or IP address (without a port).
+fn valid_address(a: &str) -> bool {
+    if a.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    a.len() <= 253
+        && a.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+}
+
+fn host_for_url(a: &str) -> String {
+    if a.contains(':') { format!("[{a}]") } else { a.to_string() }
+}
+
+/// (address, netmask) of every interface, with its name.
+fn interface_nets() -> Vec<(String, IpAddr, IpAddr)> {
+    let mut out = vec![];
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() && !ifa.ifa_netmask.is_null() && ifa.ifa_flags & (libc::IFF_UP as u32) != 0 {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
+                match (*ifa.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        let a = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        let m = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
+                        out.push((name, IpAddr::V4(u32::from_be(a.sin_addr.s_addr).into()), IpAddr::V4(u32::from_be(m.sin_addr.s_addr).into())));
+                    }
+                    libc::AF_INET6 => {
+                        let a = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        let m = &*(ifa.ifa_netmask as *const libc::sockaddr_in6);
+                        out.push((name, IpAddr::V6(a.sin6_addr.s6_addr.into()), IpAddr::V6(m.sin6_addr.s6_addr.into())));
+                    }
+                    _ => {}
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out
+}
+
+fn same_subnet(a: IpAddr, b: IpAddr, mask: IpAddr) -> bool {
+    match (a, b, mask) {
+        (IpAddr::V4(a), IpAddr::V4(b), IpAddr::V4(m)) => u32::from(a) & u32::from(m) == u32::from(b) & u32::from(m),
+        (IpAddr::V6(a), IpAddr::V6(b), IpAddr::V6(m)) => u128::from(a) & u128::from(m) == u128::from(b) & u128::from(m),
+        _ => false,
+    }
+}
+
+/// Tailscale's address ranges (CGNAT 100.64/10 and fd7a:115c:a1e0::/48).
+pub fn is_tailscale_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.octets()[0] == 100 && (64..128).contains(&v.octets()[1]),
+        IpAddr::V6(v) => v.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// `host[:port]` on the tailnet (100.64/10, Tailscale's IPv6 range, or a MagicDNS name).
+pub fn is_tailscale_host(hp: &str) -> bool {
+    let host = hp.rsplit_once(':').filter(|(h, p)| p.parse::<u16>().is_ok() && (!h.contains(':') || h.ends_with(']'))).map_or(hp, |(h, _)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.ends_with(".ts.net") || host.parse::<IpAddr>().is_ok_and(is_tailscale_ip)
+}
+
+/// May a TCP link connection from `ip` count as "this local network"? Loopback, IPv6 link-local, or an
+/// address inside the subnet of a physical interface (`en*`). Being a private (RFC 1918) address isn't enough:
+/// a VPN hands those out too, and its whole network mustn't count as the LAN. Tailscale ranges never count.
+pub fn is_local_source(ip: IpAddr) -> bool {
+    local_source_in(ip, &interface_nets())
+}
+
+fn local_source_in(ip: IpAddr, nets: &[(String, IpAddr, IpAddr)]) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v) => v.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v => v,
+    };
+    if ip.is_loopback() {
+        return true;
+    }
+    if is_tailscale_ip(ip) {
+        return false;
+    }
+    if let IpAddr::V6(v) = ip {
+        if v.segments()[0] & 0xffc0 == 0xfe80 {
+            return true;
+        }
+    }
+    nets.iter().any(|(name, addr, mask)| name.starts_with("en") && !is_tailscale_ip(*addr) && same_subnet(ip, *addr, *mask))
+}
+
+fn is_tunnel_if(name: &str) -> bool {
+    ["utun", "ipsec", "ppp"].iter().any(|p| name.starts_with(p))
+}
+
+/// The interface carrying the default route, from `route -n get default`.
+fn default_route_interface(route_out: &str) -> Option<String> {
+    route_out.lines().find_map(|l| l.trim().strip_prefix("interface:")).map(|i| i.trim().to_string()).filter(|i| !i.is_empty())
+}
+
+/// A VPN that's on: a tunnel interface with an IPv4 address (macOS's own utuns only carry IPv6 link-local).
+/// Full tunnel when the default route goes through it. The Tailscale app's tunnel (100.64/10) is reported
+/// separately: it doesn't block the local network. LStack's own helper adds no interface at all.
+fn vpn_from(default_if: Option<&str>, nets: &[(String, IpAddr, IpAddr)]) -> Value {
+    let tunnels: Vec<(&str, IpAddr)> = nets.iter().filter(|(n, a, _)| is_tunnel_if(n) && a.is_ipv4()).map(|(n, a, _)| (n.as_str(), *a)).collect();
+    let tailscale_app = tunnels.iter().any(|(_, a)| is_tailscale_ip(*a));
+    let vpns: Vec<&str> = tunnels.iter().filter(|(_, a)| !is_tailscale_ip(*a)).map(|(n, _)| *n).collect();
+    let full = default_if.filter(|d| vpns.contains(d) || (is_tunnel_if(d) && !tunnels.iter().any(|(n, a)| n == d && is_tailscale_ip(*a))));
+    let iface = full.or_else(|| vpns.first().copied());
+    json!({ "active": iface.is_some(), "interface": iface, "fullTunnel": full.is_some(), "tailscaleApp": tailscale_app })
+}
+
+/// Whether a VPN is on (`{active, interface, fullTunnel, tailscaleApp}`).
+pub fn vpn_status() -> Value {
+    let out = std::process::Command::new("/sbin/route").args(["-n", "get", "default"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    vpn_from(default_route_interface(&out).as_deref(), &interface_nets())
+}
+
+/// Every IP on this Mac's interfaces (any family, loopback included) — to tell whether a name points here.
+fn interface_ips() -> std::collections::HashSet<IpAddr> {
+    let mut out = std::collections::HashSet::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() {
+                match (*ifa.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        out.insert(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        out.insert(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out
+}
+
+/// Reverse DNS (PTR) name of an IPv4 address, if the network's resolver has one.
+fn reverse_dns(ip: std::net::Ipv4Addr) -> Option<String> {
+    let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    sin.sin_family = libc::AF_INET as libc::sa_family_t;
+    sin.sin_addr.s_addr = u32::from(ip).to_be();
+    let mut host = [0 as libc::c_char; 1025];
+    let rc = unsafe {
+        libc::getnameinfo(
+            &sin as *const _ as *const libc::sockaddr,
+            sin.sin_len as libc::socklen_t,
+            host.as_mut_ptr(),
+            host.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) }.to_string_lossy().trim_end_matches('.').to_ascii_lowercase();
+    (!name.is_empty() && !name.ends_with(".arpa") && name.parse::<IpAddr>().is_err()).then_some(name)
+}
+
+pub(super) fn scutil(args: &[&str]) -> String {
+    std::process::Command::new("/usr/sbin/scutil").args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+}
+
+/// Ways other Macs might reach this one, each checked like `dig`/`nslookup` would: LAN and VPN IPs,
+/// the DNS host name, the Bonjour `.local` name, reverse-DNS names of the LAN IPs, and this Mac's
+/// names under the network's search domains (router DNS such as `studio.lan`). Names are resolved
+/// and marked `pointsHere` when they lead back to one of this Mac's addresses. Blocking (a few seconds).
+pub fn discover_addresses(selected: Option<&str>) -> Vec<Value> {
+    let ips = local_addresses();
+    let here = interface_ips();
+    let is_ts = |a: &str| a.ends_with(".ts.net") || a.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]));
+    // (name, how it was found)
+    let mut names: Vec<(String, &str)> = vec![];
+    let mut add = |n: String, how: &'static str| {
+        let n = n.trim().trim_end_matches('.').to_ascii_lowercase();
+        if valid_address(&n) && n != "localhost" && n.parse::<IpAddr>().is_err() && !names.iter().any(|(m, _)| *m == n) {
+            names.push((n, how));
+        }
+    };
+    let host = hostname();
+    let local_host = scutil(&["--get", "LocalHostName"]).trim().to_string();
+    if host.contains('.') {
+        add(host.clone(), if host.ends_with(".local") { "bonjour" } else { "hostname" });
+    }
+    if !local_host.is_empty() {
+        add(format!("{local_host}.local"), "bonjour");
+    }
+    let rev: Vec<Option<String>> = std::thread::scope(|s| {
+        let hs: Vec<_> = ips.iter().filter_map(|ip| ip.parse::<std::net::Ipv4Addr>().ok()).map(|ip| s.spawn(move || reverse_dns(ip))).collect();
+        hs.into_iter().map(|h| h.join().ok().flatten()).collect()
+    });
+    for n in rev.into_iter().flatten() {
+        add(n, "reverse dns");
+    }
+    let short: Vec<String> = [host.split('.').next().unwrap_or(""), &local_host].iter().filter(|s| !s.is_empty()).map(|s| s.to_ascii_lowercase()).collect();
+    let mut domains: Vec<String> = vec![];
+    for line in scutil(&["--dns"]).lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            let (k, v) = (k.trim(), v.trim().trim_end_matches('.').to_ascii_lowercase());
+            if (k.starts_with("search domain") || k == "domain") && !v.is_empty() && !v.ends_with(".arpa") && v != "local" && !domains.contains(&v) {
+                domains.push(v);
+            }
+        }
+    }
+    for d in domains.iter().take(6) {
+        for s in &short {
+            add(format!("{s}.{d}"), "search domain");
+        }
+    }
+    if let Some(sel) = selected {
+        add(sel.to_string(), "chosen");
+    }
+    // Forward lookups in parallel, each capped so an unresolvable name can't stall the list.
+    let resolved: Vec<Vec<IpAddr>> = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, (n, _)) in names.iter().enumerate() {
+            let (tx, n) = (tx.clone(), n.clone());
+            std::thread::spawn(move || {
+                use std::net::ToSocketAddrs;
+                let v: Vec<IpAddr> = (n.as_str(), 0).to_socket_addrs().map(|a| a.map(|a| a.ip()).collect()).unwrap_or_default();
+                let _ = tx.send((i, v));
+            });
+        }
+        drop(tx);
+        let mut out = vec![vec![]; names.len()];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while let Ok((i, mut v)) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            v.sort();
+            v.dedup();
+            out[i] = v;
+        }
+        out
+    };
+    let mut out: Vec<(u8, Value)> = vec![];
+    for ((n, how), ips) in names.iter().zip(resolved) {
+        let points_here = ips.iter().any(|ip| here.contains(ip));
+        if !points_here && matches!(*how, "search domain" | "reverse dns") {
+            continue; // only a guess, and it doesn't lead here
+        }
+        let kind = if is_ts(n) { "tailscale" } else if n.ends_with(".local") { "bonjour" } else { "dns" };
+        let rank = if !points_here { 4 } else if kind == "dns" { 0 } else if kind == "bonjour" { 1 } else { 3 };
+        let ips: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
+        out.push((rank, json!({ "address": n, "kind": kind, "source": how, "resolves": ips, "pointsHere": points_here })));
+    }
+    for ip in &ips {
+        let kind = if is_ts(ip) { "tailscale" } else { "ip" };
+        out.push((if kind == "ip" { 2 } else { 3 }, json!({ "address": ip, "kind": kind, "source": "interface", "resolves": [ip], "pointsHere": true })));
+    }
+    if let Some(sel) = selected {
+        if !out.iter().any(|(_, v)| v["address"] == sel) {
+            let here = sel.parse::<IpAddr>().is_ok_and(|ip| here.contains(&ip));
+            out.push((5, json!({ "address": sel, "kind": "ip", "source": "chosen", "resolves": [sel], "pointsHere": here })));
+        }
+    }
+    out.sort_by_key(|(r, _)| *r);
+    out.into_iter()
+        .map(|(_, mut v)| {
+            v["selected"] = json!(selected.is_some_and(|s| v["address"] == s));
+            v
+        })
+        .collect()
 }
 
 /// IPv4 addresses other machines can plausibly reach (for showing URLs): physical interfaces
@@ -907,6 +1465,8 @@ pub(super) fn peer_router(app: AppState, remote: Arc<Remote>, peer_id: String, m
         .route("/peer/api/system", get(|State(rs): State<RState>| async move { Json(rs.app.sup.system()) }))
         .route("/peer/api/processes", get(|State(rs): State<RState>| async move { Json(json!({ "processes": *rs.app.sup.processes() })) }))
         .route("/peer/api/events", get(peer_events))
+        .route("/peer/api/transport", post(peer_transport))
+        .route("/peer/api/tailnet/prepare", post(peer_tailnet_prepare))
         .fallback(|| async { ApiErr::new(404, "not found") })
         .layer(middleware::from_fn_with_state(rs.clone(), require_link))
         .with_state(rs)
@@ -1025,15 +1585,71 @@ fn link_grants(rs: &RState) -> Option<(String, Grants)> {
 
 async fn peer_info(State(rs): State<RState>) -> Json<Value> {
     let (name, grants) = link_grants(&rs).unwrap_or_default();
+    let cfg = rs.remote.config();
+    let me = rs.peer.as_ref().and_then(|p| cfg.peers.iter().find(|x| x.id == p.id));
     Json(json!({
         "hostname": hostname(),
         "version": VERSION,
         "you": name,
         "grants": grants.json(),
         "allowControl": grants.control,
+        // How this Mac accepts the caller, and every way it can be reached.
+        "transport": me.map(|p| p.transport.as_str()),
+        "transports": rs.remote.transports(),
+        "autoApproveTransport": rs.remote.auto_approve_transport(),
         "cores": super::procinfo::host_cores(),
         "memTotal": super::procinfo::host_mem_total(),
     }))
+}
+
+/// The calling Mac asks to change how its link travels: `{transport: "local" | "tailscale"}`.
+async fn peer_transport(State(rs): State<RState>, body: Bytes) -> Response {
+    let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let Some(t) = v["transport"].as_str().and_then(Transport::parse) else {
+        return ApiErr::new(400, "transport must be \"local\" or \"tailscale\"").into_response();
+    };
+    match rs.remote.request_transport(&rs.app, &lp.id, t) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The calling Mac wants to reach this one over Tailscale: turn the helper on here (installing or updating it to
+/// `minVersion`) when transport changes are auto-approved, and report its state. Never shares the sign-in URL.
+async fn peer_tailnet_prepare(State(rs): State<RState>, body: Bytes) -> Response {
+    let Some((name, _)) = link_grants(&rs) else { return ApiErr::new(403, "link only").into_response() };
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let min = v["minVersion"].as_str().map(str::to_string);
+    let remote = rs.remote.clone();
+    let cfg = remote.config();
+    if !cfg.tailnet.enabled {
+        if !remote.auto_approve_transport() {
+            return ApiErr::new(403, format!("{} doesn't auto-approve transport changes — turn on Tailscale there", hostname())).into_response();
+        }
+        if let Err(e) = remote.set_tailnet(|t| t.enabled = true) {
+            return e.into_response();
+        }
+        remote.audit(json!({ "event": "tailnet-enabled", "peer": name }));
+        rs.app.sup.notice("Tailscale turned on", &format!("{name} asked to connect over Tailscale, so LStack turned it on here."));
+        remote.tailnet.apply(&rs.app, &remote);
+    } else if let (Some(min), Some(have)) = (&min, remote.tailnet.version()) {
+        if super::tailnet::version_cmp(&have, min).is_lt() && remote.config().tailnet.auto_update() {
+            let r = remote.clone();
+            tokio::spawn(async move {
+                let _ = r.tailnet.check_update(&r).await;
+            });
+        }
+    }
+    let mut st = remote.tailnet.status(&remote.config().tailnet);
+    if st["phase"] == "needs-login" && st["authURL"].as_str().is_some_and(|u| !u.is_empty()) {
+        rs.app.sup.notice("Sign in to Tailscale", &format!("{name} wants to connect over Tailscale. Sign in under Settings → Machines → Tailscale."));
+    }
+    let keep = ["enabled", "phase", "error", "version", "self", "tailnet", "deviceName"];
+    if let Some(o) = st.as_object_mut() {
+        o.retain(|k, _| keep.contains(&k.as_str()));
+    }
+    Json(st).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1186,6 +1802,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_sources_are_physical_subnets_only() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let nets = vec![
+            ("en0".to_string(), ip("192.168.12.173"), ip("255.255.255.0")),
+            ("utun3".to_string(), ip("10.8.0.5"), ip("255.0.0.0")),
+            ("lo0".to_string(), ip("127.0.0.1"), ip("255.0.0.0")),
+        ];
+        for ok in ["192.168.12.40", "127.0.0.1", "::1", "fe80::1", "::ffff:192.168.12.9"] {
+            assert!(local_source_in(ip(ok), &nets), "{ok} should be local");
+        }
+        for bad in ["10.8.0.9", "10.1.2.3", "100.101.102.103", "fd7a:115c:a1e0::1", "192.168.13.4", "8.8.8.8"] {
+            assert!(!local_source_in(ip(bad), &nets), "{bad} should not be local");
+        }
+    }
+
+    #[test]
+    fn transport_policy() {
+        use super::super::share::{transport_refusal, Via};
+        let ts = |t: &str| TailnetId { tailnet: t.into(), user: "u".into(), node: "n".into() };
+        let lan: IpAddr = "127.0.0.1".parse().unwrap();
+        let far: IpAddr = "100.100.1.1".parse().unwrap();
+        assert!(transport_refusal(Transport::Local, None, &Via::Lan, lan).is_none());
+        assert!(transport_refusal(Transport::Local, None, &Via::Lan, far).is_some());
+        assert!(transport_refusal(Transport::Tailscale, None, &Via::Lan, far).is_some());
+        assert!(transport_refusal(Transport::Local, None, &Via::Tailnet(ts("a")), far).is_some());
+        assert!(transport_refusal(Transport::Tailscale, Some(&ts("a")), &Via::Tailnet(ts("a")), far).is_none());
+        assert!(transport_refusal(Transport::Tailscale, Some(&ts("a")), &Via::Tailnet(ts("b")), far).is_some());
+        assert!(transport_refusal(Transport::Tailscale, None, &Via::Tailnet(ts("b")), far).is_none());
+        assert_eq!(Transport::parse("tailscale"), Some(Transport::Tailscale));
+        let old: SharedPeer = serde_json::from_str(r#"{"id":"a","name":"x","publicKey":"00","phrase":"","createdAt":1}"#).unwrap();
+        assert_eq!(old.transport, Transport::Local);
+    }
+
+    #[test]
+    fn share_addresses() {
+        for ok in ["studio.lan", "studio", "192.168.1.20", "fd00::1", "my-mac.local"] {
+            assert!(valid_address(ok), "{ok}");
+        }
+        for bad in ["", "studio.lan:7381", "a b", "-x.lan", "x..lan", "http://x"] {
+            assert!(!valid_address(bad), "{bad}");
+        }
+        assert_eq!(host_for_url("fd00::1"), "[fd00::1]");
+        let found = discover_addresses(Some("chosen.invalid"));
+        println!("{}", serde_json::to_string_pretty(&found).unwrap());
+        for ip in local_addresses() {
+            assert!(found.iter().any(|c| c["address"] == ip.as_str() && c["pointsHere"] == true), "{ip}");
+        }
+        let chosen = found.iter().find(|c| c["address"] == "chosen.invalid").unwrap();
+        assert_eq!((chosen["selected"].clone(), chosen["pointsHere"].clone()), (json!(true), json!(false)));
+        assert_eq!(found.iter().filter(|c| c["selected"] == true).count(), 1);
+    }
+
+    #[test]
     fn web_and_sharing_are_separate() {
         let lan: IpAddr = "192.168.1.20".parse().unwrap();
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
@@ -1261,5 +1930,28 @@ mod tests {
         cfg.heartbeat = Some(crate::types::Heartbeat { url: Some("https://hc-ping.com/abc-uuid".into()), ..Default::default() });
         let s = ServiceState { name: "api".into(), kind: "process".into(), config: cfg, ..Default::default() };
         assert_eq!(redact(s).config.heartbeat.unwrap().url.as_deref(), Some("••••"));
+    }
+
+    #[test]
+    fn vpn_detection() {
+        let route = "   route to: default\ndestination: default\n       mask: default\n    gateway: 10.8.0.1\n  interface: utun4\n      flags: <UP,GATEWAY,DONE>\n";
+        assert_eq!(default_route_interface(route).as_deref(), Some("utun4"));
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let en0 = ("en0".to_string(), ip("192.168.1.5"), ip("255.255.255.0"));
+        let sys = ("utun0".to_string(), ip("fe80::1"), ip("ffff:ffff:ffff:ffff::"));
+        let vpn = ("utun4".to_string(), ip("10.8.0.2"), ip("255.255.255.255"));
+        let ts = ("utun6".to_string(), ip("100.101.1.2"), ip("255.255.255.255"));
+        // No VPN: only the system's IPv6 utuns.
+        let v = vpn_from(Some("en0"), &[en0.clone(), sys.clone()]);
+        assert_eq!(v["active"], false);
+        // Full tunnel.
+        let v = vpn_from(Some("utun4"), &[en0.clone(), sys.clone(), vpn.clone()]);
+        assert_eq!((v["active"].clone(), v["fullTunnel"].clone(), v["interface"].clone()), (json!(true), json!(true), json!("utun4")));
+        // Split tunnel.
+        let v = vpn_from(Some("en0"), &[en0.clone(), vpn.clone()]);
+        assert_eq!((v["active"].clone(), v["fullTunnel"].clone()), (json!(true), json!(false)));
+        // The Tailscale app (even as an exit node) isn't a LAN-blocking VPN.
+        let v = vpn_from(Some("utun6"), &[en0.clone(), ts.clone()]);
+        assert_eq!((v["active"].clone(), v["tailscaleApp"].clone()), (json!(false), json!(true)));
     }
 }
