@@ -129,7 +129,7 @@ impl Op {
 
 /// Turn `op` errors into something actionable.
 fn explain(stderr: &str) -> String {
-    let mut e = stderr.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).last().unwrap_or("op failed");
+    let mut e = stderr.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).next_back().unwrap_or("op failed");
     // "[ERROR] 2024/01/01 12:00:00 message" → "message"
     if let Some(r) = e.strip_prefix("[ERROR]") {
         e = r.trim();

@@ -80,16 +80,16 @@ pub struct Meta {
 
 impl Meta {
     /// Pulled from 1Password on this Mac (and so shareable with a paired Mac that's been granted it).
-    pub fn from_1password(&self) -> bool {
+    pub fn is_from_1password(&self) -> bool {
         matches!(self.source.as_deref(), Some("op" | "op-env"))
     }
     /// Received from a paired Mac (it read it from 1Password there). Never shared on.
-    pub fn from_peer(&self) -> bool {
+    pub fn is_from_peer(&self) -> bool {
         self.source.as_deref().is_some_and(|s| s.starts_with("peer:"))
     }
     /// Cached for an env-file reference: from 1Password here or from a paired Mac.
     pub fn imported(&self) -> bool {
-        self.from_1password() || self.from_peer()
+        self.is_from_1password() || self.is_from_peer()
     }
 }
 impl Drop for Entry {

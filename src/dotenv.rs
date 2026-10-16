@@ -100,7 +100,7 @@ fn name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-impl<'a> P<'a> {
+impl P<'_> {
     fn peek(&self) -> Option<char> {
         self.c.get(self.i).copied()
     }

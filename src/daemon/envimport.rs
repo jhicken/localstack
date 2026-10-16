@@ -192,9 +192,12 @@ fn code_var_warning(key: &str) -> String {
     format!("{key} from an env file is ignored for services with secrets (it can load code); set it in the service's env: instead")
 }
 
+/// Variables plus warnings.
+pub type EnvWithWarnings = (Vec<(String, String)>, Vec<String>);
+
 /// Plain (non-`op://`) values from the env files, for a service start. Missing or unreadable files
 /// fail the start (like `op run`); FIFO mounts are skipped with a warning.
-pub fn plain_env(cfg: &ServiceConfig) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+pub fn plain_env(cfg: &ServiceConfig) -> Result<EnvWithWarnings, String> {
     if cfg.env_files.as_ref().is_none_or(|f| f.is_empty()) {
         return Ok((vec![], vec![]));
     }
@@ -379,7 +382,7 @@ fn block_reason(key: &str, r: &str, template: Option<&str>, op: &OnePassword) ->
 fn known_vaults(metas: &BTreeMap<String, Meta>) -> BTreeSet<String> {
     metas
         .values()
-        .filter(|m| m.from_1password())
+        .filter(|m| m.is_from_1password())
         .filter_map(|m| m.reference.as_deref().and_then(dotenv::ref_parts).map(|(v, _, _)| v.to_ascii_lowercase()))
         .collect()
 }
@@ -613,7 +616,7 @@ fn store_plan(p: Plan) -> Value {
     let metas = secrets::all_meta();
     // A cached value from a paired Mac is shown as such (not as one read from 1Password here).
     let from = |i: &PlanItem| -> Option<String> {
-        let m = metas.get(&i.name).filter(|m| i.cached && m.from_peer())?;
+        let m = metas.get(&i.name).filter(|m| i.cached && m.is_from_peer())?;
         m.source.as_deref()?.strip_prefix("peer:").map(String::from)
     };
     let out = json!({
@@ -774,7 +777,7 @@ pub fn plan_link(sup: &Sup, name: &str, r: &str, service: Option<&str>, key: Opt
         return bad(why);
     }
     let metas = secrets::all_meta();
-    if let Some(m) = metas.get(name).filter(|m| !m.from_1password()) {
+    if let Some(m) = metas.get(name).filter(|m| !m.is_from_1password()) {
         return Err((409, format!("{name} is already set ({}); remove it first", m.source.as_deref().unwrap_or("local"))));
     }
     let key = match (service, key) {

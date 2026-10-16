@@ -3,7 +3,7 @@ use crate::types::LogLine;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tokio::sync::broadcast;
 
@@ -39,8 +39,8 @@ fn tag(stream: &str) -> &'static str {
     }
 }
 
-fn rotated_path(file: &PathBuf) -> PathBuf {
-    let mut p = file.clone().into_os_string();
+fn rotated_path(file: &Path) -> PathBuf {
+    let mut p = file.to_path_buf().into_os_string();
     p.push(".1");
     PathBuf::from(p)
 }

@@ -144,7 +144,7 @@ fn spec(cfg: &ServiceConfig, salt: &str) -> Option<Value> {
         .map(|(env, name)| {
             let m = metas.get(name).cloned().unwrap_or_default();
             // A value from a paired Mac may be updated by that same Mac (its pinned key) without asking again.
-            let value = if m.from_peer() { m.peer_key.clone().map(|k| format!("peer:{k}")) } else { secrets::keyed_digest(name, salt.as_bytes()) };
+            let value = if m.is_from_peer() { m.peer_key.clone().map(|k| format!("peer:{k}")) } else { secrets::keyed_digest(name, salt.as_bytes()) };
             json!({ "env": env, "secret": name, "source": m.source.as_deref().unwrap_or("local"), "ref": m.reference, "value": value })
         })
         .collect();
@@ -469,7 +469,7 @@ mod tests {
         use p256::ecdsa::signature::Signer;
         use p256::ecdsa::SigningKey;
         let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let pk = hex(&sk.verifying_key().to_sec1_point(false).as_bytes());
+        let pk = hex(sk.verifying_key().to_sec1_point(false).as_bytes());
         let sig: Signature = sk.sign(b"lstack-approval-v1\nid\nc\nconsole:api");
         let der = hex(sig.to_der().as_bytes());
         assert!(verify(&pk, b"lstack-approval-v1\nid\nc\nconsole:api", &der).is_ok());

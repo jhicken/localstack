@@ -47,7 +47,7 @@ fn strings(v: &Value) -> Vec<String> {
 
 /// The entry holding `r` that was read from 1Password on this Mac (the only kind ever sent).
 fn shareable<'a>(metas: &'a BTreeMap<String, Meta>, r: &str) -> Option<(&'a String, &'a Meta)> {
-    metas.iter().find(|(n, m)| m.from_1password() && m.reference.as_deref() == Some(r) && !n.starts_with(INTERNAL_PREFIX))
+    metas.iter().find(|(n, m)| m.is_from_1password() && m.reference.as_deref() == Some(r) && !n.starts_with(INTERNAL_PREFIX))
 }
 
 // ------------------------------------------------------------------ sender
@@ -61,7 +61,7 @@ pub fn offer(p: &SharedPeer, v: &Value) -> Value {
     let want = strings(&v["want"]);
     let have: BTreeMap<String, i64> = v["have"]
         .as_object()
-        .map(|o| o.iter().take(MAX_REFS).filter_map(|(k, v)| Some((k.clone(), v.as_i64().unwrap_or(0)))).filter(|(k, _)| clean(k)).collect())
+        .map(|o| o.iter().take(MAX_REFS).map(|(k, v)| (k.clone(), v.as_i64().unwrap_or(0))).filter(|(k, _)| clean(k)).collect())
         .unwrap_or_default();
     WANTS.lock().unwrap_or_else(|e| e.into_inner()).insert(p.id.clone(), (now_ms(), want.clone()));
     if secrets::is_locked() {
@@ -137,7 +137,7 @@ pub fn shares(remote: &Remote) -> Value {
         .collect();
     let received: Vec<Value> = metas
         .iter()
-        .filter(|(_, m)| m.from_peer())
+        .filter(|(_, m)| m.is_from_peer())
         .map(|(n, m)| json!({ "name": n, "ref": m.reference, "from": m.source.as_deref().and_then(|s| s.strip_prefix("peer:")), "fetchedAt": m.fetched_at }))
         .collect();
     let available: Vec<Value> = OFFERS
@@ -156,9 +156,9 @@ pub fn set_share(remote: &Remote, peer: &str, items: &[String], allow: bool, act
     let mut refs = vec![];
     for i in items {
         let r = match metas.get(i) {
-            Some(m) => match (m.from_1password(), m.reference.clone()) {
+            Some(m) => match (m.is_from_1password(), m.reference.clone()) {
                 (true, Some(r)) => r,
-                _ if m.from_peer() => return Err((400, format!("{i} came from another Mac; only values read from 1Password here can be shared"))),
+                _ if m.is_from_peer() => return Err((400, format!("{i} came from another Mac; only values read from 1Password here can be shared"))),
                 _ => return Err((400, format!("{i} wasn't read from 1Password; only 1Password-sourced values can be shared"))),
             },
             None => i.clone(),
@@ -245,7 +245,7 @@ pub fn sync(sup: &Arc<Sup>, peers: &Peers, only: Option<&str>, fetch_new: bool) 
         let Some(key) = peers.public_key(&machine) else { continue };
         let metas = secrets::all_meta();
         let src = format!("peer:{machine}");
-        let from_this = |m: &Meta| m.from_peer() && m.peer_key.as_deref() == Some(key.as_str());
+        let from_this = |m: &Meta| m.is_from_peer() && m.peer_key.as_deref() == Some(key.as_str());
         let wants = wants(sup, &metas, None);
         let have: BTreeMap<String, i64> = metas.values().filter(|m| from_this(m)).filter_map(|m| Some((m.reference.clone()?, m.fetched_at.unwrap_or(0)))).collect();
         // What we wait for (vault/item/field names) is only told to paired Macs when someone asked to
