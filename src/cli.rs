@@ -92,6 +92,7 @@ fn help() -> String {
 {}
   lstack machine pair studio.local --code K7QP-3M9X [--totp 123456] [--name studio]
                                  needs that Mac's pairing code (+ its 2FA code if it uses 2FA)
+  lstack machine pair 'lstack-pair://studio.lan:7381?code=K7QP-3M9X'   same, from a Quick Connect link
   lstack security 2fa on|off|status   authenticator-app codes (TOTP) for pairing new Macs with this one
                                  and web dashboard sign-in
   lstack machine id              this install's key fingerprint     lstack machine rekey
@@ -1024,7 +1025,7 @@ fn print_remote(v: &serde_json::Value) {
         println!("  {:<9} {}{tag}", c::dim("link"), c::cyan(u.as_str().unwrap_or("")));
     }
     if share {
-        println!("{}", c::dim("  Paired Macs connect daemon to daemon over an encrypted, key-pinned link (Noise), local network only."));
+        println!("{}", c::dim("  Paired Macs connect daemon to daemon over an encrypted, key-pinned link (Noise), only through the address chosen with `lstack remote address` (automatic: local network only)."));
     }
     if web && v["webRemote"].as_bool().unwrap_or(false) {
         println!("{}", c::dim("  The web dashboard is plain HTTP: use it on a trusted network only."));

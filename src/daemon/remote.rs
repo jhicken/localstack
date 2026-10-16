@@ -9,6 +9,7 @@ use super::server::{self, ApiErr, AppState};
 use super::totp;
 use crate::paths::{self, now_ms, VERSION};
 use crate::types::ServiceState;
+use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderValue, Method};
@@ -256,6 +257,15 @@ pub(super) struct LiveLink {
 
 type TunnelKey = (String, String, u16);
 
+/// The address paired Macs must connect through ("Show this Mac as"): the chosen name, the IPs of this Mac it
+/// leads to, and whether they're all on a physical (local network) interface.
+#[derive(Clone, Debug, Default)]
+pub struct Via {
+    pub address: String,
+    pub ips: Vec<IpAddr>,
+    pub lan: bool,
+}
+
 /// Owns the remote listener's lifecycle, its sessions and login throttling.
 pub struct Remote {
     cfg: Mutex<RemoteConfig>,
@@ -279,6 +289,8 @@ pub struct Remote {
     /// Tunnel use per (peer, service, port): connections, bytes, last at.
     /// (peer, service, port) → (connections, bytes, last used).
     tunnel_stats: Mutex<HashMap<TunnelKey, (u64, u64, i64)>>,
+    /// `via()` result, re-resolved after a minute or when the chosen address changes.
+    via: Mutex<Option<(Via, Instant)>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -313,6 +325,7 @@ impl Remote {
             links: Mutex::new(vec![]),
             activity: Mutex::new(Default::default()),
             tunnel_stats: Mutex::new(HashMap::new()),
+            via: Mutex::new(None),
         })
     }
 
@@ -328,7 +341,11 @@ impl Remote {
         let code: String = raw.as_bytes().chunks(2).map(|c| ALPHABET[u8::from_str_radix(std::str::from_utf8(c).unwrap_or("0"), 16).unwrap_or(0) as usize % ALPHABET.len()] as char).collect();
         let exp = now_ms() + PAIR_CODE_TTL_MS;
         *self.pair_code.lock().unwrap() = Some((code.clone(), exp, 0));
-        Ok(json!({ "code": format!("{}-{}", &code[..4], &code[4..]), "expiresAt": exp, "urls": self.status()["shareUrls"], "totp": !cfg.totp_secret.is_empty() }))
+        let code = format!("{}-{}", &code[..4], &code[4..]);
+        let urls = self.status()["shareUrls"].clone();
+        // Address + code in one string to paste on the other Mac, once an address is chosen to connect through.
+        let link = cfg.share_address.as_ref().and(urls[0].as_str()).map(|u| super::peers::quick_link(u, &code));
+        Ok(json!({ "code": code, "expiresAt": exp, "urls": urls, "link": link, "totp": !cfg.totp_secret.is_empty() }))
     }
 
     pub(super) fn current_pair_code(&self) -> Option<String> {
@@ -394,7 +411,26 @@ impl Remote {
         f.get(&ip).map_or(0, |(_, last)| ((LOCKOUT_MS - (now_ms() - last)) / 1000).max(1))
     }
 
-    /// Addresses a paired Mac can reach this one at (the link only runs over the local network).
+    /// The chosen "Show this Mac as" address and where it leads on this Mac; None when it's automatic
+    /// (local network only) or the address doesn't lead here (then the automatic rule applies too).
+    pub async fn via(&self) -> Option<Via> {
+        let address = self.config().share_address?;
+        if let Some((v, at)) = &*self.via.lock().unwrap() {
+            if v.address == address && at.elapsed() < Duration::from_secs(60) {
+                return (!v.ips.is_empty()).then(|| v.clone());
+            }
+        }
+        let a = address.clone();
+        let v = tokio::time::timeout(Duration::from_secs(3), tokio::task::spawn_blocking(move || resolve_via(&a)))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(Via { address, ips: vec![], lan: false });
+        *self.via.lock().unwrap() = Some((v.clone(), Instant::now()));
+        (!v.ips.is_empty()).then_some(v)
+    }
+
+    /// Addresses a paired Mac can reach this one at: the chosen one, or every local-network one.
     pub fn lan_addrs(&self) -> Vec<String> {
         self.status()["shareUrls"].as_array().map(|a| a.iter().filter_map(|u| u.as_str()).map(str::to_string).collect()).unwrap_or_default()
     }
@@ -655,18 +691,18 @@ impl Remote {
         let share_urls: Vec<String> = match &*link {
             Some(l) if l.bind == "0.0.0.0" || l.bind == "::" => {
                 // Only local-network addresses: the link refuses connections from anywhere else.
-                let mut v: Vec<String> = local_addresses().into_iter().filter(|ip| !is_tailscale_host(ip)).map(|ip| format!("{ip}:{}", l.port)).collect();
-                // Names work too (router DNS like `studio.lan`, or Bonjour `studio.local`) and survive DHCP changes.
-                let h = hostname();
-                if !v.is_empty() && h != "localhost" {
-                    v.push(format!("{}:{}", if h.contains('.') { h } else { format!("{h}.local") }, l.port));
-                }
                 if let Some(a) = &cfg.share_address {
-                    let first = format!("{}:{}", host_for_url(a), l.port);
-                    v.retain(|u| *u != first);
-                    v.insert(0, first);
+                    // The chosen address is the only way in.
+                    vec![format!("{}:{}", host_for_url(a), l.port)]
+                } else {
+                    let mut v: Vec<String> = local_addresses().into_iter().filter(|ip| !is_tailscale_host(ip)).map(|ip| format!("{ip}:{}", l.port)).collect();
+                    // Names work too (router DNS like `studio.lan`, or Bonjour `studio.local`) and survive DHCP changes.
+                    let h = hostname();
+                    if !v.is_empty() && h != "localhost" {
+                        v.push(format!("{}:{}", if h.contains('.') { h } else { format!("{h}.local") }, l.port));
+                    }
+                    v
                 }
-                v
             }
             Some(l) => vec![format!("{}:{}", l.bind, l.port)],
             None => vec![],
@@ -757,7 +793,15 @@ impl Remote {
         }
         save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
         let creds_changed = cfg.username != old.username || cfg.password_hash != old.password_hash;
+        let via_changed = cfg.share_address != old.share_address;
         *self.cfg.lock().unwrap() = cfg;
+        if via_changed {
+            // Links that came in another way reconnect through the new address (or are refused).
+            *self.via.lock().unwrap() = None;
+            for l in self.links.lock().unwrap().drain(..) {
+                l.mux.shutdown();
+            }
+        }
         if creds_changed {
             self.sessions.lock().unwrap().clear();
         }
@@ -1000,6 +1044,28 @@ fn same_subnet(a: IpAddr, b: IpAddr, mask: IpAddr) -> bool {
     }
 }
 
+/// Where `address` (a name or IP) leads on this Mac.
+fn resolve_via(address: &str) -> Via {
+    use std::net::ToSocketAddrs;
+    let found: Vec<IpAddr> = match address.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => (address, 0).to_socket_addrs().map(|a| a.map(|a| a.ip()).collect()).unwrap_or_default(),
+    };
+    let nets = interface_nets();
+    let mut ips: Vec<IpAddr> = found.into_iter().map(unmap).filter(|ip| nets.iter().any(|(_, a, _)| a == ip)).collect();
+    ips.sort();
+    ips.dedup();
+    let lan = !ips.is_empty() && ips.iter().all(|ip| !is_tailscale_ip(*ip) && nets.iter().any(|(n, a, _)| a == ip && n.starts_with("en")));
+    Via { address: address.to_string(), ips, lan }
+}
+
+pub fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v) => v.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v => v,
+    }
+}
+
 /// CGNAT 100.64/10 and fd7a:115c:a1e0::/48 (used by Tailscale and other overlay VPNs): never the local network.
 pub fn is_tailscale_ip(ip: IpAddr) -> bool {
     match ip {
@@ -1133,8 +1199,8 @@ pub(super) fn scutil(args: &[&str]) -> String {
 /// names under the network's search domains (router DNS such as `studio.lan`). Names are resolved
 /// and marked `pointsHere` when they lead back to one of this Mac's addresses. Blocking (a few seconds).
 pub fn discover_addresses(selected: Option<&str>) -> Vec<Value> {
-    // The link only accepts the local network, so VPN / Tailscale-app addresses are never offered.
-    let ips: Vec<String> = local_addresses().into_iter().filter(|ip| !is_tailscale_host(ip)).collect();
+    // Local network addresses, plus Tailscale's (a paired Mac may connect through either once it's chosen).
+    let ips: Vec<String> = local_addresses();
     let here = interface_ips();
     // (name, how it was found)
     let mut names: Vec<(String, &str)> = vec![];
@@ -1204,16 +1270,14 @@ pub fn discover_addresses(selected: Option<&str>) -> Vec<Value> {
         if !points_here && matches!(*how, "search domain" | "reverse dns") {
             continue; // only a guess, and it doesn't lead here
         }
-        if is_tailscale_host(n) {
-            continue;
-        }
-        let kind = if n.ends_with(".local") { "bonjour" } else { "dns" };
-        let rank = if !points_here { 4 } else if kind == "dns" { 0 } else { 1 };
+        let kind = if is_tailscale_host(n) { "tailscale" } else if n.ends_with(".local") { "bonjour" } else { "dns" };
+        let rank = if !points_here { 4 } else { [("dns", 0), ("bonjour", 1), ("tailscale", 3)].iter().find(|k| k.0 == kind).map_or(3, |k| k.1) };
         let ips: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
         out.push((rank, json!({ "address": n, "kind": kind, "source": how, "resolves": ips, "pointsHere": points_here })));
     }
     for ip in &ips {
-        out.push((2, json!({ "address": ip, "kind": "ip", "source": "interface", "resolves": [ip], "pointsHere": true })));
+        let ts = is_tailscale_host(ip);
+        out.push((if ts { 3 } else { 2 }, json!({ "address": ip, "kind": if ts { "tailscale" } else { "ip" }, "source": "interface", "resolves": [ip], "pointsHere": true })));
     }
     if let Some(sel) = selected {
         if !out.iter().any(|(_, v)| v["address"] == sel) {
@@ -1328,16 +1392,13 @@ fn router(app: AppState, remote: Arc<Remote>, gen: u64) -> Router {
         .route("/api/processes", get(|State(rs): State<RState>| async move { server::processes(State(rs.app)).await.into_response() }))
         .route("/api/machines", get(|State(rs): State<RState>| async move { server::machines_list(State(rs.app)).await.into_response() }))
         .route("/api/machines/:m", get(|State(rs): State<RState>, p: Path<String>| async move { server::machine_get(State(rs.app), p).await.into_response() }))
-        .route("/api/machines/:m/services/:name", get(|State(rs): State<RState>, p: Path<(String, String)>| async move { server::m_service(State(rs.app), p).await.into_response() }))
+        .route("/api/machines/:m/services/:name", get(m_service))
         .route("/api/machines/:m/services/:name/logs", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_logs(State(rs.app), p, q).await.into_response() }))
         .route("/api/machines/:m/services/:name/logs/stream", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_log_stream(State(rs.app), p, q).await.into_response() }))
         .route("/api/machines/:m/services/:name/metrics", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_metrics(State(rs.app), p, q).await.into_response() }))
         .route(
             "/api/machines/:m/services/:name/:action",
-            post(|State(rs): State<RState>, p: Path<(String, String, String)>| async move {
-                let allowed = rs.remote.config().allow_control;
-                server::m_action(State(rs.app), p, allowed).await.into_response()
-            }),
+            post(m_action),
         )
         .layer(middleware::from_fn_with_state(rs.clone(), require_session));
     Router::new()
@@ -1568,6 +1629,22 @@ async fn get_one(State(rs): State<RState>, Path(name): Path<String>) -> Result<J
     Ok(Json(redact(rs.app.sup.get_state(&name)?)))
 }
 
+// This Mac's own services by machine name must go through the redacting handlers above, like `/api/services`.
+async fn m_service(State(rs): State<RState>, Path((m, name)): Path<(String, String)>) -> Response {
+    if server::is_local(&m) {
+        return get_one(State(rs), Path(name)).await.into_response();
+    }
+    server::m_service(State(rs.app), Path((m, name))).await.into_response()
+}
+
+async fn m_action(State(rs): State<RState>, Path((m, name, act)): Path<(String, String, String)>) -> Response {
+    if server::is_local(&m) {
+        return action(State(rs), Path((name, act))).await.into_response();
+    }
+    let allowed = rs.remote.config().allow_control;
+    server::m_action(State(rs.app), Path((m, name, act)), allowed).await.into_response()
+}
+
 type Q = Query<HashMap<String, String>>;
 
 async fn logs(State(rs): State<RState>, p: Path<String>, q: Q) -> Response {
@@ -1642,17 +1719,35 @@ mod tests {
     #[test]
     fn link_is_local_network_only() {
         use super::super::share::link_refusal;
-        assert!(link_refusal("127.0.0.1".parse().unwrap()).is_none());
-        assert!(link_refusal("fe80::1".parse().unwrap()).is_none());
-        // Overlay VPNs (Tailscale's ranges) and public addresses are never the local network.
+        let any: IpAddr = "0.0.0.0".parse().unwrap();
+        assert!(link_refusal("127.0.0.1".parse().unwrap(), any, None).is_none());
+        assert!(link_refusal("fe80::1".parse().unwrap(), any, None).is_none());
+        // Automatic: overlay VPNs (Tailscale's ranges) and public addresses are never the local network.
         for far in ["100.100.1.1", "fd7a:115c:a1e0::1", "8.8.8.8"] {
-            assert!(link_refusal(far.parse().unwrap()).is_some(), "{far}");
+            assert!(link_refusal(far.parse().unwrap(), any, None).is_some(), "{far}");
         }
         // Configs written by versions with a Tailscale transport still load.
         let old: SharedPeer = serde_json::from_str(r#"{"id":"a","name":"x","publicKey":"00","phrase":"","createdAt":1,"transport":"tailscale","tailnetId":{"tailnet":"t"}}"#).unwrap();
         assert_eq!(old.name, "x");
         let cfg: RemoteConfig = serde_json::from_str(r#"{"enabled":false,"tailnet":{"enabled":true},"autoApproveTransport":false}"#).unwrap();
         assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn link_only_through_the_chosen_address() {
+        use super::super::share::link_refusal;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Tailscale chosen: only connections to this Mac's Tailscale address, from anywhere.
+        let ts = Via { address: "automain.tail1.ts.net".into(), ips: vec![ip("100.117.1.2")], lan: false };
+        assert!(link_refusal(ip("100.117.232.223"), ip("100.117.1.2"), Some(&ts)).is_none());
+        assert!(link_refusal(ip("::ffff:100.117.232.223"), ip("::ffff:100.117.1.2"), Some(&ts)).is_none());
+        let why = link_refusal(ip("192.168.1.30"), ip("192.168.1.20"), Some(&ts)).unwrap();
+        assert!(why.contains("automain.tail1.ts.net"), "{why}");
+        // A LAN name chosen: only to that address, and still only from the local network (not a VPN into it).
+        let lan = Via { address: "automain.lan".into(), ips: vec![ip("192.168.1.20")], lan: true };
+        assert!(link_refusal(ip("100.117.232.223"), ip("100.117.1.2"), Some(&lan)).is_some());
+        assert!(link_refusal(ip("10.8.0.9"), ip("192.168.1.20"), Some(&lan)).is_some());
+        assert!(link_refusal(ip("127.0.0.1"), ip("127.0.0.1"), Some(&lan)).is_none());
     }
 
     #[test]
@@ -1666,8 +1761,7 @@ mod tests {
         assert_eq!(host_for_url("fd00::1"), "[fd00::1]");
         let found = discover_addresses(Some("chosen.invalid"));
         println!("{}", serde_json::to_string_pretty(&found).unwrap());
-        for ip in local_addresses().into_iter().filter(|ip| !is_tailscale_host(ip)) {
-            assert!(!found.iter().any(|c| c["kind"] == "tailscale"));
+        for ip in local_addresses() {
             assert!(found.iter().any(|c| c["address"] == ip.as_str() && c["pointsHere"] == true), "{ip}");
         }
         let chosen = found.iter().find(|c| c["address"] == "chosen.invalid").unwrap();

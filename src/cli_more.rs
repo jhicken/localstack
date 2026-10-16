@@ -157,9 +157,11 @@ pub fn cmd_machine(args: &[String]) -> R {
             Ok(())
         }
         "add" | "pair" => {
-            let addr = a.pos.get(1).ok_or("usage: lstack machine pair <address> --code XXXX-XXXX [--totp 123456] [--name <alias>]")?;
+            let addr = a.pos.get(1).ok_or("usage: lstack machine pair <address> --code XXXX-XXXX | <lstack-pair://… link> [--totp 123456] [--name <alias>]")?;
             let code = match a.get("code") {
                 Some(c) => c.to_string(),
+                // A Quick Connect link carries the code; the daemon reads it.
+                None if addr.starts_with("lstack-pair://") => String::new(),
                 None if std::io::stdin().is_terminal() => {
                     eprint!("Pairing code shown on {addr} (Share this Mac → Show pairing code): ");
                     let mut s = String::new();
@@ -260,6 +262,9 @@ pub fn cmd_remote_peers(cl: &client::Client, sub: &str, rest: &[String], tunnel:
                 return Ok(());
             }
             println!("Pairing code (valid 10 minutes, one use): {}\n", c::bold(v["code"].as_str().unwrap_or("?")));
+            if let Some(l) = v["link"].as_str() {
+                println!("Quick Connect link (paste it in LStack → Settings → Machines on the other Mac):\n  {}\n", c::cyan(l));
+            }
             println!("On the Mac that should pair with this one, run:");
             let urls: Vec<&str> = v["urls"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
             for u in if urls.is_empty() { vec!["<this-mac-address>"] } else { urls } {

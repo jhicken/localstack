@@ -825,9 +825,16 @@ pub(super) async fn machine_get(State(st): State<AppState>, Path(m): Path<String
 
 async fn machine_add(State(st): State<AppState>, body: Bytes) -> Res {
     let v = parse_body(&body)?;
-    let addr = v["address"].as_str().or(v["url"].as_str()).unwrap_or("").to_string();
+    let mut addr = v["address"].as_str().or(v["url"].as_str()).unwrap_or("").to_string();
     let name = v["name"].as_str().filter(|s| !s.is_empty()).map(String::from);
-    let code = v["code"].as_str().unwrap_or("").trim().to_string();
+    let mut code = v["code"].as_str().unwrap_or("").trim().to_string();
+    // A Quick Connect link carries both.
+    if let Some((a, c)) = super::peers::parse_quick_link(&addr) {
+        addr = a;
+        if code.is_empty() {
+            code = c;
+        }
+    }
     if code.is_empty() {
         return Err(ApiErr(400, "pairing needs the other Mac's one-time code (Share this Mac → Show pairing code there), plus its 2FA code if it uses two-factor authentication".into()));
     }
@@ -876,7 +883,7 @@ async fn machine_remove(State(st): State<AppState>, Path(m): Path<String>) -> Re
     ok()
 }
 
-fn is_local(m: &str) -> bool {
+pub(super) fn is_local(m: &str) -> bool {
     m == super::peers::local_name()
 }
 

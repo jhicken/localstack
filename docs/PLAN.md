@@ -80,6 +80,7 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | Identity | X25519 key pair per install, private half in the secret store. Fingerprint + 4-word phrase (`lstack machine id`), `lstack machine rekey` (all pairings must re-pair). |
 | Pairing | SPAKE2 over the one-time code (3 tries, then burned). The TOTP code (if 2FA is on) is sent only inside the PAKE-encrypted session. Keys are pinned on both sides and a confirmation phrase is shown. Per-IP lockout. |
 | Link | Dedicated link port (7381) speaking only Noise IK. A small multiplexer carries typed streams (`http` = the peer API router, `tunnel` = byte relay), each checked against the peer's grants. Plain-HTTP bearer `/peer/*` routes and tokens were removed; old pairings show "pair again". |
+| Reachability | "Show this Mac as" is the only way in: links/pairings must arrive at an IP that address resolves to here (LAN choice also needs a LAN source; Tailscale accepted). Automatic = LAN subnets only. Changing it drops links. Quick Connect link `lstack-pair://host:port?code=…` (never the 2FA code), pasted in Settings → Machines or `lstack machine pair`. |
 | Grants | Per paired Mac: `control` and `tunnel` (all, none or a list). Settings → Share this Mac, `lstack remote grant/revoke/activity`, `/api/remote/peers`. Changes drop the link so new grants apply immediately. |
 | Forwards | Automatic localhost forwards (127.0.0.1/::1) for granted services' live ports, same port when free, remembered fallbacks (`forwards.json`). Same-user check via libproc, 128 connections per Mac, per-service pause (`lstack forwards`). The shared Mac re-checks port ownership on each open, dials only its loopback, and audits. URL chips show 🔒 "via <machine>" everywhere. |
 | Later | Built-in screen sharing as `screen` / `input` stream kinds with their own grants and consent (design note in the README). |
@@ -161,7 +162,7 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 - [ ] Import from PM2 `ecosystem.config.js`, Procfile, and existing compose files; `lstack export`.
 - [ ] Config profiles/workspaces (switch "client-A stack" vs "personal").
 - [ ] Linux support (systemd user units) since the daemon/CLI are portable.
-- [ ] Remote dashboard: built-in HTTPS (self-signed or user-supplied cert), multiple users/roles, and log streaming for several services at once.
+- [ ] Remote dashboard: built-in HTTPS (self-signed or user-supplied cert), source-IP gating like the link port (LAN / Tailscale only) when **other devices too** is on, multiple users/roles, and log streaming for several services at once. Until then it's plain HTTP and open to any IP (README → Web dashboard → Plain HTTP).
 
 ---
 

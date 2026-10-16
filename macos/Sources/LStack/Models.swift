@@ -192,8 +192,17 @@ struct Machine: Codable, Identifiable, Equatable {
     var online: Bool { status == "online" }
     /// What the live link is going through, for tooltips.
     var linkDescription: String {
-        guard online, let v = via else { return "Connects directly over the local network (encrypted)" }
-        return "Connected directly over the local network, encrypted end to end (\(v.address))"
+        let path = isTailscale ? "through Tailscale" : "over the local network"
+        guard online, let v = via else { return "Connects directly \(path) (encrypted)" }
+        return "Connected directly \(path), encrypted end to end (\(v.address))"
+    }
+    /// Paired through a Tailscale address (100.64/10 or a MagicDNS name).
+    var isTailscale: Bool {
+        var host = (address ?? "").lowercased()
+        if let i = host.lastIndex(of: ":"), !host.hasSuffix("]") { host = String(host[..<i]) }
+        if host.hasSuffix(".ts.net") { return true }
+        let o = host.split(separator: ".").compactMap { Int($0) }
+        return o.count == 4 && o[0] == 100 && (64..<128).contains(o[1])
     }
     var canControl: Bool { allowControl ?? false }
     /// Paired with an older LStack (before the encrypted link): must pair again.
@@ -352,8 +361,25 @@ struct PairCode: Decodable {
     let code: String
     let expiresAt: Double
     let urls: [String]
+    /// `lstack-pair://address?code=…`, once an address to connect through is chosen.
+    var link: String?
     /// A 2FA code is needed too.
     var totp: Bool?
+
+    var expired: Bool { Date().timeIntervalSince1970 * 1000 >= expiresAt }
+
+    /// (address, code) from a Quick Connect link.
+    static func parse(_ link: String) -> (address: String, code: String)? {
+        let s = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix("lstack-pair://") else { return nil }
+        let rest = s.dropFirst("lstack-pair://".count)
+        let parts = rest.split(separator: "?", maxSplits: 1)
+        let addr = String(parts.first ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let code = parts.count > 1
+            ? parts[1].split(separator: "&").first { $0.hasPrefix("code=") }.map { String($0.dropFirst(5)) } ?? ""
+            : ""
+        return addr.isEmpty ? nil : (addr, code)
+    }
 }
 
 /// What `POST /api/machines` returns: the new machine plus the pairing's confirmation phrase.
@@ -602,7 +628,7 @@ struct VpnStatus: Decodable, Equatable {
 /// `GET /api/remote/addresses`: a way other Macs might reach this one, checked by resolving it.
 struct ShareAddress: Decodable, Identifiable, Hashable {
     let address: String
-    /// ip, dns or bonjour
+    /// ip, dns, bonjour or tailscale
     let kind: String
     let source: String?
     let resolves: [String]

@@ -362,6 +362,7 @@ struct MachinesSettings: View {
     @State private var openForwards: Set<String> = []
     @State private var addresses: [ShareAddress] = []
     @State private var findingAddresses = false
+    @State private var copiedLink = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -426,13 +427,27 @@ struct MachinesSettings: View {
                         ForEach(r.shareUrls ?? [], id: \.self) { u in
                             Label(u, systemImage: "network").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                         }
-                        Button(pair == nil ? "Show Pairing Code" : "New Code") {
-                            Task {
-                                do { pair = try await store.pairCode() } catch { self.error = error.localizedDescription }
+                        HStack(spacing: 8) {
+                            if r.shareAddress != nil {
+                                Button {
+                                    copyQuickLink()
+                                } label: {
+                                    Label(copiedLink ? "Copied" : "Copy Quick Connect Link", systemImage: copiedLink ? "checkmark" : "link")
+                                }
+                                .help("Copies this Mac's address and a new one-time pairing code as one link. Paste it in LStack → Settings → Machines on the other Mac.")
+                            }
+                            Button(pair == nil ? "Show Pairing Code" : "New Code") {
+                                Task {
+                                    do { pair = try await store.pairCode() } catch { self.error = error.localizedDescription }
+                                }
                             }
                         }
                         .controlSize(.small)
                         .disabled((r.shareUrls ?? []).isEmpty)
+                        if r.shareAddress == nil {
+                            Text("Choose how this Mac is shown to get a Quick Connect link (address + code to paste on the other Mac).")
+                                .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        }
                     }
                     .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
                 }
@@ -444,6 +459,7 @@ struct MachinesSettings: View {
                             Text("Expires ") + Text(Date(timeIntervalSince1970: pair.expiresAt / 1000), style: .relative)
                             if let u = store.remote?.shareUrls?.first ?? pair.urls.first { Text("Address: \(u)").textSelection(.enabled) }
                             if pair.totp == true { Text("Also needs a 2FA code from this Mac's authenticator app.") }
+                            if let l = pair.link { Text(l).font(.system(size: 10, design: .monospaced)).textSelection(.enabled).lineLimit(1).truncationMode(.middle) }
                         }
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     }
@@ -502,7 +518,7 @@ struct MachinesSettings: View {
     }
 
     private func addressLabel(_ a: ShareAddress) -> String {
-        let kind = ["ip": "IP address", "dns": "DNS name", "bonjour": "Bonjour"][a.kind] ?? a.kind
+        let kind = ["ip": "IP address", "dns": "DNS name", "bonjour": "Bonjour", "tailscale": "Tailscale"][a.kind] ?? a.kind
         return "\(a.address)  —  \(kind)\(a.pointsHere ? "" : " ⚠︎ doesn't reach this Mac")"
     }
 
@@ -511,9 +527,10 @@ struct MachinesSettings: View {
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Picker("Show this Mac as", selection: Binding(get: { r.shareAddress ?? "" }, set: { v in
+                    pair = nil
                     Task { error = await store.updateRemote(RemotePatch(shareAddress: v)); await lookUpAddresses() }
                 })) {
-                    Text("Automatic (IP address)").tag("")
+                    Text("Automatic (local network only)").tag("")
                     ForEach(addressOptions(r)) { a in Text(addressLabel(a)).tag(a.address) }
                 }
                 .font(.system(size: 11)).controlSize(.small).fixedSize()
@@ -528,9 +545,12 @@ struct MachinesSettings: View {
             if let c = chosen, !c.pointsHere {
                 Text("\(c.address) doesn't resolve to this Mac right now — other Macs may not reach it.")
                     .font(.system(size: 10)).foregroundStyle(.orange)
+            } else if let c = chosen {
+                Text("Paired Macs can connect only through \(c.address)\(c.kind == "tailscale" ? " — from anywhere on your tailnet" : ""). Macs paired through another address reconnect through this one (or pair again).")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("A name (router DNS such as .lan, or Bonjour .local) keeps working when the IP address changes.")
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                Text("Automatic accepts paired Macs on this local network only. Pick an address (a .lan or .local name, or Tailscale) to make it the one way in; a name keeps working when the IP changes.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -539,7 +559,7 @@ struct MachinesSettings: View {
     @ViewBuilder
     private func linkLine(_ m: Machine) -> some View {
         HStack(spacing: 4) {
-            Text("LAN · encrypted").font(.system(size: 9, weight: .medium)).padding(.horizontal, 5).padding(.vertical, 1)
+            Text(m.isTailscale ? "Tailscale · encrypted" : "LAN · encrypted").font(.system(size: 9, weight: .medium)).padding(.horizontal, 5).padding(.vertical, 1)
                 .background(Capsule().fill(Color.secondary.opacity(0.15)))
                 .foregroundStyle(.secondary)
                 .help(m.linkDescription)
@@ -556,7 +576,7 @@ struct MachinesSettings: View {
         }
         let port = store.remote?.linkPort.map { " (port \($0))" } ?? ""
         let tfa = store.remote?.totp == true ? " and a 2FA code from your authenticator app" : ""
-        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below\(tfa). Paired Macs connect directly over the local network, LStack to LStack: everything between them is end-to-end encrypted\(port) and tied to each Mac's own key."
+        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below\(tfa). Paired Macs connect directly, LStack to LStack, through the address chosen below (automatic: the local network only): everything between them is end-to-end encrypted\(port) and tied to each Mac's own key."
     }
 
     private func sectionTitle(_ t: String) -> some View {
@@ -566,7 +586,13 @@ struct MachinesSettings: View {
     private var addForm: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                TextField("Address, e.g. studio.local or 192.168.1.20", text: $address)
+                TextField("Address or Quick Connect link", text: $address)
+                    .onChange(of: address) { useQuickLink(address) }
+                Button {
+                    useQuickLink(NSPasteboard.general.string(forType: .string) ?? "")
+                } label: { Image(systemName: "doc.on.clipboard") }
+                    .buttonStyle(.borderless)
+                    .help("Paste a Quick Connect link copied on the other Mac (fills in its address and code)")
                 TextField("Name (optional)", text: $label).frame(width: 120)
             }
             HStack(spacing: 6) {
@@ -580,10 +606,39 @@ struct MachinesSettings: View {
                 }
                 .disabled(busy || address.isEmpty || code.isEmpty)
             }
-            Text("Leave 2FA empty if that Mac doesn't use two-factor authentication.").font(.system(size: 10)).foregroundStyle(.tertiary)
+            Text("Paste a Quick Connect link from the other Mac (Share this Mac → Copy Quick Connect Link), or type its address and code. Leave 2FA empty if that Mac doesn't use two-factor authentication.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
         }
         .textFieldStyle(.roundedBorder)
         .controlSize(.small)
+    }
+
+    /// Fill the address and code from a Quick Connect link (pasted or typed into the address field).
+    private func useQuickLink(_ s: String) {
+        guard let q = PairCode.parse(s) else {
+            if s.hasPrefix("lstack-pair") { return }
+            if !s.isEmpty, s != address { error = "The clipboard doesn't hold a Quick Connect link (lstack-pair://…)" }
+            return
+        }
+        address = q.address
+        if !q.code.isEmpty { code = q.code }
+        error = nil
+    }
+
+    private func copyQuickLink() {
+        Task {
+            do {
+                var p = pair
+                if p?.link == nil || p?.expired == true { p = try await store.pairCode() }
+                pair = p
+                guard let l = p?.link else { error = "Choose an address under “Show this Mac as” first"; return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(l, forType: .string)
+                copiedLink = true
+                try? await Task.sleep(for: .seconds(2))
+                copiedLink = false
+            } catch { self.error = error.localizedDescription }
+        }
     }
 
     private func machineRow(_ m: Machine) -> some View {

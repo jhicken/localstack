@@ -54,21 +54,11 @@ struct ServiceRow: View {
                         .offset(x: 4, y: 4)
                 }
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) {
-                    Text(service.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                    if service.autostart {
-                        Image(systemName: "power.circle.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.cyan)
-                            .help("Starts at login")
-                    }
-                    healthIcon
-                    if let hb = service.heartbeat, !hb.ok {
-                        Image(systemName: "waveform.path.ecg").font(.system(size: 9)).foregroundStyle(.orange)
-                            .help("Heartbeat ping failed: \(hb.error ?? "unknown error")")
-                    }
-                    if let p = service.secretsPending, !service.isRemote { pendingBadge(p) }
-                    if let k = service.envStale, !k.isEmpty, service.isRunning, !service.isRemote { staleBadge(k) }
+                // Badges shrink to icons when the full line doesn't fit, so the name stays visible
+                // and the row never grows wider than the panel.
+                ViewThatFits(in: .horizontal) {
+                    titleLine(compact: false)
+                    titleLine(compact: true)
                 }
                 Text(subtitle)
                     .font(.system(size: 11))
@@ -112,14 +102,33 @@ struct ServiceRow: View {
         .padding(.vertical, 8)
     }
 
+    private func titleLine(compact: Bool) -> some View {
+        HStack(spacing: 5) {
+            Text(service.name).font(.system(size: 13, weight: .semibold)).lineLimit(1).layoutPriority(1)
+            if service.autostart {
+                Image(systemName: "power.circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.cyan)
+                    .help("Starts at login")
+            }
+            healthIcon
+            if let hb = service.heartbeat, !hb.ok {
+                Image(systemName: "waveform.path.ecg").font(.system(size: 9)).foregroundStyle(.orange)
+                    .help("Heartbeat ping failed: \(hb.error ?? "unknown error")")
+            }
+            if let p = service.secretsPending, !service.isRemote { pendingBadge(p, compact: compact) }
+            if let k = service.envStale, !k.isEmpty, service.isRunning, !service.isRemote { staleBadge(k, compact: compact) }
+        }
+    }
+
     /// The env files changed while it runs: a restart applies them.
-    private func staleBadge(_ keys: [String]) -> some View {
+    private func staleBadge(_ keys: [String], compact: Bool = false) -> some View {
         Button {
             store.perform(service, "restart")
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "arrow.clockwise").font(.system(size: 8, weight: .bold))
-                Text("Env changed").font(.system(size: 9, weight: .semibold))
+                if !compact { Text("Env changed").font(.system(size: 9, weight: .semibold)) }
             }
             .lineLimit(1).fixedSize()
             .padding(.horizontal, 5).padding(.vertical, 1)
@@ -132,7 +141,7 @@ struct ServiceRow: View {
 
     /// Env file secrets waiting for review: 1Password references open the review (nothing is read
     /// yet); `lstack://` lines open the editor, where they're approved.
-    private func pendingBadge(_ p: SecretsPending) -> some View {
+    private func pendingBadge(_ p: SecretsPending, compact: Bool = false) -> some View {
         Button {
             if p.onlyStored { openEditor(.environment); return }
             openWindow(id: "op-review", value: service.name)
@@ -140,7 +149,7 @@ struct ServiceRow: View {
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "key.horizontal.fill").font(.system(size: 8))
-                Text(p.onlyStored ? "Secrets: \(p.count) to approve" : p.count > 0 ? "1Password: \(p.count) to review" : "1Password: needs a look")
+                Text(compact ? (p.count > 0 ? "\(p.count)" : "!") : p.onlyStored ? "Secrets: \(p.count) to approve" : p.count > 0 ? "1Password: \(p.count) to review" : "1Password: needs a look")
                     .font(.system(size: 9, weight: .semibold))
             }
             .lineLimit(1).fixedSize()
@@ -375,14 +384,11 @@ struct FlowLinks: View {
     let open: (ServiceURL) -> Void
 
     var body: some View {
-        // A wrapping row: a few chips fit per line in the 400 pt popover.
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(stride(from: 0, to: urls.count, by: 3)), id: \.self) { i in
-                HStack(spacing: 4) {
-                    ForEach(urls[i..<min(i + 3, urls.count)], id: \.self) { u in chip(u) }
-                }
-            }
+        // Wraps onto more lines; a chip wider than the panel is truncated rather than widening it.
+        FlowLayout(spacing: 4, lineSpacing: 4) {
+            ForEach(urls, id: \.self) { u in chip(u) }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func chip(_ u: ServiceURL) -> some View {
@@ -391,7 +397,7 @@ struct FlowLinks: View {
                 Image(systemName: icon(u))
                     .font(.system(size: 9))
                     .foregroundStyle(paused(u) ? Color.secondary : warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
-                Text(u.display).font(.system(size: 10, weight: .medium)).lineLimit(1)
+                Text(u.display).font(.system(size: 10, weight: .medium)).lineLimit(1).truncationMode(.middle)
             }
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(Capsule().fill(Color.accentColor.opacity(0.12)))

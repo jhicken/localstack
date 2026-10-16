@@ -63,20 +63,39 @@ impl PeerCfg {
     }
 }
 
+pub const QUICK_LINK_SCHEME: &str = "lstack-pair://";
+
+/// A Quick Connect link: the shared Mac's address and its one-time pairing code (never a 2FA code).
+pub fn quick_link(addr: &str, code: &str) -> String {
+    format!("{QUICK_LINK_SCHEME}{addr}?code={code}")
+}
+
+/// `lstack-pair://host:port?code=XXXX-XXXX` → (address, code).
+pub fn parse_quick_link(s: &str) -> Option<(String, String)> {
+    let rest = s.trim().strip_prefix(QUICK_LINK_SCHEME)?;
+    let (addr, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let code = query.split('&').find_map(|kv| kv.strip_prefix("code=")).unwrap_or("").to_string();
+    Some((addr.trim_end_matches('/').to_string(), code))
+}
+
 /// Open the link to a paired Mac: a direct, end-to-end encrypted connection from this daemon to its
 /// daemon, trying each LAN address in turn. Returns the link and how/where it connected.
 pub async fn dial_link(cfg: &PeerCfg, id: &link::Identity, their: &[u8; 32], hello: Value) -> std::io::Result<(Arc<Mux>, Value, &'static str, String)> {
     use std::io::{Error, ErrorKind};
     let mut last = Error::new(ErrorKind::NotFound, "no address");
+    let mut refused = None;
     for a in cfg.lan_addrs() {
         match link::connect(&a, id, their, hello.clone()).await {
             Ok((m, v)) => return Ok((m, v, "lan", a)),
-            // It answered and refused: another address won't change that.
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Err(e),
+            // It answered and refused (e.g. it only accepts another of its addresses now): try the rest, and
+            // report the refusal if none works.
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                refused.get_or_insert(e);
+            }
             Err(e) => last = Error::new(e.kind(), format!("{a}: {e}")),
         }
     }
-    Err(last)
+    Err(refused.unwrap_or(last))
 }
 
 /// What the rest of the daemon publishes for one machine.
@@ -475,7 +494,7 @@ impl Peers {
         // `addrs` (current), or `transports.local.addrs` from LStack versions that had a Tailscale option.
         let list = if info["addrs"].is_array() { &info["addrs"] } else { &info["transports"]["local"]["addrs"] };
         let Some(list) = list.as_array() else { return };
-        let lan: Vec<String> = list.iter().filter_map(|v| v.as_str()).filter(|a| normalize_addr(a).is_ok() && !super::remote::is_tailscale_host(a)).take(8).map(str::to_string).collect();
+        let lan: Vec<String> = list.iter().filter_map(|v| v.as_str()).filter(|a| normalize_addr(a).is_ok()).take(8).map(str::to_string).collect();
         let changed = self.update_cfg(name, |c| {
             let own = c.address();
             c.addrs = lan.into_iter().filter(|a| *a != own).collect();
@@ -648,10 +667,6 @@ impl Peers {
         let addr = normalize_addr(addr).map_err(|e| ApiErr::new(400, e))?;
         if code.trim().is_empty() {
             return Err(ApiErr::new(400, "pairing code required (Share this Mac → Show pairing code on the other Mac)"));
-        }
-        // Machines are only paired (and linked) directly over the local network, never through a VPN.
-        if super::remote::is_tailscale_host(&addr) {
-            return Err(ApiErr::new(400, "that's a VPN (Tailscale) address — pair using the other Mac's local network address or name"));
         }
         let paired = link::pair_client(&addr, code, auth, &local_name()).await.map_err(|e| ApiErr::new(403, e))?;
         let key = link::key_hex(&paired.public);
@@ -913,6 +928,10 @@ mod tests {
         let c: PeerCfg = serde_json::from_value(json!({ "name": "studio", "addr": "studio.lan:7381", "addrs": ["192.168.1.5:7381"], "publicKey": "ab", "addedAt": 1,
             "transport": "tailscale", "tailnetName": "lstack-studio.t.ts.net", "pendingTransport": "local" })).unwrap();
         assert_eq!(c.lan_addrs(), vec!["studio.lan:7381", "192.168.1.5:7381"]);
+        let l = quick_link("automain.tail1.ts.net:7381", "K7QP-3M9X");
+        assert_eq!(parse_quick_link(&l), Some(("automain.tail1.ts.net:7381".into(), "K7QP-3M9X".into())));
+        assert_eq!(parse_quick_link(" lstack-pair://[fd00::1]:7381/?code=AB-CD&x=1 "), Some(("[fd00::1]:7381".into(), "AB-CD".into())));
+        assert_eq!(parse_quick_link("studio.lan:7381"), None);
         let saved = serde_json::to_string(&c).unwrap();
         assert!(!saved.contains("transport") && !saved.contains("tailnet") && !saved.contains("ts.net"));
     }

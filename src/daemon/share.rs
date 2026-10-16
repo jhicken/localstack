@@ -8,7 +8,8 @@
 //!
 //! Unknown kinds are refused and audited, so new kinds (e.g. screen sharing) can be added with their own grants.
 //!
-//! The link is accepted only as a direct TCP connection from this Mac's local network, and its Noise session
+//! The link is accepted only as a direct TCP connection through the address chosen in "Show this Mac as" (or,
+//! when that's automatic, from this Mac's local network), and its Noise session
 //! ends inside this daemon: no helper process or relay ever handles its bytes, encrypted or not. Tunnels can't
 //! reach this daemon's own ports, so the peer API (and the secrets it serves) is only reachable as a link stream.
 use super::link::{self, Incoming, Mux, PairPolicy};
@@ -36,12 +37,24 @@ pub async fn serve(listener: TcpListener, app: AppState, remote: Arc<Remote>) {
     }
 }
 
-/// Whether a link or pairing connection from `ip` may be served (None) or why not: only from this Mac's own
-/// local network (see `remote::is_local_source`), never through a VPN or overlay network.
-pub fn link_refusal(ip: IpAddr) -> Option<String> {
-    (!super::remote::is_local_source(ip)).then(|| {
-        format!("{} only accepts paired Macs on its local network (this one connected from {ip})", super::remote::hostname())
-    })
+/// Whether a link or pairing connection from `ip` to this Mac's `local` address may be served (None) or why not.
+/// With a chosen "Show this Mac as" address (`via`), only connections to the IPs it leads to; a local network
+/// address also still needs a local network source, so a VPN routed into the LAN doesn't count. Automatic:
+/// only from this Mac's own local network (see `remote::is_local_source`), never through a VPN or overlay.
+pub fn link_refusal(ip: IpAddr, local: IpAddr, via: Option<&super::remote::Via>) -> Option<String> {
+    use super::remote::{hostname, is_local_source, unmap};
+    let (ip, local) = (unmap(ip), unmap(local));
+    match via {
+        Some(_) if ip.is_loopback() => None,
+        Some(v) if !v.ips.contains(&local) => {
+            Some(format!("{} only accepts paired Macs through {} (this one connected to {local}) — pair using {}", hostname(), v.address, v.address))
+        }
+        Some(v) if v.lan && !is_local_source(ip) => {
+            Some(format!("{} only accepts paired Macs through {} on its local network (this one connected from {ip})", hostname(), v.address))
+        }
+        Some(_) => None,
+        None => (!is_local_source(ip)).then(|| format!("{} only accepts paired Macs on its local network (this one connected from {ip}) — choose “Show this Mac as” there to allow another way in", hostname())),
+    }
 }
 
 async fn connection(mut tcp: TcpStream, addr: SocketAddr, app: AppState, remote: Arc<Remote>) {
@@ -50,9 +63,10 @@ async fn connection(mut tcp: TcpStream, addr: SocketAddr, app: AppState, remote:
     if tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut magic)).await.map_or(true, |r| r.is_err()) {
         return;
     }
-    let off_lan = link_refusal(ip);
+    let local = tcp.local_addr().map_or(ip, |a| a.ip());
+    let off_lan = link_refusal(ip, local, remote.via().await.as_ref());
     if let (Some(why), true) = (&off_lan, &magic == link::MAGIC_PAIR) {
-        remote.audit(json!({ "event": "pair-refused", "address": ip.to_string(), "reason": "not on the local network" }));
+        remote.audit(json!({ "event": "pair-refused", "address": ip.to_string(), "reason": why.clone() }));
         link::pair_refuse(tcp, why).await;
         return;
     }

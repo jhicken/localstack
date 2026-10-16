@@ -524,6 +524,32 @@ fn env_file_editing_and_lstack_secrets() {
     assert!(audit.contains("env-edit") && !audit.contains("sk-live-Zr8") && !audit.contains("two words"), "{audit}");
 }
 
+/// The web dashboard never returns env values, including through this Mac's `/api/machines/<name>/…` routes.
+#[test]
+fn web_dashboard_redacts_local_machine_routes() {
+    let home = std::env::temp_dir().join(format!("lstack-it-webredact-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let d = Daemon::start(&home);
+    let secret = "dash-leak-Qx7";
+    d.post("/api/services", Some(json!({ "name": "api", "type": "process", "restart": "never", "env": { "API_KEY": secret }, "command": "sleep 60" }))).unwrap();
+
+    let rport = free_port();
+    d.call("PUT", "/api/remote", Some(json!({ "enabled": true, "webRemote": false, "allowControl": true, "bind": "127.0.0.1", "port": rport, "username": "me", "password": "correct horse" })))
+        .unwrap();
+    let base = format!("http://127.0.0.1:{rport}");
+    wait_until("dashboard", 10, || ureq::get(&format!("{base}/api/login")).call().is_ok());
+    let res = ureq::post(&format!("{base}/api/login")).set("X-LStack", "1").send_json(json!({ "username": "me", "password": "correct horse" })).unwrap();
+    let cookie = res.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let get = |p: &str| ureq::get(&format!("{base}{p}")).set("Cookie", &cookie).call().unwrap().into_string().unwrap();
+    let post = |p: &str| ureq::post(&format!("{base}{p}")).set("Cookie", &cookie).set("X-LStack", "1").call().unwrap().into_string().unwrap();
+
+    let me = serde_json::from_str::<Value>(&get("/api/machines")).unwrap()["local"]["name"].as_str().unwrap().to_string();
+    for body in [get("/api/services"), get("/api/services/api"), get(&format!("/api/machines/{me}/services/api")), post(&format!("/api/machines/{me}/services/api/start"))] {
+        assert!(body.contains("API_KEY") && !body.contains(secret), "{body}");
+    }
+    let _ = d.post("/api/services/api/stop", None);
+}
+
 /// A paired Mac receives a 1Password value only after it's shared with it, from the other Mac's store.
 #[test]
 fn onepassword_values_shared_with_paired_mac() {
@@ -672,8 +698,14 @@ fn machines_pair_and_proxy() {
         assert_eq!(e.0, 403, "{e:?}");
     }
     assert!(host.post("/api/machines", Some(login(&code))).is_err(), "burned after 3 failures");
-    let code3 = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
-    let m = host.post("/api/machines", Some(login(&code3))).unwrap();
+    // No Quick Connect link until an address to connect through is chosen; then the link carries address + code.
+    assert!(client.post("/api/remote/pair-code", None).unwrap()["link"].is_null());
+    client.call("PUT", "/api/remote", Some(json!({ "shareAddress": "127.0.0.1" }))).unwrap();
+    assert_eq!(client.get("/api/remote").unwrap()["shareUrls"], json!([addr]));
+    let pc = client.post("/api/remote/pair-code", None).unwrap();
+    let code3 = pc["code"].as_str().unwrap().to_string();
+    assert_eq!(pc["link"], json!(format!("lstack-pair://{addr}?code={code3}")));
+    let m = host.post("/api/machines", Some(json!({ "address": pc["link"], "name": "studio" }))).unwrap();
     assert_eq!(m["name"], "studio");
     assert_eq!(m["phrase"].as_str().unwrap().split(' ').count(), 4);
     assert_eq!(m["grants"], json!({ "control": false, "tunnel": "all" }));
@@ -714,8 +746,6 @@ fn machines_pair_and_proxy() {
     assert!(host.get("/api/forwards").unwrap().as_array().unwrap().is_empty());
     client.call("PATCH", &format!("/api/remote/peers/{id}"), Some(json!({ "tunnel": "all" }))).unwrap();
     wait_until("forward back", 30, || forwarded().is_some());
-    // Machines are paired over the local network only, never through a VPN address.
-    assert_eq!(host.post("/api/machines", Some(json!({ "address": "100.101.102.103", "code": "AAAA-AAAA" }))).unwrap_err().0, 400);
 
     // Proxied logs and details over the link; control needs the control grant.
     assert!(host.get("/api/machines/studio/services/web").unwrap()["status"] == "running");
