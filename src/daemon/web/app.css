@@ -148,6 +148,9 @@ a.link:hover { background: rgba(79, 209, 255, 0.16); border-color: rgba(79, 209,
 .link.via { border-color: rgba(52, 211, 153, 0.35); }
 .lvia { font-size: 10px; margin-right: 4px; }
 .badge.ro { color: var(--amber); background: rgba(251, 191, 36, 0.12); }
+.badge.op { color: var(--amber); background: rgba(251, 191, 36, 0.12); text-transform: none; margin-left: 4px; }
+.op-pending { color: var(--amber); }
+.op-pending .muted { color: var(--muted); }
 .m-err { margin: 4px 8px 6px; color: var(--red); font-size: 11.5px; overflow-wrap: anywhere; }
 .empty.sm { padding: 12px 8px; font-size: 12px; }
 .procs { margin-top: 10px; }

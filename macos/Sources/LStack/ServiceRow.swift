@@ -67,6 +67,7 @@ struct ServiceRow: View {
                         Image(systemName: "waveform.path.ecg").font(.system(size: 9)).foregroundStyle(.orange)
                             .help("Heartbeat ping failed: \(hb.error ?? "unknown error")")
                     }
+                    if let p = service.secretsPending, !service.isRemote { pendingBadge(p) }
                 }
                 Text(subtitle)
                     .font(.system(size: 11))
@@ -108,6 +109,35 @@ struct ServiceRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+    }
+
+    /// 1Password references in the env files waiting for review; opens the review (nothing is read yet).
+    private func pendingBadge(_ p: SecretsPending) -> some View {
+        Button {
+            openWindow(id: "op-review", value: service.name)
+            bringToFront()
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "key.horizontal.fill").font(.system(size: 8))
+                Text(p.count > 0 ? "1Password: \(p.count) to review" : "1Password: needs a look")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .lineLimit(1).fixedSize()
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Capsule().fill(Color.orange.opacity(0.15)))
+            .foregroundStyle(.orange)
+        }
+        .buttonStyle(.plain)
+        .help(pendingHelp(p))
+    }
+
+    private func pendingHelp(_ p: SecretsPending) -> String {
+        var lines: [String] = []
+        for (label, keys) in [("New", p.new), ("Changed", p.changed), ("Not cached", p.missing), ("Blocked", p.blocked), ("Removed", p.removed)] {
+            if let keys, !keys.isEmpty { lines.append("\(label): \(keys.joined(separator: ", "))") }
+        }
+        lines += p.errors ?? []
+        return (["Review 1Password references from the env files"] + lines).joined(separator: "\n")
     }
 
     @ViewBuilder private var healthIcon: some View {
@@ -183,17 +213,7 @@ struct ServiceRow: View {
             }
             if !service.links.isEmpty { links }
             if let hb = service.heartbeat { heartbeatLine(hb) }
-            if let names = service.config.secrets?.names, !names.isEmpty {
-                HStack(spacing: 4) {
-                    Image(systemName: "key.fill").font(.system(size: 9)).foregroundStyle(.secondary)
-                    ForEach(names, id: \.self) { n in
-                        Text(n).font(.system(size: 10, design: .monospaced))
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Capsule().fill(Color.primary.opacity(0.07)))
-                    }
-                }
-                .help("Secrets passed in as environment variables")
-            }
+            if hasEnvironment { environmentChips }
             if service.isRemote {
                 if !canControl {
                     Label("\(service.machine ?? "That Mac") is read-only (turn on “Allow control” there).", systemImage: "lock")
@@ -209,6 +229,40 @@ struct ServiceRow: View {
 
     private var links: some View {
         FlowLinks(urls: service.links) { store.open($0, in: service) }
+    }
+
+    private var secretKeys: [String] { (service.config.secrets?.pairs ?? []).map(\.key) }
+    private var plainKeys: [String] { (service.config.env ?? [:]).keys.sorted() }
+    private var hasEnvironment: Bool { !secretKeys.isEmpty || !plainKeys.isEmpty || !(service.config.envFiles ?? []).isEmpty }
+
+    /// Env files, variables and secrets as chips that wrap onto more lines (names only, never values).
+    private var environmentChips: some View {
+        let max = 14
+        let items: [(String, String?)] = (service.config.envFiles ?? []).map { ($0, "doc.text") }
+            + secretKeys.map { ($0, "key.fill") }
+            + plainKeys.filter { !secretKeys.contains($0) }.map { ($0, nil) }
+        return FlowLayout(spacing: 4, lineSpacing: 4) {
+            ForEach(items.prefix(max), id: \.0) { item in
+                HStack(spacing: 3) {
+                    if let icon = item.1 { Image(systemName: icon).font(.system(size: 8)).foregroundStyle(.secondary) }
+                    Text(item.0).font(.system(size: 10, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                }
+                .padding(.horizontal, 5).padding(.vertical, 1)
+                .background(Capsule().fill(Color.primary.opacity(0.07)))
+            }
+            if items.count > max {
+                Text("+\(items.count - max) more").font(.system(size: 10)).foregroundStyle(.secondary).padding(.vertical, 1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture { if !service.isRemote { openEditor(.environment) } }
+        .help(service.isRemote ? "Environment (env files, secrets and variables)" : "Environment — click to edit env files, variables and secrets")
+    }
+
+    private func openEditor(_ tab: ServiceEditorView.Tab) {
+        openWindow(id: "service", value: EditorTarget(service: service.name, tab: tab))
+        bringToFront()
     }
 
     private func heartbeatLine(_ hb: HeartbeatStatus) -> some View {
@@ -240,7 +294,15 @@ struct ServiceRow: View {
                 }
                 .disabled(!service.isRunning)
                 Menu {
-                    Button("Edit Definition…") { store.revealConfig(service.name) }
+                    Button("Edit…") { openEditor(.general) }
+                    Button("Environment Variables…") { openEditor(.environment) }
+                    if !(service.config.envFiles ?? []).isEmpty {
+                        Button("Review 1Password References…") {
+                            openWindow(id: "op-review", value: service.name)
+                            bringToFront()
+                        }
+                    }
+                    Button("Open YAML Definition") { store.revealConfig(service.name) }
                     Divider()
                     Button("Remove…", role: .destructive) { confirmRemove = true }
                 } label: {

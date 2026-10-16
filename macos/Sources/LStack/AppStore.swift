@@ -122,6 +122,10 @@ final class AppStore {
     init() {
         Task { await eventLoop() }
         watchNetwork()
+        if Bundle.main.bundleURL.pathExtension == "app", ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT"] == nil {
+            notificationRouter.store = self
+            UNUserNotificationCenter.current().delegate = notificationRouter
+        }
     }
 
     // MARK: reconnecting
@@ -168,9 +172,10 @@ final class AppStore {
     // MARK: notifications
 
     @ObservationIgnored private var notificationsAsked = false
+    @ObservationIgnored private let notificationRouter = NotificationRouter()
 
     /// The daemon's notices (a paired Mac switched transport, asks to, or needs Tailscale signed in here).
-    private func notify(title: String, body: String) {
+    private func notify(title: String, body: String, review: String? = nil) {
         // Notifications need a real app bundle (not `swift run`).
         guard Bundle.main.bundleIdentifier != nil, Bundle.main.bundleURL.pathExtension == "app" else {
             flash("\(title): \(body)")
@@ -181,6 +186,8 @@ final class AppStore {
             let c = UNMutableNotificationContent()
             c.title = title
             c.body = body
+            // Clicking opens that service's 1Password review (nothing is read until a button there is clicked).
+            if let review { c.userInfo = ["review": review] }
             center.add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
         }
         if notificationsAsked {
@@ -244,7 +251,12 @@ final class AppStore {
         case "notice":
             struct Notice: Decodable { let title: String; let body: String }
             guard let n = try? dec.decode(Notice.self, from: data) else { return }
-            notify(title: n.title, body: n.body)
+            // "<service>: review 1Password changes for KEY, …"
+            var review: String?
+            if n.title == "1Password changes to review", let colon = n.body.range(of: ": review ") {
+                review = String(n.body[..<colon.lowerBound])
+            }
+            notify(title: n.title, body: n.body, review: review)
             Task { await refreshRemote(); await refreshTailnet() }
         case "service":
             guard let s = try? dec.decode(ServiceState.self, from: data) else { return }
@@ -765,6 +777,63 @@ final class AppStore {
         return e
     }
 
+    // MARK: 1Password (the daemon never runs `op`; the app reads values after a click — see OnePassword.swift)
+
+    /// A service whose 1Password review should open (from a notification or the menu); MenuBarLabel opens it.
+    var reviewRequest: String?
+
+    /// Services on this Mac with 1Password references waiting for review.
+    var pendingReviews: [ServiceState] { services.filter { $0.secretsPending != nil } }
+
+    func openReview(_ service: String) { reviewRequest = service }
+
+    func opReview(_ service: String) async throws -> OPReview {
+        guard let client else { throw DaemonError.notRunning }
+        return try await client.send("GET", "/api/onepassword/review/\(service.urlPath)", as: OPReview.self)
+    }
+
+    func opDetect(_ dir: String) async -> OPDetect? {
+        try? await client?.send("POST", "/api/onepassword/detect", body: ["cwd": dir], as: OPDetect.self)
+    }
+
+    func opPlan(_ body: [String: Any]) async throws -> OPPlan {
+        try JSONDecoder().decode(OPPlan.self, from: await sendJSON("POST", "/api/onepassword/plan", body))
+    }
+
+    func opCancelPlan(_ id: String) async {
+        _ = try? await client?.send("DELETE", "/api/onepassword/plan/\(id.urlPath)", as: EmptyResponse.self)
+    }
+
+    /// Hands values to the daemon (request body only; never logged or kept).
+    func opImport(_ body: [String: Any]) async throws -> OPImportResult {
+        try JSONDecoder().decode(OPImportResult.self, from: await sendJSON("POST", "/api/onepassword/import", body))
+    }
+
+    func opShares() async throws -> OPShares {
+        guard let client else { throw DaemonError.notRunning }
+        return try await client.send("GET", "/api/onepassword/shares", as: OPShares.self)
+    }
+
+    /// Lets (or stops letting) a paired Mac take cached values; items are secret names or refs.
+    func opShare(peer: String, items: [String], allow: Bool) async throws -> OPShares {
+        let body: [String: Any] = ["peer": peer, "items": items, "allow": allow, "actor": "app"]
+        return try JSONDecoder().decode(OPShares.self, from: await sendJSON("POST", "/api/onepassword/shares", body))
+    }
+
+    /// Takes the values paired Macs share now (from their cache; never 1Password).
+    func opPeerSync(service: String? = nil) async throws -> OPPeerSync {
+        var body: [String: Any] = [:]
+        if let service { body["service"] = service }
+        let r = try JSONDecoder().decode(OPPeerSync.self, from: await sendJSON("POST", "/api/onepassword/peers/sync", body))
+        await refreshSecrets()
+        return r
+    }
+
+    func opAudit(_ n: Int = 100) async -> [OPAuditEntry] {
+        struct R: Decodable { let entries: [OPAuditEntry] }
+        return (try? await client?.send("GET", "/api/onepassword/audit?n=\(n)", as: R.self))?.entries ?? []
+    }
+
     // MARK: settings patches (heartbeats, process thresholds)
 
     /// Send a free-form JSON object (NSNull clears a key). Throws DaemonError.http on failure.
@@ -1017,7 +1086,16 @@ final class AppStore {
 
     func logStream(_ id: String) -> AsyncThrowingStream<(String, Data), Error>? {
         let (name, machine) = Self.split(id)
-        return client?.events("\(Self.path(name: name, machine: machine))/logs/stream?tail=1000")
+        return client?.events("\(Self.path(name: name, machine: machine))/logs/stream?tail=\(LogPaging.initial)")
+    }
+
+    /// Up to `count` lines logged before the line at cursor `before` (oldest first); fewer once the start is reached.
+    func olderLogs(_ id: String, before: String, count: Int = LogPaging.page) async throws -> [LogLine] {
+        struct R: Decodable { let lines: [LogLine] }
+        let (name, machine) = Self.split(id)
+        let q = before.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? before
+        guard let client else { throw URLError(.notConnectedToInternet) }
+        return try await client.send("GET", "\(Self.path(name: name, machine: machine))/logs?tail=\(count)&before=\(q)", as: R.self).lines
     }
 
     func sendInput(_ name: String, _ text: String) {
@@ -1030,6 +1108,25 @@ final class AppStore {
 
     func clearLogs(_ name: String) {
         Task { try? await client?.send("DELETE", "/api/services/\(name.urlPath)/logs") }
+    }
+}
+
+/// Routes a click on a notification (e.g. "1Password changes to review") back into the app.
+final class NotificationRouter: NSObject, UNUserNotificationCenterDelegate {
+    weak var store: AppStore?
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let service = response.notification.request.content.userInfo["review"] as? String
+        Task { @MainActor [weak self] in
+            if let service { self?.store?.openReview(service) }
+            completionHandler()
+        }
     }
 }
 

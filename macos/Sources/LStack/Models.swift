@@ -60,6 +60,8 @@ struct ServiceConfig: Codable, Hashable {
     var healthcheck: HealthCheck?
     var secrets: SecretRefs?
     var heartbeat: HeartbeatConfig?
+    /// `.env` files (relative to `cwd`) read like `op run --env-file`.
+    var envFiles: [String]?
 }
 
 /// `secrets:` in a service definition: `[NAME, …]` or `{ENV_VAR: SECRET_NAME}`.
@@ -88,6 +90,23 @@ enum SecretRefs: Codable, Hashable {
         case let .list(l): return l
         case let .map(m): return Array(Set(m.values)).sorted()
         }
+    }
+
+    /// Env var → stored secret name.
+    var pairs: [(key: String, name: String)] {
+        switch self {
+        case let .list(l): return l.map { ($0, $0) }
+        case let .map(m): return m.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+        }
+    }
+
+    var isMap: Bool { if case .map = self { return true }; return false }
+
+    /// The simple list form when every env var has its secret's name (unless it was a map already).
+    static func make(_ pairs: [(String, String)], asMap: Bool) -> SecretRefs? {
+        if pairs.isEmpty { return nil }
+        if !asMap, pairs.allSatisfy({ $0.0 == $0.1 }) { return .list(pairs.map(\.0)) }
+        return .map(Dictionary(pairs, uniquingKeysWith: { _, b in b }))
     }
 }
 
@@ -313,13 +332,33 @@ struct SecretInfo: Decodable, Identifiable, Hashable {
     let usedBy: [String]
     let isInternal: Bool?
     let missing: Bool?
+    /// "local" (typed in), "op" (1Password reference), "op-env" (1Password Environment) or "peer:<machine>".
+    let source: String?
+    let ref: String?
+    let template: String?
+    let account: String?
+    let origin: String?
+    /// When the value was last read from 1Password (ms).
+    let fetchedAt: Double?
 
     enum CodingKeys: String, CodingKey {
-        case name, setAt, usedBy, missing
+        case name, setAt, usedBy, missing, source, ref, template, account, origin, fetchedAt
         case isInternal = "internal"
     }
 
     var isSet: Bool { !(missing ?? false) }
+    var fromOnePassword: Bool { source == "op" }
+    var peer: String? { source?.hasPrefix("peer:") == true ? String(source!.dropFirst(5)) : nil }
+
+    /// Where the value came from, for display.
+    var sourceLabel: String? {
+        switch source {
+        case "op": return "1Password reference"
+        case "op-env": return "1Password Environment"
+        case "local": return "typed in"
+        default: return peer.map { "from \($0)" }
+        }
+    }
 }
 
 struct SecretsStatus: Decodable {
@@ -443,6 +482,8 @@ struct ServiceState: Codable, Identifiable, Hashable {
     /// nil = this Mac; otherwise the paired machine's name.
     let machine: String?
     let config: ServiceConfig
+    /// 1Password references in its env files waiting for review (keys only).
+    var secretsPending: SecretsPending? = nil
 
     /// Addresses that can be opened from here (LAN ones are hidden while that Mac is on Tailscale).
     var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "lan" } }
@@ -480,6 +521,8 @@ struct LogLine: Codable, Hashable, Identifiable {
     let ts: Double
     let stream: String
     let line: String
+    /// Cursor for paging to older lines (nil from daemons that predate log paging).
+    var pos: String? = nil
     var id: String { "\(ts)-\(line.hashValue)" }
 }
 
@@ -671,6 +714,7 @@ struct DaemonSettings: Decodable, Equatable {
     var cmux: CmuxStatus?
     var healthchecks: HealthchecksStatus?
     var processes: ProcessThresholds?
+    var onepassword: OnePasswordSettings?
 }
 
 struct CmuxStatus: Decodable, Equatable {
@@ -700,4 +744,252 @@ struct CmuxFixResult: Decodable {
     let reloaded: Bool?
     let backup: String?
     let note: String?
+}
+
+// MARK: - 1Password
+
+/// `secretsPending` on a service: references in its env files that need a look (keys only, never values).
+struct SecretsPending: Codable, Hashable {
+    var count: Int
+    var new: [String]?
+    var changed: [String]?
+    var missing: [String]?
+    var blocked: [String]?
+    var removed: [String]?
+    var errors: [String]?
+
+    var summary: String {
+        var parts: [String] = []
+        if count > 0 { parts.append("\(count) to review") }
+        if let b = blocked, !b.isEmpty { parts.append("\(b.count) blocked") }
+        if let e = errors, !e.isEmpty { parts.append("\(e.count) file error\(e.count == 1 ? "" : "s")") }
+        return parts.isEmpty ? "needs a look" : parts.joined(separator: " · ")
+    }
+}
+
+/// Settings › 1Password (`onepassword` in `/api/settings`).
+struct OnePasswordSettings: Codable, Equatable {
+    var watch: Bool?
+    var autoApplyRemovals: Bool?
+    var restartOnChange: Bool?
+    var allowedVaults: [String]?
+    var pushToPeers: Bool?
+    var pullFromPeers: Bool?
+}
+
+/// `GET /api/onepassword/review/:service`.
+struct OPReview: Decodable {
+    struct File: Decodable, Hashable {
+        let path: String
+        /// ok, fifo (an Environment mount), missing or error.
+        let state: String
+        let error: String?
+    }
+    struct Ref: Decodable, Hashable, Identifiable {
+        var id: String { key }
+        let key: String
+        let ref: String
+        let template: String?
+        let file: String?
+        let line: Int?
+        /// ok, new, changed, missing or blocked.
+        let status: String
+        let secret: String?
+        let vault: String?
+        let item: String?
+        let field: String?
+        let warnings: [String]?
+        let blocked: String?
+        /// Paired Macs that share this reference's value (cache to cache, no 1Password).
+        let offeredBy: [String]?
+    }
+    struct Removed: Decodable, Hashable {
+        let key: String
+        let secret: String
+        let ref: String?
+    }
+    let service: String
+    let files: [File]
+    let refs: [Ref]
+    let removed: [Removed]
+    let plain: [String]
+    let warnings: [String]
+    let locked: Bool
+
+    /// Something "Pull from 1Password" would do.
+    var actionable: Bool { refs.contains { ["new", "changed", "missing"].contains($0.status) } || !removed.isEmpty }
+    var hasCached: Bool { refs.contains { $0.status == "ok" } }
+}
+
+/// `POST /api/onepassword/detect`: env files in a folder (names and keys, never values).
+struct OPDetect: Decodable {
+    struct File: Decodable, Hashable, Identifiable {
+        var id: String { name }
+        struct Ref: Decodable, Hashable {
+            let key: String
+            let ref: String
+        }
+        let name: String
+        let example: Bool
+        let refs: [Ref]?
+        let plain: [String]?
+        let fifo: Bool?
+        let error: String?
+
+        var isMount: Bool { fifo == true }
+        var summary: String {
+            if isMount { return "1Password Environment mount" }
+            if let error { return error }
+            let r = refs?.count ?? 0, p = plain?.count ?? 0
+            var parts: [String] = []
+            if r > 0 { parts.append("\(r) op:// reference\(r == 1 ? "" : "s")") }
+            if p > 0 { parts.append("\(p) plain value\(p == 1 ? "" : "s")") }
+            return parts.isEmpty ? "empty" : parts.joined(separator: ", ")
+        }
+    }
+    let dir: String
+    let files: [File]
+}
+
+/// `GET/POST /api/onepassword/shares`: cached 1Password values shared with paired Macs (never 1Password itself).
+struct OPShares: Decodable {
+    struct Granted: Decodable, Hashable {
+        let ref: String
+        let name: String?
+        let have: Bool?
+        let fetchedAt: Double?
+    }
+    struct Want: Decodable, Hashable {
+        let ref: String
+        let name: String?
+        let have: Bool?
+        let granted: Bool?
+        let fetchedAt: Double?
+    }
+    struct Peer: Decodable, Identifiable {
+        let id: String
+        let name: String
+        let granted: [Granted]?
+        let wants: [Want]?
+        let wantsAt: Double?
+    }
+    struct Received: Decodable, Hashable {
+        let name: String
+        let ref: String?
+        let from: String
+        let fetchedAt: Double?
+    }
+    struct Available: Decodable, Hashable {
+        let machine: String
+        let ref: String
+    }
+    let peers: [Peer]?
+    let received: [Received]?
+    let available: [Available]?
+}
+
+/// `POST /api/onepassword/peers/sync`.
+struct OPPeerSync: Decodable {
+    struct Received: Decodable, Hashable {
+        let machine: String
+        let stored: [String]?
+        let updated: [String]?
+    }
+    let received: [Received]?
+    let errors: [String]?
+
+    var summary: String {
+        let lines = (received ?? []).compactMap { r -> String? in
+            let n = (r.stored ?? []) + (r.updated ?? [])
+            return n.isEmpty ? nil : "From \(r.machine): \(n.joined(separator: ", "))"
+        }
+        return lines.isEmpty ? "Nothing new from paired Macs." : lines.joined(separator: "\n")
+    }
+}
+
+/// `POST /api/onepassword/plan`: what would be read from 1Password and where it would go.
+struct OPPlan: Decodable, Identifiable {
+    struct Item: Decodable, Hashable, Identifiable {
+        var id: String { name }
+        let key: String?
+        let name: String
+        let ref: String
+        let template: String?
+        /// "op" (read with the CLI) or "op-env" (already read from an Environment).
+        let source: String
+        let cached: Bool
+        let status: String
+        let warnings: [String]?
+        let vault: String?
+        let item: String?
+        let field: String?
+        let needsRead: Bool
+        /// A cached value received from this paired Mac (not read from 1Password here).
+        let from: String?
+        let fetchedAt: Int64?
+
+        /// `KEY → NAME`, or just the one when they match.
+        var target: String {
+            guard let key, key != name else { return key ?? name }
+            return "\(key) → \(name)"
+        }
+    }
+    struct Removal: Decodable, Hashable {
+        let key: String
+        let secret: String
+        let ref: String?
+    }
+    let id: String
+    let kind: String
+    let service: String?
+    let expiresAt: Double?
+    let items: [Item]
+    let removals: [Removal]
+
+    var reads: [Item] { items.filter(\.needsRead) }
+    /// Values a paired Mac sent: always shown and confirmed before they're granted to a service.
+    var fromPeers: [Item] { items.filter { $0.cached && $0.from != nil } }
+    var peerNames: [String] { Array(Set(fromPeers.compactMap(\.from))).sorted() }
+}
+
+/// `POST /api/onepassword/import`.
+struct OPImportResult: Decodable {
+    let stored: [String]?
+    let granted: [String: String]?
+    let removed: [String]?
+    let deleted: [String]?
+    let skipped: [String]?
+    let restarting: [String]?
+}
+
+/// One line of `GET /api/onepassword/audit` (no values, ever).
+struct OPAuditEntry: Decodable {
+    let ts: String
+    let actor: String
+    let action: String
+    let detail: JSONValue?
+
+    var summary: String {
+        guard case let .object(d)? = detail else { return "" }
+        var parts: [String] = []
+        if case let .string(s)? = d["service"] { parts.append(s) }
+        for (k, label) in [("stored", "stored"), ("removed", "removed"), ("deleted", "deleted")] {
+            guard case let .array(list)? = d[k] else { continue }
+            let names: [String] = list.compactMap {
+                if case let .string(s) = $0 { return s }
+                if case let .object(o) = $0, case let .string(s)? = o["name"] { return s }
+                return nil
+            }
+            if !names.isEmpty { parts.append("\(label) \(names.joined(separator: ", "))") }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var date: Date? { ISO8601DateFormatter().date(from: ts) ?? Self.fractional.date(from: ts) }
+
+    private static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 }

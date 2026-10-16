@@ -145,6 +145,11 @@ pub struct ServiceConfig {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default, deserialize_with = "lenient_map")]
     pub env: Option<BTreeMap<String, String>>,
+    /// `.env` files (relative to `cwd`) read the way `op run --env-file` reads them: plain values are
+    /// set at each start (later files win, and they override `env:`); `op://` references are imported
+    /// into the secret store and injected through `secrets:`. Applies to every service type.
+    #[serde(skip_serializing_if = "Option::is_none", default, deserialize_with = "string_or_vec")]
+    pub env_files: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     /// Files sourced before the command (default: the shell's rc file, e.g. ~/.zshrc). `[]` = none.
@@ -316,6 +321,9 @@ pub struct ServiceState {
     /// Which machine runs it: None = this machine, else the paired machine's name.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub machine: Option<String>,
+    /// 1Password references in `envFiles` that changed since they were last approved (names and refs only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub secrets_pending: Option<serde_json::Value>,
     pub config: ServiceConfig,
 }
 
@@ -324,6 +332,9 @@ pub struct LogLine {
     pub ts: i64,
     pub stream: String,
     pub line: String,
+    /// Opaque cursor of this line in the log file; pass it as `before=` to page to older lines.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pos: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

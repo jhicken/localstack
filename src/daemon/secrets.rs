@@ -45,6 +45,50 @@ impl Drop for Key {
 struct Entry {
     value: String,
     set_at: i64,
+    #[serde(flatten)]
+    meta: Meta,
+}
+
+/// Where a value came from. Never secret: shown in `lstack secret ls`, the app and the audit log.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Meta {
+    /// `local` (typed in), `op` (1Password reference), `op-env` (1Password Environment), `peer:<machine>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The resolved `op://…` reference (or Environment mount `path#KEY`).
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// The reference as written in the env file, before `$VAR` expansion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// 1Password account it was read from (`--account`), when not the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Absolute path of the env file that introduced it (for clean-up when the line is removed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// When the value was last read from 1Password (or received from a paired Mac), ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<i64>,
+    /// For `peer:<machine>` values: that Mac's pinned link key (hex). Only it may update the value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_key: Option<String>,
+}
+
+impl Meta {
+    /// Pulled from 1Password on this Mac (and so shareable with a paired Mac that's been granted it).
+    pub fn from_1password(&self) -> bool {
+        matches!(self.source.as_deref(), Some("op" | "op-env"))
+    }
+    /// Received from a paired Mac (it read it from 1Password there). Never shared on.
+    pub fn from_peer(&self) -> bool {
+        self.source.as_deref().is_some_and(|s| s.starts_with("peer:"))
+    }
+    /// Cached for an env-file reference: from 1Password here or from a paired Mac.
+    pub fn imported(&self) -> bool {
+        self.from_1password() || self.from_peer()
+    }
 }
 impl Drop for Entry {
     fn drop(&mut self) {
@@ -138,15 +182,27 @@ impl ShareB {
         let r = match self {
             ShareB::File(p) => write_private(p, h.as_bytes()).map_err(|e| e.to_string()),
             ShareB::Keychain { account } => {
-                let out = Command::new("/usr/bin/security")
-                    .args(["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", account, "-l", "LStack secret store key share", "-w", &h])
-                    .stdin(Stdio::null())
-                    .output()
+                // The share goes to `security -i` on stdin, not argv, so `ps` can't see it while it runs.
+                if account.contains(['"', '\\', '\n', '\r']) {
+                    return Err(format!("Keychain: can't use account name {account:?}"));
+                }
+                let mut cmd = format!(
+                    "add-generic-password -U -s \"{KEYCHAIN_SERVICE}\" -a \"{account}\" -l \"LStack secret store key share\" -w {h}\n"
+                );
+                let mut child = Command::new("/usr/bin/security")
+                    .arg("-i")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
                     .map_err(|e| e.to_string())?;
-                if out.status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("Keychain: {}", String::from_utf8_lossy(&out.stderr).trim()))
+                let wrote = child.stdin.take().map(|mut i| std::io::Write::write_all(&mut i, cmd.as_bytes()));
+                cmd.zeroize();
+                let out = child.wait_with_output().map_err(|e| e.to_string())?;
+                // `security -i` exits 0 even when a command fails: check by reading it back.
+                match (wrote, self.read()) {
+                    (Some(Ok(())), Ok(Some(back))) if back == *share => Ok(()),
+                    _ => Err(format!("Keychain: couldn't store the key share {}", String::from_utf8_lossy(&out.stderr).trim())),
                 }
             }
         };
@@ -162,6 +218,10 @@ pub struct Vault {
     values: BTreeMap<String, Entry>,
     /// Why the store can't be read (missing share, Keychain locked, tampered file…).
     error: Option<String>,
+    /// Bumped on every change, so watchers can tell when to re-check.
+    generation: u64,
+    /// The generation the log scrubber last saw (it's rebuilt only when values change).
+    scrubbed: Option<u64>,
 }
 
 impl Vault {
@@ -178,7 +238,7 @@ impl Vault {
         } else {
             ShareB::File(dir.join("secrets.share2"))
         };
-        let mut v = Vault { dir, share_b, key: None, values: BTreeMap::new(), error: None };
+        let mut v = Vault { dir, share_b, key: None, values: BTreeMap::new(), error: None, generation: 0, scrubbed: None };
         if let Err(e) = v.load() {
             v.error = Some(e);
         }
@@ -188,6 +248,7 @@ impl Vault {
     fn load(&mut self) -> Result<(), String> {
         self.key = None;
         self.values.clear();
+        self.generation += 1;
         let exists = self.enc_file().exists();
         let a = match std::fs::read_to_string(self.share_file()) {
             Ok(s) => Some(share32(&s).ok_or("secrets.key is corrupt")?),
@@ -275,25 +336,74 @@ impl Vault {
         if value.len() > MAX_VALUE {
             return Err("secret value is too large (64 KB max)".into());
         }
-        let prev = self.values.insert(name.to_string(), Entry { value: value.to_string(), set_at: paths::now_ms() });
-        if let Err(e) = self.save() {
-            match prev {
-                Some(p) => self.values.insert(name.to_string(), p),
-                None => self.values.remove(name),
-            };
-            return Err(e);
+        self.set_many(vec![(name.to_string(), value.to_string(), Meta { source: Some("local".into()), ..Default::default() })])
+    }
+
+    fn check(name: &str, value: &str) -> Result<(), String> {
+        if !valid_name(name) {
+            return Err(format!("invalid secret name {name:?} (letters, digits and _, not starting with a digit)"));
+        }
+        if value.is_empty() {
+            return Err(format!("{name}: secret value is empty"));
+        }
+        if value.len() > MAX_VALUE {
+            return Err(format!("{name}: secret value is too large (64 KB max)"));
+        }
+        if value.contains('\0') {
+            return Err(format!("{name}: secret value contains a NUL byte, which can't be passed as an environment variable"));
         }
         Ok(())
     }
 
-    pub fn remove(&mut self, name: &str) -> Result<bool, String> {
+    /// Set several values in one encrypted write: all or nothing.
+    pub fn set_many(&mut self, items: Vec<(String, String, Meta)>) -> Result<(), String> {
         self.ready()?;
-        let Some(prev) = self.values.remove(name) else { return Ok(false) };
+        for (n, v, _) in &items {
+            Self::check(n, v)?;
+        }
+        let mut prev = Vec::new();
+        for (name, value, meta) in items {
+            let p = self.values.insert(name.clone(), Entry { value, set_at: paths::now_ms(), meta });
+            prev.push((name, p));
+        }
         if let Err(e) = self.save() {
-            self.values.insert(name.to_string(), prev);
+            for (name, p) in prev.into_iter().rev() {
+                match p {
+                    Some(p) => self.values.insert(name, p),
+                    None => self.values.remove(&name),
+                };
+            }
             return Err(e);
         }
-        Ok(true)
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Remove several names in one encrypted write. Returns how many existed.
+    pub fn remove_many(&mut self, names: &[String]) -> Result<usize, String> {
+        self.ready()?;
+        let mut prev = Vec::new();
+        for n in names {
+            if let Some(p) = self.values.remove(n) {
+                prev.push((n.clone(), p));
+            }
+        }
+        if prev.is_empty() {
+            return Ok(0);
+        }
+        if let Err(e) = self.save() {
+            for (n, p) in prev {
+                self.values.insert(n, p);
+            }
+            return Err(e);
+        }
+        self.generation += 1;
+        Ok(prev.len())
+    }
+
+    pub fn remove(&mut self, name: &str) -> Result<bool, String> {
+        self.ready()?;
+        Ok(self.remove_many(&[name.to_string()])? == 1)
     }
 
     pub fn rotate(&mut self) -> Result<(), String> {
@@ -307,6 +417,7 @@ impl Vault {
 
     pub fn reload(&mut self) {
         self.error = self.load().err();
+        self.generation += 1;
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -317,8 +428,18 @@ impl Vault {
         self.values.iter().map(|(k, e)| (k.clone(), e.set_at)).collect()
     }
 
-    fn sync_scrubber(&self) {
+    pub fn meta(&self, name: &str) -> Option<Meta> {
+        self.values.get(name).map(|e| e.meta.clone())
+    }
+
+    /// Every vault access goes through here: only rebuild the scrubber's patterns (plaintext forms of every
+    /// value) when something changed, so stale copies don't pile up on the heap.
+    fn sync_scrubber(&mut self) {
+        if self.scrubbed == Some(self.generation) {
+            return;
+        }
         crate::scrub::set_secrets(self.values.iter().map(|(k, e)| (k.as_str(), e.value.as_str())));
+        self.scrubbed = Some(self.generation);
     }
 }
 
@@ -358,6 +479,28 @@ pub fn rotate() -> Result<(), String> {
     with(|v| v.rotate())
 }
 
+pub fn set_many(items: Vec<(String, String, Meta)>) -> Result<(), String> {
+    with(|v| v.set_many(items))
+}
+
+pub fn remove_many(names: &[String]) -> Result<usize, String> {
+    with(|v| v.remove_many(names))
+}
+
+/// Metadata (never values) for every stored secret.
+pub fn all_meta() -> BTreeMap<String, Meta> {
+    with(|v| v.values.iter().map(|(k, e)| (k.clone(), e.meta.clone())).collect())
+}
+
+/// Changes whenever the store does (set, remove, unlock).
+pub fn generation() -> u64 {
+    with(|v| v.generation)
+}
+
+pub fn is_locked() -> bool {
+    with(|v| v.error.is_some())
+}
+
 /// For the daemon's own use only (env injection, cmux password, ping key). Never sent to clients.
 pub fn internal_get(name: &str) -> Option<String> {
     with(|v| v.get(name).map(String::from))
@@ -391,7 +534,12 @@ pub fn status(services: &[crate::types::ServiceConfig]) -> Value {
             .map(|(name, set_at)| {
                 let used_by: Vec<&str> =
                     services.iter().filter(|c| c.secret_refs().iter().any(|(_, s)| *s == name)).map(|c| c.name.as_str()).collect();
-                json!({ "name": name, "setAt": set_at, "usedBy": used_by, "internal": name.starts_with(INTERNAL_PREFIX) })
+                let m = v.meta(&name).unwrap_or_default();
+                json!({
+                    "name": name, "setAt": set_at, "usedBy": used_by, "internal": name.starts_with(INTERNAL_PREFIX),
+                    "source": m.source.as_deref().unwrap_or("local"), "ref": m.reference, "template": m.template,
+                    "account": m.account, "origin": m.origin, "fetchedAt": m.fetched_at,
+                })
             })
             .collect();
         // Referenced but not set yet, so the UI can prompt for them.

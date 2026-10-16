@@ -1,5 +1,13 @@
 import SwiftUI
 
+/// The log window keeps a bounded window of lines: it opens with the newest few hundred and
+/// pages older ones in from the daemon's log file as you scroll up.
+enum LogPaging {
+    static let initial = 300
+    static let page = 500
+    static let maxLines = 4000
+}
+
 struct LogView: View {
     @Environment(AppStore.self) private var store
     let name: String
@@ -10,6 +18,16 @@ struct LogView: View {
     @State private var input = ""
     @State private var streamError: String?
     @State private var counter = 0
+    @State private var oldest = 0
+    @State private var reachedStart = false
+    @State private var loadingOlder = false
+    @State private var olderError: String?
+    /// The newest lines were dropped to make room for older ones (or new output was paused while you
+    /// read back), so live lines aren't appended until you jump back to the latest.
+    @State private var detached = false
+    @State private var generation = 0
+    /// Whether the end of the log is on screen (tracked with a sentinel row); only then does Follow scroll.
+    @State private var atBottom = true
 
     struct IndexedLine: Identifiable {
         let id: Int
@@ -29,19 +47,32 @@ struct LogView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
+                        olderRow(proxy)
                         ForEach(visible) { l in
                             row(l).id(l.id)
                         }
+                        Color.clear.frame(height: 1)
+                            .onAppear { atBottom = true }
+                            .onDisappear { atBottom = false }
                     }
                     .padding(10)
                     .textSelection(.enabled)
                 }
                 .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
                 .onChange(of: lines.last?.id) {
-                    if follow, let last = visible.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                    if follow, atBottom, let last = visible.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
                 .onChange(of: follow) {
+                    if follow, detached { generation += 1; return }
                     if follow, let last = visible.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if detached {
+                    Button { follow = true; generation += 1 } label: {
+                        Label("Paused — Jump to Latest", systemImage: "arrow.down.to.line")
+                    }
+                    .buttonStyle(.borderedProminent).controlSize(.small).padding(12)
                 }
             }
             if service?.type == "process", !isRemote {
@@ -94,6 +125,7 @@ struct LogView: View {
                     Button {
                         store.clearLogs(name)
                         lines = []
+                        reachedStart = true
                     } label: { Label("Clear", systemImage: "trash") }
                 }
                 Toggle(isOn: $follow) { Label("Follow", systemImage: "arrow.down.to.line") }
@@ -107,7 +139,84 @@ struct LogView: View {
             }
         }
         .background(LiveWindowReporter(store: store))
-        .task(id: name) { await stream() }
+        .task(id: "\(name)#\(generation)") { await stream() }
+    }
+
+    private var hasOlder: Bool { !reachedStart && lines.first?.line.pos != nil }
+
+    @ViewBuilder
+    private func olderRow(_ proxy: ScrollViewProxy) -> some View {
+        if hasOlder {
+            HStack(spacing: 6) {
+                if loadingOlder {
+                    ProgressView().controlSize(.small)
+                    Text("Loading older lines…")
+                } else if let e = olderError {
+                    Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                    Text(e).lineLimit(1)
+                    Button("Retry") { Task { await loadOlder(proxy) } }.buttonStyle(.link)
+                } else {
+                    Button("Load Older Lines") { Task { await loadOlder(proxy) } }.buttonStyle(.link)
+                }
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            // Scrolling to the top pulls in the previous page (not while filtering, so a filter with
+            // few matches doesn't page through the whole history on its own).
+            .onAppear { if filter.isEmpty, olderError == nil, !atBottom { Task { await loadOlder(proxy) } } }
+        } else if !lines.isEmpty, reachedStart {
+            Text("Beginning of log").font(.system(size: 11)).foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity).padding(.vertical, 4)
+        }
+    }
+
+    private func loadOlder(_ proxy: ScrollViewProxy) async {
+        guard !loadingOlder, let before = lines.first?.line.pos else { return }
+        let anchor = visible.first?.id
+        loadingOlder = true
+        defer { loadingOlder = false }
+        do {
+            let page = try await store.olderLogs(name, before: before)
+            olderError = nil
+            guard lines.first?.line.pos == before else { return } // reloaded meanwhile
+            if page.count < LogPaging.page { reachedStart = true }
+            guard !page.isEmpty else { return }
+            var older: [IndexedLine] = []
+            older.reserveCapacity(page.count)
+            for l in page.reversed() {
+                oldest -= 1
+                older.append(IndexedLine(id: oldest, line: l, text: Self.stripAnsi(l.line)))
+            }
+            lines.insert(contentsOf: older.reversed(), at: 0)
+            if lines.count > LogPaging.maxLines {
+                lines.removeLast(lines.count - LogPaging.maxLines)
+                detached = true
+                follow = false
+            }
+            if let anchor {
+                try? await Task.sleep(for: .milliseconds(10))
+                proxy.scrollTo(anchor, anchor: .top)
+            }
+        } catch {
+            if !Task.isCancelled { olderError = error.localizedDescription }
+        }
+    }
+
+    private func append(_ l: LogLine) {
+        guard !detached else { return }
+        counter += 1
+        lines.append(IndexedLine(id: counter, line: l, text: Self.stripAnsi(l.line)))
+        guard lines.count > LogPaging.maxLines else { return }
+        if follow, atBottom {
+            lines.removeFirst(lines.count - LogPaging.maxLines)
+            reachedStart = false
+        } else {
+            // You're reading back: keep what's on screen and stop appending until you jump back.
+            lines.removeLast()
+            detached = true
+        }
     }
 
     private func row(_ l: IndexedLine) -> some View {
@@ -125,6 +234,10 @@ struct LogView: View {
         let decoder = JSONDecoder()
         while !Task.isCancelled {
             lines = []
+            atBottom = true
+            reachedStart = false
+            detached = false
+            olderError = nil
             guard let events = store.logStream(name) else {
                 streamError = "daemon offline"
                 try? await Task.sleep(for: .seconds(2))
@@ -134,9 +247,7 @@ struct LogView: View {
                 streamError = nil
                 for try await (_, data) in events {
                     guard let l = try? decoder.decode(LogLine.self, from: data) else { continue }
-                    counter += 1
-                    lines.append(IndexedLine(id: counter, line: l, text: Self.stripAnsi(l.line)))
-                    if lines.count > 5000 { lines.removeFirst(lines.count - 5000) }
+                    append(l)
                 }
             } catch {
                 if Task.isCancelled { return }

@@ -27,17 +27,28 @@ fn print_secrets(v: &Value) {
             } else {
                 c::green("set ✓")
             };
-            let set_at = s["setAt"].as_i64().map(c::local_time).unwrap_or_else(|| "—".into());
+            let at = s["fetchedAt"].as_i64().or(s["setAt"].as_i64());
+            let set_at = at.map(c::local_time).unwrap_or_else(|| "—".into());
+            let source = match s["source"].as_str() {
+                Some("op") => c::cyan(&format!("1Password {}", s["ref"].as_str().unwrap_or(""))),
+                Some("op-env") => c::cyan("1Password Environment"),
+                Some(p) if p.starts_with("peer:") => c::cyan(&format!("from {}", &p[5..])),
+                _ if s["missing"].as_bool().unwrap_or(false) => c::dim("—"),
+                _ => c::dim("typed in"),
+            };
             let used: Vec<&str> = s["usedBy"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
             let used = if s["internal"].as_bool().unwrap_or(false) { c::dim("(LStack)") } else if used.is_empty() { c::dim("—") } else { used.join(", ") };
-            vec![c::bold(s["name"].as_str().unwrap_or("?")), state, set_at, used]
+            vec![c::bold(s["name"].as_str().unwrap_or("?")), state, set_at, used, source]
         })
         .collect();
-    println!("{}", c::table(&rows, &["NAME", "VALUE", "UPDATED", "USED BY"]));
+    println!("{}", c::table(&rows, &["NAME", "VALUE", "UPDATED", "USED BY", "SOURCE"]));
     println!("{}", c::dim(&format!("  Encrypted at rest; key split between {} and secrets.key. Values can't be read back.", if v["storage"] == "keychain" { "the login Keychain" } else { "secrets.share2" })));
 }
 
 pub fn cmd_secret(args: &[String]) -> R {
+    if args.first().is_some_and(|s| crate::cli_op::handles(s)) {
+        return crate::cli_op::cmd(args);
+    }
     let a = Args::parse(args, &[("stdin", "", false), ("json", "", false), ("yes", "y", false)])?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("ls");
@@ -77,7 +88,7 @@ pub fn cmd_secret(args: &[String]) -> R {
             r
         }
         "get" | "show" | "reveal" => return Err("secrets are write-only: values can't be read back (set it again to change it)".into()),
-        other => return Err(format!("unknown secret command {other:?} (set, ls, rm, rotate-key, unlock)")),
+        other => return Err(format!("unknown secret command {other:?} (set, ls, rm, rotate-key, unlock, import, review, refresh, link, audit)")),
     };
     if a.has("json") {
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());

@@ -85,7 +85,11 @@ impl Client {
             Ok(resp) => resp.into_json::<T>().map_err(|e| e.to_string()),
             Err(ureq::Error::Status(code, resp)) => {
                 let v: Value = resp.into_json().unwrap_or(Value::Null);
-                Err(v["error"].as_str().map(String::from).unwrap_or_else(|| format!("HTTP {code}")))
+                let msg = v["error"].as_str().map(String::from).unwrap_or_else(|| format!("HTTP {code}"));
+                if code == 404 && msg.starts_with("no route for") {
+                    return Err(format!("{msg} — the background service is older than this command; run `lstack daemon restart`"));
+                }
+                Err(msg)
             }
             Err(e) => Err(e.to_string()),
         }

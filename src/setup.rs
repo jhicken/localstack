@@ -284,10 +284,8 @@ pub fn daemon_stale(i: &crate::types::DaemonInfo) -> Option<String> {
     if i.version != paths::VERSION {
         return Some(format!("the background service is running v{} but this is v{}", i.version, paths::VERSION));
     }
+    // The daemon's own binary changed since it started (an app update or rebuild), whichever copy this is.
     let bin = PathBuf::from(i.bin.as_deref()?);
-    if canon(&bin) != canon(&paths::self_exe()) {
-        return None;
-    }
     let modified = std::fs::metadata(&bin).and_then(|m| m.modified()).ok()?;
     let modified_ms = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
     (modified_ms > i.started_at + 2_000).then(|| "LStack was updated after the background service started".to_string())

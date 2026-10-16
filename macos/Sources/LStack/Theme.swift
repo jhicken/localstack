@@ -114,3 +114,43 @@ struct IconButton: View {
         .onHover { hover = $0 }
     }
 }
+
+/// Lays children out left to right, wrapping onto new lines when the row is full (chips, tags).
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 4
+    var lineSpacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxW = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, lineH: CGFloat = 0, width: CGFloat = 0
+        for s in subviews {
+            let sz = s.sizeThatFits(.unspecified)
+            let w = min(sz.width, maxW)
+            if x > 0, x + w > maxW {
+                y += lineH + lineSpacing
+                x = 0
+                lineH = 0
+            }
+            x += w + spacing
+            lineH = max(lineH, sz.height)
+            width = max(width, x - spacing)
+        }
+        return CGSize(width: width, height: y + lineH)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, lineH: CGFloat = 0
+        for s in subviews {
+            let sz = s.sizeThatFits(.unspecified)
+            let w = min(sz.width, bounds.width)
+            if x > bounds.minX, x + w > bounds.maxX {
+                y += lineH + lineSpacing
+                x = bounds.minX
+                lineH = 0
+            }
+            s.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(width: w, height: sz.height))
+            x += w + spacing
+            lineH = max(lineH, sz.height)
+        }
+    }
+}

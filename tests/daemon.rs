@@ -146,6 +146,25 @@ fn end_to_end() {
     assert_eq!(d.post("/api/services", Some(json!({ "name": "echo", "type": "process", "command": "x" }))).unwrap_err().0, 409);
     assert_eq!(d.post("/api/services", Some(json!({ "name": "bad name", "type": "process", "command": "x" }))).unwrap_err().0, 400);
 
+    // a folder's .env.lstack is used by default (no terminal: no prompt); --no-env-file skips it
+    let proj = home.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join(".env.lstack"), "GREETING=hi\n").unwrap();
+    std::fs::write(proj.join(".env"), "OTHER=1\n").unwrap();
+    let (ok, out) = d.cli(&["add", "envy", "-c", proj.to_str().unwrap(), "--", "true"]);
+    assert!(ok && out.contains(".env.lstack"), "{out}");
+    assert_eq!(d.svc("envy")["config"]["envFiles"], json!([".env.lstack"]));
+    let (ok, out) = d.cli(&["add", "plain", "-c", proj.to_str().unwrap(), "--no-env-file", "--", "true"]);
+    assert!(ok, "{out}");
+    assert!(d.svc("plain")["config"].get("envFiles").is_none());
+    let (ok, out) = d.cli(&["add", "chosen", "-c", proj.to_str().unwrap(), "--env-file", ".env", "--", "true"]);
+    assert!(ok, "{out}");
+    assert_eq!(d.svc("chosen")["config"]["envFiles"], json!([".env"]));
+    for n in ["envy", "plain", "chosen"] {
+        let (ok, out) = d.cli(&["rm", n, "-y"]);
+        assert!(ok, "{out}");
+    }
+
     // stop kills the whole process group
     let pid = d.svc("echo")["pid"].as_i64().unwrap();
     let st = d.post("/api/services/echo/stop", None).unwrap();
@@ -263,6 +282,167 @@ fn secrets_are_write_only_injected_and_scrubbed() {
 
     d.call("DELETE", "/api/secrets/API_KEY", None).unwrap();
     assert_eq!(d.call("DELETE", "/api/secrets/API_KEY", None).unwrap_err().0, 404);
+}
+
+/// 1Password references in an env file: flagged for review, imported with values a client read (here
+/// fake ones; the daemon never runs `op`), injected from the store on every restart, never read
+/// live from the file, and cleaned up when the line goes away.
+#[test]
+fn onepassword_env_file_import() {
+    let home = std::env::temp_dir().join(format!("lstack-it-op-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let d = Daemon::start(&home);
+    let app = home.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join(".env"), "PLAIN=hello-$APP_ENV\nDB_PASSWORD=op://Dev/db/password\n").unwrap();
+    d.post("/api/services", Some(json!({ "name": "api", "type": "process", "restart": "never", "cwd": app.to_string_lossy(),
+        "envFiles": [".env"], "env": { "APP_ENV": "dev" },
+        "command": "echo plain=$PLAIN db=${DB_PASSWORD:-unset}; sleep 60" }))).unwrap();
+
+    // The watcher flags the new reference; nothing is read.
+    wait_until("pending", 10, || d.svc("api")["secretsPending"]["new"] == json!(["DB_PASSWORD"]));
+    let review = d.get("/api/onepassword/review/api").unwrap();
+    assert_eq!(review["refs"][0]["status"], "new", "{review}");
+    assert_eq!(review["refs"][0]["vault"], "Dev");
+    let (ok, out) = d.cli(&["secret", "review", "api"]);
+    assert!(ok && out.contains("DB_PASSWORD") && out.contains("op://Dev/db/password") && out.contains("lstack secret import api"), "{out}");
+
+    // It starts with plain values and without the unapproved key.
+    d.post("/api/services/api/start", None).unwrap();
+    wait_until("first run", 10, || d.logs("api").contains("plain=hello-dev db=unset"));
+    assert!(d.logs("api").contains("waiting for review"), "{}", d.logs("api"));
+
+    // Plan → the client reads (here: a fake value) → import.
+    let plan = d.post("/api/onepassword/plan", Some(json!({ "kind": "env", "service": "api" }))).unwrap();
+    assert_eq!(plan["items"][0]["name"], "DB_PASSWORD");
+    assert_eq!(plan["items"][0]["needsRead"], true);
+    let id = plan["id"].as_str().unwrap();
+    let bad = d.post("/api/onepassword/import", Some(json!({ "plan": id, "values": { "OTHER": "x-not-in-plan" } }))).unwrap_err();
+    assert_eq!(bad.0, 400, "values for refs outside the plan are refused");
+    let value = "pw-from-1password-Q7x";
+    let r = d.post("/api/onepassword/import", Some(json!({ "plan": id, "values": { "DB_PASSWORD": value }, "actor": "cli" }))).unwrap();
+    assert_eq!(r["stored"], json!(["DB_PASSWORD"]), "{r}");
+    assert_eq!(d.post("/api/onepassword/import", Some(json!({ "plan": id, "values": {} }))).unwrap_err().0, 404, "plans are single-use");
+    wait_until("pending cleared", 10, || d.svc("api")["secretsPending"].is_null());
+    let listed = d.get("/api/secrets").unwrap();
+    let entry = listed["secrets"].as_array().unwrap().iter().find(|s| s["name"] == "DB_PASSWORD").unwrap().clone();
+    assert_eq!(entry["source"], "op");
+    assert_eq!(entry["ref"], "op://Dev/db/password");
+    assert!(!listed.to_string().contains(value));
+
+    // Restarts need no 1Password: the value comes from the store.
+    d.post("/api/services/api/restart", None).unwrap();
+    wait_until("injected", 10, || d.logs("api").contains("db=••••[DB_PASSWORD]"));
+    assert!(!d.logs("api").contains(value));
+
+    // Pointing the key at another reference doesn't change what the service gets until reviewed.
+    std::fs::write(app.join(".env"), "PLAIN=hello-$APP_ENV\nDB_PASSWORD=op://Dev/other-db/password\n").unwrap();
+    wait_until("changed", 10, || d.svc("api")["secretsPending"]["changed"] == json!(["DB_PASSWORD"]));
+    d.post("/api/services/api/restart", None).unwrap();
+    wait_until("still approved value", 10, || d.logs("api").matches("db=••••[DB_PASSWORD]").count() >= 2);
+
+    // Removing the line stops passing it and forgets the imported value.
+    std::fs::write(app.join(".env"), "PLAIN=hello-$APP_ENV\n").unwrap();
+    wait_until("removed", 10, || d.svc("api")["config"]["secrets"].is_null());
+    // …once the running process (which still has it, and whose logs must stay scrubbed) restarts.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(d.get("/api/secrets").unwrap().to_string().contains("DB_PASSWORD"), "kept while still in use");
+    d.post("/api/services/api/restart", None).unwrap();
+    wait_until("forgotten", 10, || !d.get("/api/secrets").unwrap().to_string().contains("DB_PASSWORD"));
+    let audit = d.get("/api/onepassword/audit").unwrap().to_string();
+    assert!(audit.contains("op://Dev/db/password") && audit.contains("\"remove\"") && !audit.contains(value), "{audit}");
+
+    // A missing env file fails the start clearly (like `op run`).
+    d.call("PATCH", "/api/services/api", Some(json!({ "envFiles": [".env", ".env.missing"] }))).unwrap();
+    d.post("/api/services/api/stop", None).unwrap();
+    let _ = d.post("/api/services/api/start", None);
+    wait_until("start fails", 10, || d.svc("api")["lastError"].as_str().unwrap_or("").contains(".env.missing"));
+}
+
+/// A paired Mac receives a 1Password value only after it's shared with it, from the other Mac's store.
+#[test]
+fn onepassword_values_shared_with_paired_mac() {
+    let base = std::env::temp_dir().join(format!("lstack-it-opshare-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let a = Daemon::start(&base.join("a")); // has the value from 1Password; shares its services
+    let b = Daemon::start(&base.join("b")); // watches `a` ("studio") and needs the value
+
+    // `a` imported the value (the client read it from 1Password; here a fake value).
+    let value = "shared-pw-Zk9";
+    let plan = a.post("/api/onepassword/plan", Some(json!({ "kind": "link", "name": "DB_PASSWORD", "ref": "op://Dev/db/password" }))).unwrap();
+    a.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "DB_PASSWORD": value } }))).unwrap();
+    a.call("PUT", "/api/secrets/TYPED_IN", Some(json!({ "value": "typed-in-value" }))).unwrap();
+
+    let (rport, lport) = (free_port(), free_port());
+    a.call("PUT", "/api/remote", Some(json!({ "enabled": false, "sharing": true, "bind": "127.0.0.1", "port": rport, "linkPort": lport, "username": "me", "password": "correct horse" })))
+        .unwrap();
+    let addr = format!("127.0.0.1:{lport}");
+    wait_until("link listener", 10, || std::net::TcpStream::connect(&addr).is_ok());
+    let code = a.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
+    b.post("/api/machines", Some(json!({ "address": addr, "code": code, "name": "studio" }))).unwrap();
+    wait_until("online", 30, || b.get("/api/machines/studio").is_ok_and(|v| v["status"] == "online"));
+    let peer_id = a.get("/api/remote/peers").unwrap()[0]["id"].as_str().unwrap().to_string();
+
+    let app = base.join("b/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join(".env"), "DB_PASSWORD=op://Dev/db/password\n").unwrap();
+    b.post("/api/services", Some(json!({ "name": "api", "type": "process", "restart": "never", "cwd": app.to_string_lossy(),
+        "envFiles": [".env"], "command": "echo db=${DB_PASSWORD:-unset}; sleep 60" }))).unwrap();
+    wait_until("pending", 10, || b.svc("api")["secretsPending"]["new"] == json!(["DB_PASSWORD"]));
+
+    // Not shared yet: nothing arrives, but `a` sees what `b` waits for (references only).
+    let r = b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    assert_eq!(r["received"], json!([]), "{r}");
+    let shares = a.get("/api/onepassword/shares").unwrap();
+    assert_eq!(shares["peers"][0]["wants"][0]["ref"], "op://Dev/db/password", "{shares}");
+    assert_eq!(shares["peers"][0]["wants"][0]["have"], true);
+    // Only values read from 1Password here can be shared.
+    assert_eq!(a.post("/api/onepassword/shares", Some(json!({ "peer": peer_id, "items": ["TYPED_IN"] }))).unwrap_err().0, 400);
+    assert_eq!(a.post("/api/onepassword/shares", Some(json!({ "peer": peer_id, "items": ["op://Dev/nope/x"] }))).unwrap_err().0, 404);
+
+    // Shared: importing on `b` takes it from `a` — no 1Password read.
+    let (ok, out) = a.cli(&["secret", "share", &peer_id, "DB_PASSWORD"]);
+    assert!(ok, "{out}");
+    let plan = b.post("/api/onepassword/plan", Some(json!({ "kind": "env", "service": "api" }))).unwrap();
+    assert_eq!(plan["items"][0]["cached"], true, "{plan}");
+    assert_eq!(plan["items"][0]["needsRead"], false);
+    assert_eq!(plan["items"][0]["from"], "studio", "the plan says the value came from the paired Mac");
+    // Received values aren't granted to anything until that plan is confirmed.
+    assert_eq!(b.svc("api")["config"]["secrets"], Value::Null);
+    b.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": {} }))).unwrap();
+    let entry = |d: &Daemon| d.get("/api/secrets").unwrap()["secrets"].as_array().unwrap().iter().find(|s| s["name"] == "DB_PASSWORD").cloned().unwrap_or(Value::Null);
+    assert_eq!(entry(&b)["source"], "peer:studio");
+    assert_eq!(b.svc("api")["config"]["secrets"], json!({ "DB_PASSWORD": "DB_PASSWORD" }));
+    b.post("/api/services/api/start", None).unwrap();
+    wait_until("injected", 10, || b.logs("api").contains("db=••••[DB_PASSWORD]"));
+    assert!(!b.logs("api").contains(value));
+
+    // A refresh on `a` reaches `b` (pushToPeers), still from the store.
+    let before = entry(&b)["fetchedAt"].clone();
+    std::thread::sleep(Duration::from_millis(20));
+    let plan = a.post("/api/onepassword/plan", Some(json!({ "kind": "refresh", "names": ["DB_PASSWORD"] }))).unwrap();
+    a.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "DB_PASSWORD": "rotated-pw-Q2" } }))).unwrap();
+    let r = b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    assert_eq!(r["received"][0]["updated"], json!(["DB_PASSWORD"]), "{r}");
+    assert_ne!(entry(&b)["fetchedAt"], before);
+
+    // `b` can't pass on what it received.
+    let b_peers = b.get("/api/remote/peers").unwrap();
+    assert!(b_peers.as_array().unwrap().is_empty() || b.post("/api/onepassword/shares", Some(json!({ "peer": b_peers[0]["id"], "items": ["DB_PASSWORD"] }))).unwrap_err().0 == 400);
+
+    // Unshared: no more updates.
+    a.post("/api/onepassword/shares", Some(json!({ "peer": peer_id, "items": ["DB_PASSWORD"], "allow": false }))).unwrap();
+    let plan = a.post("/api/onepassword/plan", Some(json!({ "kind": "refresh", "names": ["DB_PASSWORD"] }))).unwrap();
+    a.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "DB_PASSWORD": "rotated-again" } }))).unwrap();
+    assert_eq!(b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap()["received"], json!([]));
+
+    let (audit_a, audit_b) = (a.get("/api/onepassword/audit").unwrap().to_string(), b.get("/api/onepassword/audit").unwrap().to_string());
+    assert!(audit_a.contains("peer-sent") && audit_b.contains("peer-received"), "{audit_a}\n{audit_b}");
+    for s in [&audit_a, &audit_b] {
+        assert!(!s.contains(value) && !s.contains("rotated"), "{s}");
+    }
+    let activity = a.get("/api/remote/activity").map(|v| v.to_string()).unwrap_or_default();
+    assert!(activity.is_empty() || activity.contains("secrets-sent"), "{activity}");
 }
 
 #[test]

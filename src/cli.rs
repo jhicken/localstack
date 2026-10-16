@@ -32,6 +32,15 @@ fn help() -> String {
   lstack terminal [terminal|iterm|cmux|ghostty]   app used to open the dashboard / attach
   lstack terminal cmux --fix     let LStack open cmux workspaces (socket password mode)
   lstack secret set|ls|rm|rotate-key|unlock   write-only secrets passed to services as env vars
+  lstack secret review <service|file>   op:// references in the service's envFiles and what's approved
+  lstack secret import [<service|file>] [--env-file .env] [--keys A,B] [--environment <mount>] [--account <a>] [-y]
+                                 read new/changed references from 1Password (you approve in the app)
+  lstack secret refresh <NAME…>|--service S|--all   re-read cached 1Password values
+  lstack secret link <NAME> op://vault/item/field [--service S [--key ENV]]   cache one reference
+  lstack secret audit [-n 50]    imports, refreshes, removals and transfers (never values)
+  lstack secret shares           what paired Macs wait for, and what you share with them
+  lstack secret share|unshare <machine> <NAME|op://…>…   send a paired Mac cached 1Password values
+  lstack secret sync [<service>]   take values paired Macs share with you now (from their cache)
   lstack ps [--machine <m>]      busy processes (over the CPU/mem/net thresholds), per machine
   lstack machine ls|add|rm|rename|transport   watch other Macs (their services show up everywhere)
   lstack tailnet on|off|status|login|logout|update   Tailscale transport for paired Macs (see below)
@@ -56,6 +65,10 @@ fn help() -> String {
       --no-split         keep the command as typed (by default a leading `cd dir &&`, `FOO=bar`,
                          `export …` and `source …` are moved into cwd / env / source)
       --now              start immediately after adding
+      --env-file <path>  .env read like `op run --env-file` (repeatable): plain values at each start,
+                         op:// references pulled from 1Password once you approve (lstack secret import).
+                         Default: the folder's .env.lstack, if any (asks first on a terminal; -y accepts)
+      --no-env-file      don't use an env file
 
 {}
   lstack remote on [--local|--network] [--port 7380] [--user admin] [--bind 0.0.0.0] [--allow-control|--read-only] [--password-stdin]
@@ -189,6 +202,9 @@ pub(crate) struct Args {
     flags: std::collections::HashMap<String, Vec<String>>,
 }
 impl Args {
+    pub(crate) fn set(&mut self, key: &str, value: &str) {
+        self.flags.insert(key.to_string(), vec![value.to_string()]);
+    }
     /// `spec`: (long, short, takes_value). Everything after `--` is positional.
     pub(crate) fn parse(args: &[String], spec: &[(&str, &str, bool)]) -> Result<Args, String> {
         let mut out = Args::default();
@@ -347,6 +363,10 @@ fn print_services(services: &[ServiceState], local: bool) {
             headers.push("URL");
         }
         println!("{}", c::table(&rows, &headers));
+        for s in services.iter().filter(|s| s.secrets_pending.is_some()) {
+            let how = if local { format!("lstack secret review {}", s.name) } else { "review it on that Mac".into() };
+            println!("{} {}: 1Password references to review — {how}", c::yellow("!"), s.name);
+        }
     }
 }
 
@@ -361,6 +381,10 @@ fn cmd_show(args: &[String]) -> R {
     }
     if let Some(d) = &s.description {
         println!("{}", c::dim(d));
+    }
+    if let Some(p) = &s.secrets_pending {
+        let keys: Vec<&str> = ["new", "changed", "missing", "blocked", "removed"].iter().flat_map(|k| p[*k].as_array().into_iter().flatten()).filter_map(|v| v.as_str()).collect();
+        println!("{} 1Password references to review: {}  {}", c::yellow("!"), keys.join(", "), c::cyan(&format!("lstack secret review {}", s.name)));
     }
     let met = s.metrics.as_ref();
     let mut kv = vec![
@@ -442,6 +466,9 @@ fn cmd_add(args: &[String]) -> R {
             ("no-source", "", false),
             ("no-split", "", false),
             ("now", "", false),
+            ("env-file", "", true),
+            ("no-env-file", "", false),
+            ("yes", "y", false),
         ],
     )?;
     let kind = a.get("type").unwrap_or("process").to_string();
@@ -501,8 +528,19 @@ fn cmd_add(args: &[String]) -> R {
         }
         cfg
     };
+    let env_files = a.all("env-file");
+    if !env_files.is_empty() {
+        cfg.env_files = Some(env_files);
+    } else if a.has("no-env-file") {
+        cfg.env_files = None;
+    } else if cfg.env_files.is_none() {
+        if let Some(f) = choose_env_file(&cfg, a.has("yes"))? {
+            cfg.env_files = Some(vec![f]);
+        }
+    }
     cfg = config::validate(cfg)?;
-    let s = client::connect(true)?.create(&cfg, a.has("now"))?;
+    let cl = client::connect(true)?;
+    let s = cl.create(&cfg, a.has("now"))?;
     println!(
         "{} added {} {}{}",
         c::green("✓"),
@@ -513,7 +551,116 @@ fn cmd_add(args: &[String]) -> R {
     if a.has("now") {
         println!("  {} {}", c::status_dot(&s.status), s.status);
     }
+    env_file_hint(&cl, &s.config);
     Ok(())
+}
+
+/// The env file a service looks for by default in its folder.
+pub(crate) const DEFAULT_ENV_FILE: &str = ".env.lstack";
+
+/// Env files in `dir` a service could use (no `.example`/`.sample`/… templates), `.env.lstack` first.
+pub(crate) fn env_file_candidates(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|t| !t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.retain(|n| {
+        (n == ".env" || n.starts_with(".env.") || n.ends_with(".env"))
+            && ![".example", ".sample", ".template", ".dist"].iter().any(|s| n.ends_with(s))
+    });
+    names.sort_by_key(|n| (n != DEFAULT_ENV_FILE, n != ".env", n.clone()));
+    names.truncate(20);
+    names
+}
+
+/// Answer to the env file prompt: `Some(Some(i))` = candidate i, `Some(None)` = none, `None` = invalid.
+fn parse_env_choice(input: &str, candidates: &[String], default: Option<usize>) -> Option<Option<usize>> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Some(default);
+    }
+    if s == "0" || s.eq_ignore_ascii_case("n") || s.eq_ignore_ascii_case("no") || s.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    if s.eq_ignore_ascii_case("y") || s.eq_ignore_ascii_case("yes") {
+        return Some(default.or(Some(0)).filter(|_| !candidates.is_empty()));
+    }
+    if let Ok(n) = s.parse::<usize>() {
+        return (1..=candidates.len()).contains(&n).then_some(Some(n - 1));
+    }
+    candidates.iter().position(|c| c == s).map(Some)
+}
+
+/// `lstack add` without `--env-file`: use the folder's `.env.lstack` by default. On a terminal, confirm
+/// it and offer the folder's other env files (or none).
+fn choose_env_file(cfg: &ServiceConfig, yes: bool) -> Result<Option<String>, String> {
+    let dir = match (cfg.cwd.as_deref(), cfg.compose_file.as_deref()) {
+        (Some(d), _) if !d.is_empty() => std::path::PathBuf::from(paths::expand_home(d)),
+        (_, Some(f)) => match std::path::Path::new(&paths::expand_home(f)).parent() {
+            Some(p) => p.to_path_buf(),
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let candidates = env_file_candidates(&dir);
+    if candidates.first().map(String::as_str) != Some(DEFAULT_ENV_FILE) {
+        return Ok(None);
+    }
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if yes || !interactive {
+        println!("  {} using {DEFAULT_ENV_FILE} from {} (--no-env-file to skip)", c::cyan("↳"), dir.display());
+        return Ok(Some(DEFAULT_ENV_FILE.into()));
+    }
+    println!("Found {} in {}. Env file for {}:", c::bold(DEFAULT_ENV_FILE), dir.display(), c::bold(&cfg.name));
+    for (i, n) in candidates.iter().enumerate() {
+        println!("  {}) {n}{}", i + 1, if i == 0 { c::dim("  (default)") } else { String::new() });
+    }
+    println!("  0) none");
+    loop {
+        print!("Use which? [1] ");
+        let _ = std::io::stdout().flush();
+        let mut s = String::new();
+        if std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())? == 0 {
+            return Ok(Some(DEFAULT_ENV_FILE.into()));
+        }
+        match parse_env_choice(&s, &candidates, Some(0)) {
+            Some(pick) => return Ok(pick.map(|i| candidates[i].clone())),
+            None => println!("  enter 1–{}, a file name, or 0 for none", candidates.len()),
+        }
+    }
+}
+
+/// After `add`: point at 1Password references to review, or at a `.env` that could be used.
+fn env_file_hint(cl: &client::Client, cfg: &ServiceConfig) {
+    let Some(dir) = cfg.cwd.clone() else { return };
+    if cfg.env_files.as_ref().is_some_and(|f| !f.is_empty()) {
+        if let Ok(r) = cl.req::<serde_json::Value>("GET", &format!("/api/onepassword/review/{}", client::enc(&cfg.name)), None) {
+            let n = r["refs"].as_array().map(|a| a.iter().filter(|x| x["status"] != "ok").count()).unwrap_or(0);
+            if n > 0 {
+                println!("  {} {n} 1Password reference(s) to review: {}", c::yellow("!"), c::cyan(&format!("lstack secret import {}", cfg.name)));
+            }
+        }
+        return;
+    }
+    let Ok(v) = cl.req::<serde_json::Value>("POST", "/api/onepassword/detect", Some(serde_json::json!({ "cwd": dir }))) else { return };
+    for f in v["files"].as_array().into_iter().flatten().filter(|f| f["example"] != true) {
+        let refs = f["refs"].as_array().map(Vec::len).unwrap_or(0);
+        let plain = f["plain"].as_array().map(Vec::len).unwrap_or(0);
+        if refs + plain == 0 && f["fifo"] != true {
+            continue;
+        }
+        let name = f["name"].as_str().unwrap_or(".env");
+        let what = if f["fifo"] == true { "a 1Password Environment mount".to_string() } else { format!("{refs} op:// reference(s), {plain} plain value(s)") };
+        println!(
+            "  {} found {name} ({what}); use it like `op run --env-file`: {}",
+            c::cyan("↳"),
+            c::cyan(&format!("lstack secret import {} --env-file {name}", cfg.name))
+        );
+    }
 }
 
 /// Move leading `cd …`, `FOO=bar`, `export …` and `source …` out of the command into
@@ -1199,5 +1346,25 @@ mod tests {
         assert_eq!(a.all("env"), vec!["A=1", "B=2"]);
         assert_eq!(a.get("cwd"), Some("/x"));
         assert!(Args::parse(&["--nope".into()], &[]).is_err());
+    }
+
+    #[test]
+    fn env_file_choice() {
+        let d = std::env::temp_dir().join(format!("lstack-envpick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".env.dir")).unwrap();
+        for f in [".env", ".env.local", ".env.lstack", ".env.example", "prod.env", "README.md"] {
+            std::fs::write(d.join(f), "A=1\n").unwrap();
+        }
+        let c = env_file_candidates(&d);
+        assert_eq!(c, vec![".env.lstack", ".env", ".env.local", "prod.env"]);
+        assert_eq!(parse_env_choice("", &c, Some(0)), Some(Some(0)));
+        assert_eq!(parse_env_choice("2", &c, Some(0)), Some(Some(1)));
+        assert_eq!(parse_env_choice("0", &c, Some(0)), Some(None));
+        assert_eq!(parse_env_choice("no", &c, Some(0)), Some(None));
+        assert_eq!(parse_env_choice(".env.local", &c, Some(0)), Some(Some(2)));
+        assert_eq!(parse_env_choice("9", &c, Some(0)), None);
+        assert_eq!(parse_env_choice("what", &c, Some(0)), None);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -49,6 +49,8 @@ struct SecretsSettings: View {
     @State private var busy = false
     @State private var error: String?
     @State private var replacing: String?
+    @State private var opSheet: OnePasswordSheet.Mode?
+    @State private var showStored = false
 
     private var visible: [SecretInfo] { (store.secrets?.secrets ?? []).filter { !($0.isInternal ?? false) } }
     private var localServices: [ServiceState] { store.services }
@@ -62,19 +64,51 @@ struct SecretsSettings: View {
                     }
                 }
                 Divider().padding(.leading, 52)
-                form.padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
-            }
-            if !visible.isEmpty {
-                SettingsCard {
-                    ForEach(Array(visible.enumerated()), id: \.element.id) { i, s in
-                        if i > 0 { Divider().padding(.leading, 12) }
-                        row(s)
-                    }
-                }
+                Label("Add secrets, plain variables, env files and 1Password references on each service: Environment Variables… in its ⋯ menu. A secret stored for one service can be picked on any other.", systemImage: "info.circle")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
+                Divider().padding(.leading, 52)
+                storedList.padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
             }
             ErrorText(text: error)
+            OnePasswordCard(sheet: $opSheet)
         }
         .task { await store.refreshSecrets() }
+        .sheet(item: $opSheet) { mode in
+            OnePasswordSheet(mode: mode).environment(store)
+        }
+    }
+
+    /// Every stored secret, collapsed by default: secrets are usually managed from each service now.
+    private var storedList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { showStored.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).rotationEffect(.degrees(showStored || replacing != nil ? 90 : 0))
+                    Text("Stored secrets").font(.system(size: 10, weight: .semibold)).textCase(.uppercase)
+                    Text("\(visible.count)").font(.system(size: 10))
+                    Spacer()
+                }
+                .foregroundStyle(.secondary).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if showStored || replacing != nil {
+                form
+                if !visible.isEmpty {
+                    VStack(spacing: 0) {
+                        ForEach(Array(visible.enumerated()), id: \.element.id) { i, s in
+                            if i > 0 { Divider() }
+                            row(s)
+                        }
+                    }
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.background))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(.separator.opacity(0.6)))
+                }
+            }
+        }
     }
 
     private var storageDetail: String {
@@ -101,7 +135,7 @@ struct SecretsSettings: View {
             }
             .textFieldStyle(.roundedBorder)
             .controlSize(.small)
-            Text("The env var has the secret's name. Pick which services get it below.")
+            Text("Stores it without giving it to any service. Pick it on a service, or with Services below.")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
         }
     }
@@ -115,14 +149,27 @@ struct SecretsSettings: View {
                 Group {
                     if !s.isSet {
                         Text("Not set — needed by \(s.usedBy.joined(separator: ", "))")
-                    } else if let at = s.setAt {
-                        Text("Set \(Date(timeIntervalSince1970: at / 1000), format: .relative(presentation: .named))") +
+                    } else if let at = s.fetchedAt ?? s.setAt {
+                        Text(s.sourceLabel.map { "\($0) · " } ?? "") +
+                            Text("\(s.fetchedAt != nil ? "fetched" : "set") \(Date(timeIntervalSince1970: at / 1000), format: .relative(presentation: .named))") +
                             Text(s.usedBy.isEmpty ? " · not used yet" : " · used by \(s.usedBy.joined(separator: ", "))")
                     }
                 }
                 .font(.system(size: 10)).foregroundStyle(.secondary)
+                if let r = s.ref, s.source == "op" || s.source == "op-env" {
+                    Text(r).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
             }
             Spacer()
+            if s.fromOnePassword {
+                Button {
+                    opSheet = .refresh(["name": s.name], "Refresh \(s.name) from 1Password")
+                } label: { Image(systemName: "arrow.triangle.2.circlepath") }
+                    .buttonStyle(.borderless)
+                    .disabled(store.secrets?.locked == true)
+                    .help("Refresh from 1Password (asks for approval in the 1Password app)")
+            }
             Menu {
                 ForEach(localServices) { svc in
                     let names = svc.config.secrets?.names ?? []

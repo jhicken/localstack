@@ -15,6 +15,33 @@ pub struct Settings {
     pub healthchecks: Healthchecks,
     /// Which non-service processes show up in the process breakdown.
     pub processes: ProcessThresholds,
+    /// How 1Password references in services' env files are handled (see `envimport.rs`).
+    pub onepassword: OnePassword,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OnePassword {
+    /// Watch imported env files and flag new or changed `op://` references for review.
+    pub watch: bool,
+    /// When a reference disappears from an env file, stop passing it and forget the cached value
+    /// without asking (it only reduces what the service gets).
+    pub auto_apply_removals: bool,
+    /// Restart running services whose values changed after an import or refresh.
+    pub restart_on_change: bool,
+    /// Only allow references into these vaults (case-insensitive). Empty = any vault.
+    pub allowed_vaults: Vec<String>,
+    /// After a refresh here, send changed values to paired Macs that were granted them.
+    pub push_to_peers: bool,
+    /// When a service needs a value that came from a paired Mac and it's missing, ask that Mac again
+    /// (served from its encrypted cache; 1Password is never contacted).
+    pub pull_from_peers: bool,
+}
+
+impl Default for OnePassword {
+    fn default() -> Self {
+        OnePassword { watch: true, auto_apply_removals: true, restart_on_change: false, allowed_vaults: vec![], push_to_peers: true, pull_from_peers: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -131,6 +158,7 @@ pub fn status() -> Value {
         "cmux": cmux_status(),
         "healthchecks": super::heartbeat::settings_status(&settings.healthchecks),
         "processes": settings.processes,
+        "onepassword": settings.onepassword,
     })
 }
 

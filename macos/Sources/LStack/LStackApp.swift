@@ -30,7 +30,22 @@ struct LStackApp: App {
         .defaultSize(width: 860, height: 560)
 
         Window("Add Service", id: "add") {
-            AddServiceView()
+            ServiceEditorView()
+                .environment(store)
+        }
+        .windowResizability(.contentSize)
+
+        WindowGroup("Edit Service", id: "service", for: EditorTarget.self) { $target in
+            if let target {
+                ServiceEditorView(editing: target.service, tab: target.tab)
+                    .environment(store)
+                    .id(target)
+            }
+        }
+        .windowResizability(.contentSize)
+
+        WindowGroup("1Password", id: "op-review", for: String.self) { $name in
+            OnePasswordReviewView(service: name ?? "")
                 .environment(store)
         }
         .windowResizability(.contentSize)
@@ -54,6 +69,13 @@ struct MenuBarLabel: View {
             if store.connected, !store.running.isEmpty {
                 Text("\(store.running.count)").monospacedDigit()
             }
+        }
+        // A notification or Settings asked for a service's 1Password review.
+        .onChange(of: store.reviewRequest) {
+            guard let s = store.reviewRequest else { return }
+            store.reviewRequest = nil
+            openWindow(id: "op-review", value: s)
+            bringToFront()
         }
         .task {
             if await store.launch(), ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT"] == nil {

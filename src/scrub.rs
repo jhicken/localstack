@@ -46,16 +46,27 @@ pub fn percent(s: &str) -> String {
 /// Every form of `value` we redact.
 pub fn variants(value: &str) -> Vec<String> {
     let mut v = vec![value.to_string()];
-    let b = base64(value.as_bytes());
+    let mut b = base64(value.as_bytes());
     v.push(b.trim_end_matches('=').to_string());
+    zeroize::Zeroize::zeroize(&mut b);
     v.push(base64url(value.as_bytes()));
     v.push(percent(value));
     v.push(value.bytes().map(|b| format!("{b:02x}")).collect());
     v.push(value.bytes().map(|b| format!("{b:02X}")).collect());
-    v.retain(|s| s.len() >= MIN_LEN);
     v.sort();
-    v.dedup();
-    v
+    let mut dropped = vec![];
+    let mut out: Vec<String> = Vec::with_capacity(v.len());
+    for s in v {
+        if s.len() < MIN_LEN || out.last() == Some(&s) {
+            dropped.push(s);
+        } else {
+            out.push(s);
+        }
+    }
+    for mut s in dropped {
+        zeroize::Zeroize::zeroize(&mut s);
+    }
+    out
 }
 
 /// Replace the registered set of secrets: (name, value).
@@ -67,7 +78,10 @@ pub fn set_secrets<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) {
         .collect();
     // Longest first, so a value that contains another secret is masked as a whole.
     pats.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-    *PATTERNS.write().unwrap_or_else(|e| e.into_inner()) = pats;
+    let mut old = std::mem::replace(&mut *PATTERNS.write().unwrap_or_else(|e| e.into_inner()), pats);
+    for (p, _) in old.iter_mut() {
+        zeroize::Zeroize::zeroize(p);
+    }
 }
 
 pub fn active() -> bool {

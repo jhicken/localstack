@@ -28,7 +28,7 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | Health | HTTP and TCP checks; Docker native `HEALTHCHECK` passthrough |
 | Metrics | CPU and memory per process tree (native `proc_pidinfo`), Docker Engine API stats for containers, per-process network via `nettop`; SQLite history with 7-day retention and bucketed queries |
 | Logs | Per-service rotating log files, tail, live SSE streaming, stdin injection |
-| API | REST + SSE (`/api/events`, `/api/services/:name/logs/stream`) |
+| API | REST + SSE (`/api/events`, `/api/services/:name/logs/stream`); `GET …/logs?tail=N&before=<pos>` pages back through the log file using each line's `pos` cursor |
 | CLI | `add/rm/edit/ls/show/start/stop/restart/enable/disable/logs/attach/exec/metrics/reload/daemon/startup` |
 | TUI | `lstack top`: service list, detail pane with sparklines, live log pane, full-screen logs, stdin input, shell into containers |
 | Menu bar app | Status icon, service rows with live sparklines, expandable CPU/memory charts, log window with input, Add Service window, daemon auto-launch |
@@ -83,6 +83,20 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | Grants | Per paired Mac: `control` and `tunnel` (all, none or a list). Settings → Share this Mac, `lstack remote grant/revoke/activity`, `/api/remote/peers`. Changes drop the link so new grants apply immediately. |
 | Forwards | Automatic localhost forwards (127.0.0.1/::1) for granted services' live ports, same port when free, remembered fallbacks (`forwards.json`). Same-user check via libproc, 128 connections per Mac, per-service pause (`lstack forwards`). The shared Mac re-checks port ownership on each open, dials only its loopback, and audits. URL chips show 🔒 "via <machine>" everywhere. |
 | Later | Built-in screen sharing as `screen` / `input` stream kinds with their own grants and consent (design note in the README). |
+
+## Phase 1.9 — 1Password, by hand ✅ (done)
+
+| Area | Delivered |
+|---|---|
+| Model | 1Password is a source you pull from by hand. The encrypted secret store is the cache that unattended restarts read from. There is no service-account token or stored credential. The daemon contains no `op` code; only the CLI and the app run `op`, after a click, with approval in 1Password. |
+| Env files | `envFiles:` is compatible with `op run --env-file` (quoting, `export`, `$VAR` in references, last file wins, values override `env:`). Plain values are read at each start. `op://` values come only from the approved snapshot (the `secrets:` map plus the reference stored with each value). |
+| Review & import | `/api/onepassword/{review,plan,import}`. Single-use plans that expire in 15 min; only references in the plan are accepted. Flags vaults that are new, personal or outside the allow-list. Refuses `LSTACK_*`, TOTP and unresolved `$VARS`. `lstack secret review/import/link/refresh/audit`, plus `--env-file` on `lstack add`. |
+| `op` runner | Checks the codesign AgileBits Team ID, runs with a minimal environment (token variables stripped), values over a pipe with zeroized buffers, a timeout, and `op signout` after each batch. |
+| Watcher | Checks file metadata every 2 s. New or changed references become `secretsPending` with a notification, and nothing is pulled. Removals apply automatically. Cached values nothing uses are garbage-collected, deferred until running users restart. Never opens FIFOs (Environment mounts). |
+| Environments | A mounted 1Password Environment (FIFO) is read by the client when you ask (`--environment`), with the values held by the daemon only until you confirm. |
+| Sharing | Cache-to-cache over the Noise link. Grants are per exact reference and per Mac. Only `op`/`op-env` values are sent, with no re-sharing. The receiver asks only on a user action (or `pullFromPeers`), accepts only references it waits for, binds each value to the sender's pinned key, and never overwrites a value holding a different reference. A received value reaches a service only after a confirmed import that names the sending Mac. Refresh pushes (`pushToPeers`) update only already-confirmed values from the same key. Both sides audit. `lstack secret shares/share/unshare/sync`. |
+| Audit | `secrets-audit.log` (0600, never values). |
+| To verify by hand | Approval prompts when `op` is spawned from LStack.app (no TTY), the number of prompts per batch, whether `op signout` ends the integration session, and Environment FIFO behavior when 1Password is locked. |
 
 ## Phase 2 — Daily-driver polish
 
@@ -154,6 +168,7 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | HTTP + SSE API on localhost | Trivial to consume from Swift (`URLSession.bytes`) and Rust, debuggable with curl, and push updates come without polling. |
 | launchd LaunchAgent with `KeepAlive` | The standard macOS mechanism. It restarts the daemon if it crashes and needs no admin rights. |
 | Containers outlive the daemon | Restarting or upgrading lstack shouldn't bounce your database. |
+| 1Password pulled by hand, cached locally | Unattended restarts must never prompt or need the network, and 1Password must never be reached without a person. A cache filled only by approved, client-side `op` reads covers both. |
 | ratatui TUI | Mature layout and widgets with a small binary-size cost. Emoji are avoided because their width breaks box drawing. |
 
 ## Open questions

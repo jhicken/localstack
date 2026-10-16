@@ -142,11 +142,13 @@ pub struct Grants {
     pub tunnel_all: bool,
     /// …or only these services'.
     pub tunnel: Vec<String>,
+    /// 1Password references (exact `op://…`) whose cached values it may receive (Secrets › Share).
+    pub secrets: Vec<String>,
 }
 
 impl Grants {
     pub fn new_pairing() -> Grants {
-        Grants { control: false, tunnel_all: true, tunnel: vec![] }
+        Grants { control: false, tunnel_all: true, tunnel: vec![], secrets: vec![] }
     }
     pub fn tunnel_allows(&self, service: &str) -> bool {
         self.tunnel_all || self.tunnel.iter().any(|s| s == service)
@@ -634,6 +636,31 @@ impl Remote {
         self.drop_links(&pid);
         self.audit(json!({ "event": "grants", "peer": name, "grants": grants }));
         Ok(self.shared_peers())
+    }
+
+    /// Allow (or stop) sending a paired Mac the cached values of these exact references. Doesn't reset its link.
+    pub fn set_secret_grants(&self, id: &str, refs: &[String], allow: bool) -> Result<(String, Vec<String>), ApiErr> {
+        let mut cfg = self.config();
+        let i = Self::find_peer(&cfg, id)?;
+        let g = &mut cfg.peers[i].grants.secrets;
+        for r in refs {
+            g.retain(|x| x != r);
+            if allow {
+                g.push(r.clone());
+            }
+        }
+        g.sort();
+        let list = g.clone();
+        let name = cfg.peers[i].name.clone();
+        self.save(cfg)?;
+        self.audit(json!({ "event": if allow { "secrets-shared" } else { "secrets-unshared" }, "peer": name, "refs": refs }));
+        Ok((name, list))
+    }
+
+    /// Paired Mac by id or name.
+    pub fn peer(&self, id: &str) -> Option<SharedPeer> {
+        let cfg = self.config();
+        Self::find_peer(&cfg, id).ok().map(|i| cfg.peers[i].clone())
     }
 
     pub fn revoke_peer(&self, id: &str) -> Result<(), ApiErr> {
@@ -1467,6 +1494,8 @@ pub(super) fn peer_router(app: AppState, remote: Arc<Remote>, peer_id: String, m
         .route("/peer/api/events", get(peer_events))
         .route("/peer/api/transport", post(peer_transport))
         .route("/peer/api/tailnet/prepare", post(peer_tailnet_prepare))
+        .route("/peer/api/secrets/offer", post(peer_secrets_offer))
+        .route("/peer/api/secrets/pull", post(peer_secrets_pull))
         .fallback(|| async { ApiErr::new(404, "not found") })
         .layer(middleware::from_fn_with_state(rs.clone(), require_link))
         .with_state(rs)
@@ -1650,6 +1679,34 @@ async fn peer_tailnet_prepare(State(rs): State<RState>, body: Bytes) -> Response
         o.retain(|k, _| keep.contains(&k.as_str()));
     }
     Json(st).into_response()
+}
+
+/// The calling Mac says which 1Password references its services wait for (`want`) and which values it holds
+/// from this Mac (`have`: ref → fetchedAt). Returns those it may receive now. References only, never values.
+async fn peer_secrets_offer(State(rs): State<RState>, body: Bytes) -> Response {
+    let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let Some(p) = rs.remote.peer(&lp.id) else { return ApiErr::new(403, "link only").into_response() };
+    let r = tokio::task::spawn_blocking(move || super::secretshare::offer(&p, &v)).await;
+    match r {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => ApiErr::new(500, e.to_string()).into_response(),
+    }
+}
+
+/// Send the calling Mac the cached values of granted references: `{refs: [..]}`. Served from this Mac's
+/// encrypted store only — never reads 1Password.
+async fn peer_secrets_pull(State(rs): State<RState>, body: Bytes) -> Response {
+    let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let Some(p) = rs.remote.peer(&lp.id) else { return ApiErr::new(403, "link only").into_response() };
+    let remote = rs.remote.clone();
+    let r = tokio::task::spawn_blocking(move || super::secretshare::serve(&remote, &p, &v)).await;
+    match r {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err((c, m))) => ApiErr::new(c, m).into_response(),
+        Err(e) => ApiErr::new(500, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

@@ -181,6 +181,15 @@ pub fn router(st: AppState) -> Router {
         .route("/api/secrets/unlock", post(secrets_unlock))
         .route("/api/secrets/rotate", post(secrets_rotate))
         .route("/api/secrets/:name", axum::routing::put(secret_set).delete(secret_delete))
+        // 1Password: the daemon never runs `op`; clients read values after a person approves.
+        .route("/api/onepassword/review/:service", get(op_review))
+        .route("/api/onepassword/detect", post(op_detect))
+        .route("/api/onepassword/plan", post(op_plan))
+        .route("/api/onepassword/plan/:id", axum::routing::delete(op_plan_cancel))
+        .route("/api/onepassword/import", post(op_import))
+        .route("/api/onepassword/audit", get(op_audit))
+        .route("/api/onepassword/shares", get(op_shares).post(op_share))
+        .route("/api/onepassword/peers/sync", post(op_peer_sync))
         .route("/api/reload", post(|State(st): State<AppState>| async move { to_json(st.sup.reload()) }))
         .route("/api/shutdown", post(shutdown))
         .route("/api/open-dashboard", post(|q: Q| async move { open_terminal_with(&["top"], q.get("terminal").cloned()).await }))
@@ -278,8 +287,15 @@ fn tail_param(q: &Q) -> usize {
     q.get("tail").and_then(|t| t.parse().ok()).unwrap_or(200)
 }
 
+/// `?tail=N` = the newest N lines; add `&before=<pos>` to page to the N lines before a line's `pos`.
 pub(super) async fn logs(State(st): State<AppState>, Path(name): Path<String>, q: Q) -> Res {
-    to_json(json!({ "lines": st.sup.logs(&name)?.tail(tail_param(&q)) }))
+    let store = st.sup.logs(&name)?;
+    let n = tail_param(&q);
+    let lines = match q.get("before").cloned() {
+        Some(before) => blocking(move || Ok::<_, ApiErr>(store.older(&before, n))).await?,
+        None => store.tail(n),
+    };
+    to_json(json!({ "lines": lines }))
 }
 
 async fn clear_logs(State(st): State<AppState>, Path(name): Path<String>) -> Res {
@@ -434,6 +450,134 @@ async fn secret_delete(State(st): State<AppState>, Path(name): Path<String>) -> 
     secrets_list(State(st)).await
 }
 
+fn op_err((code, msg): (u16, String)) -> ApiErr {
+    ApiErr(code, msg)
+}
+
+async fn op_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiErr> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| ApiErr(500, e.to_string()))
+}
+
+async fn op_review(State(st): State<AppState>, Path(service): Path<String>) -> Res {
+    let sup = st.sup.clone();
+    Ok(Json(op_blocking(move || super::envimport::review_service(&sup, &service)).await?.map_err(op_err)?))
+}
+
+async fn op_detect(Json(v): Json<Value>) -> Res {
+    let dir = v.get("cwd").and_then(Value::as_str).ok_or_else(|| ApiErr(400, "cwd required".into()))?.to_string();
+    Ok(Json(op_blocking(move || super::envimport::detect(&dir)).await?))
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct PlanReq {
+    kind: String,
+    service: Option<String>,
+    keys: Option<Vec<String>>,
+    names: Vec<String>,
+    name: Option<String>,
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+    key: Option<String>,
+    path: Option<String>,
+    content: Option<String>,
+}
+
+/// Start a review: what would be read from 1Password (or, for an Environment, what was read) and
+/// where it would go. Returns a plan id the client confirms with `/api/onepassword/import`.
+async fn op_plan(State(st): State<AppState>, Json(mut r): Json<PlanReq>) -> Res {
+    let (sup, peers) = (st.sup.clone(), st.peers.clone());
+    let v = op_blocking(move || {
+        use super::envimport as e;
+        if r.kind == "env" {
+            // A person asked to import: take values paired Macs share for it first (from their cache), so
+            // those need no 1Password read here.
+            if let Some(s) = r.service.as_deref() {
+                super::secretshare::sync(&sup, &peers, Some(s), true);
+            }
+        }
+        match r.kind.as_str() {
+            "env" => e::plan_env(&sup, r.service.as_deref().ok_or((400, "service required".to_string()))?, r.keys.as_deref()),
+            "refresh" => e::plan_refresh(&sup, &r.names, r.service.as_deref()),
+            "link" => e::plan_link(
+                &sup,
+                r.name.as_deref().ok_or((400, "name required".to_string()))?,
+                r.reference.as_deref().ok_or((400, "ref required".to_string()))?,
+                r.service.as_deref(),
+                r.key.as_deref(),
+            ),
+            "environment" => {
+                let path = r.path.clone().ok_or((400, "path required".to_string()))?;
+                let content = r.content.take().ok_or((400, "content required".to_string()))?;
+                e::plan_environment(&sup, r.service.as_deref(), &path, content)
+            }
+            k => Err((400, format!("unknown plan kind {k:?} (env, refresh, link, environment)"))),
+        }
+    })
+    .await?
+    .map_err(op_err)?;
+    Ok(Json(v))
+}
+
+async fn op_plan_cancel(Path(id): Path<String>) -> Res {
+    Ok(Json(json!({ "cancelled": super::envimport::cancel_plan(&id) })))
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct ImportBody {
+    plan: String,
+    values: std::collections::BTreeMap<String, String>,
+    keys: Option<Vec<String>>,
+    apply_removals: Option<bool>,
+    account: Option<String>,
+    actor: Option<String>,
+}
+
+async fn op_import(State(st): State<AppState>, Json(mut b): Json<ImportBody>) -> Res {
+    let req = super::envimport::ImportReq {
+        plan: std::mem::take(&mut b.plan),
+        values: std::mem::take(&mut b.values),
+        keys: b.keys.take(),
+        apply_removals: b.apply_removals,
+        account: b.account.take(),
+        actor: b.actor.take().filter(|a| matches!(a.as_str(), "cli" | "app")).unwrap_or_else(|| "api".into()),
+    };
+    let sup = st.sup.clone();
+    Ok(Json(op_blocking(move || super::envimport::import(&sup, req)).await?.map_err(op_err)?))
+}
+
+async fn op_shares(State(st): State<AppState>) -> Res {
+    Ok(Json(super::secretshare::shares(&st.remote)))
+}
+
+/// `{peer, items: [name | ref], allow: bool, actor}`: share stored 1Password values with a paired Mac (or stop).
+async fn op_share(State(st): State<AppState>, Json(v): Json<Value>) -> Res {
+    let peer = v["peer"].as_str().ok_or_else(|| ApiErr(400, "peer required".into()))?.to_string();
+    let items: Vec<String> = v["items"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+    let allow = v["allow"].as_bool().unwrap_or(true);
+    let actor = v["actor"].as_str().filter(|a| matches!(*a, "cli" | "app")).unwrap_or("api").to_string();
+    let remote = st.remote.clone();
+    Ok(Json(op_blocking(move || super::secretshare::set_share(&remote, &peer, &items, allow, &actor)).await?.map_err(op_err)?))
+}
+
+/// `{service?}`: ask paired Macs now for values they share (for `service`, or newer values of ones held).
+async fn op_peer_sync(State(st): State<AppState>, body: axum::body::Bytes) -> Res {
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let service = v["service"].as_str().map(String::from);
+    let (sup, peers) = (st.sup.clone(), st.peers.clone());
+    let r = op_blocking(move || {
+        super::secretshare::sync(&sup, &peers, service.as_deref(), true)
+    })
+    .await?;
+    Ok(Json(r))
+}
+
+async fn op_audit(Query(q): Query<HashMap<String, String>>) -> Res {
+    let n = q.get("n").and_then(|n| n.parse().ok()).unwrap_or(100usize).min(1000);
+    Ok(Json(json!({ "entries": super::envimport::audit_tail(n) })))
+}
+
 async fn secrets_unlock(State(st): State<AppState>) -> Res {
     tokio::task::spawn_blocking(super::secrets::unlock).await.map_err(|e| ApiErr(500, e.to_string()))?.map_err(|e| ApiErr(409, e))?;
     secrets_list(State(st)).await
@@ -513,6 +657,11 @@ async fn settings_update(body: Bytes) -> Res {
         let mut cur = serde_json::to_value(&s.processes).unwrap_or_default();
         merge(&mut cur, p);
         s.processes = serde_json::from_value(cur).map_err(|e| ApiErr(400, format!("processes: {e}")))?;
+    }
+    if let Some(p) = v.get("onepassword") {
+        let mut cur = serde_json::to_value(&s.onepassword).unwrap_or_default();
+        merge(&mut cur, p);
+        s.onepassword = serde_json::from_value(cur).map_err(|e| ApiErr(400, format!("onepassword: {e}")))?;
     }
     if let Some(t) = v.get("terminal").and_then(Value::as_str) {
         if !t.is_empty() && !super::terminal::is_known(t) {
@@ -666,7 +815,8 @@ pub(super) async fn m_logs(State(st): State<AppState>, Path((m, name)): Path<(St
     }
     let peers = st.peers.clone();
     let tail = tail_param(&q);
-    Ok(Json(blocking(move || peers.call(&m, "GET", &format!("/services/{}/logs?tail={tail}", enc(&name)))).await?))
+    let before = q.get("before").map(|b| format!("&before={}", enc(b))).unwrap_or_default();
+    Ok(Json(blocking(move || peers.call(&m, "GET", &format!("/services/{}/logs?tail={tail}{before}", enc(&name)))).await?))
 }
 
 pub(super) async fn m_metrics(State(st): State<AppState>, Path((m, name)): Path<(String, String)>, q: Q) -> Res {

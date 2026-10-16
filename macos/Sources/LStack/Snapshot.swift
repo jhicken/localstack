@@ -19,7 +19,11 @@ enum SnapshotRenderer {
                 render(SetupView().environment(store), size: nil, to: path.replacingOccurrences(of: ".png", with: "-setup.png"), delay: 1.5)
             }
             if let cmd = ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_ADD"] {
-                render(AddServiceView(command: cmd).environment(store), size: nil, to: path.replacingOccurrences(of: ".png", with: "-add.png"), delay: 2)
+                render(ServiceEditorView(command: cmd).environment(store), size: nil, to: path.replacingOccurrences(of: ".png", with: "-add.png"), delay: 2)
+            }
+            if let svc = ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_EDIT"] {
+                render(ServiceEditorView(editing: svc, tab: .environment).environment(store), size: NSSize(width: 560, height: 820), to: path.replacingOccurrences(of: ".png", with: "-edit.png"), delay: 3)
+                try? await Task.sleep(for: .seconds(2))
             }
             if ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_MACHINES"] != nil {
                 render(ScrollView { MachinesSettings().padding(20) }.environment(store), size: NSSize(width: 680, height: 1100), to: path.replacingOccurrences(of: ".png", with: "-machines.png"), delay: 4)

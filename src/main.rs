@@ -1,11 +1,14 @@
 mod cli;
 mod cli_more;
+mod cli_op;
 mod cmdline;
 mod client;
 mod config;
 mod daemon;
+mod dotenv;
 mod fmt;
 mod launchd;
+mod op;
 mod paths;
 mod scrub;
 mod setup;

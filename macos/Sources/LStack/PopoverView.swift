@@ -18,6 +18,7 @@ struct PopoverView: View {
             daemonBanner
             diskAccessBanner
             cmuxBanner
+            reviewBanner
             Divider().opacity(0.5)
             if !store.connected {
                 disconnected
@@ -144,6 +145,23 @@ struct PopoverView: View {
         }
     }
 
+    /// Services whose env files have 1Password references waiting; hidden until the set changes.
+    @State private var hiddenReviews: Set<String> = []
+
+    @ViewBuilder private var reviewBanner: some View {
+        let pending = store.pendingReviews.map(\.name)
+        if store.connected, !pending.isEmpty, Set(pending) != hiddenReviews {
+            Banner(icon: "key.horizontal.fill", tint: .blue,
+                   text: "1Password changes to review: \(pending.joined(separator: ", "))",
+                   action: "Review…", perform: {
+                       openWindow(id: "op-review", value: pending[0])
+                       bringToFront()
+                   },
+                   dismiss: { hiddenReviews = Set(pending) },
+                   dismissHelp: "Hide (the services still show a badge)")
+        }
+    }
+
     @ViewBuilder private var cmuxBanner: some View {
         if let d = store.cmuxDenied {
             CmuxBanner(denial: d)
@@ -238,6 +256,7 @@ private struct Banner: View {
     let action: String
     let perform: () -> Void
     let dismiss: () -> Void
+    var dismissHelp = "Hide (you can still grant it in Settings)"
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
@@ -249,7 +268,7 @@ private struct Banner: View {
                 Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
-            .help("Hide (you can still grant it in Settings)")
+            .help(dismissHelp)
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(tint.opacity(0.12)))

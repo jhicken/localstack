@@ -1147,6 +1147,22 @@ impl Peers {
         Ok(v)
     }
 
+    /// JSON request with a body to a peer's API (blocking). Nothing is scrubbed or rewritten.
+    pub fn call_json(&self, name: &str, method: &str, path: &str, body: &Value) -> Result<Value, ApiErr> {
+        let (mux, _) = self.live(name)?;
+        self.request(&mux, method, path, Some(body)).map_err(|(c, m)| ApiErr::new(if c == 0 { 502 } else { c }, format!("{name}: {m}")))
+    }
+
+    /// The pinned link key (hex) of a paired Mac.
+    pub fn public_key(&self, name: &str) -> Option<String> {
+        self.cfg(name).map(|c| c.public_key).filter(|k| !k.is_empty())
+    }
+
+    /// Machines whose link is up now.
+    pub fn online(&self) -> Vec<String> {
+        self.inner.lock().unwrap().iter().filter(|(_, p)| p.status == "online" && p.mux.as_ref().is_some_and(|m| !m.is_closed())).map(|(n, _)| n.clone()).collect()
+    }
+
     /// Open a proxied SSE stream (blocking); the reader yields raw SSE bytes.
     pub fn stream(&self, name: &str, path: &str) -> Result<Box<dyn Read + Send>, ApiErr> {
         let (mux, _) = self.live(name)?;

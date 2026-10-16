@@ -110,6 +110,10 @@ impl Sup {
             Ok(e) => e,
             Err(e) => return self.fail(name, gen, &e),
         };
+        let file_env = match self.env_file_vars(name, &cfg) {
+            Ok(e) => e,
+            Err(e) => return self.fail(name, gen, &e),
+        };
         let shell = cfg.shell.clone().filter(|s| !s.is_empty()).unwrap_or_else(crate::cmdline::user_shell);
         let command = cfg.command.clone().unwrap_or_default();
         self.with(name, Some(gen), |m| {
@@ -124,6 +128,7 @@ impl Sup {
             .current_dir(&cwd)
             .env("SHELL", &shell)
             .envs(cfg.env.clone().unwrap_or_default())
+            .envs(file_env)
             .envs(secret_env)
             .env("LSTACK_SERVICE", name)
             .env("LSTACK_COMMAND", &command)
@@ -234,6 +239,25 @@ impl Sup {
         self.with(name, None, |m| m.system(msg));
     }
 
+    /// Plain values from the service's `envFiles` (references come from the secret store via the
+    /// approved `secrets:` map). Logs warnings and any 1Password changes still waiting for review.
+    fn env_file_vars(&self, name: &str, cfg: &crate::types::ServiceConfig) -> Result<Vec<(String, String)>, String> {
+        let (vars, warnings) = super::envimport::plain_env(cfg)?;
+        for w in warnings {
+            self.system_log(name, &format!("[lstack] {w}"));
+        }
+        if let Some(p) = self.with(name, None, |m| m.secrets_pending.clone()).flatten() {
+            let keys: Vec<&str> = ["new", "changed", "missing"].iter().flat_map(|k| p[*k].as_array().into_iter().flatten()).filter_map(|v| v.as_str()).collect();
+            if !keys.is_empty() {
+                self.system_log(
+                    name,
+                    &format!("[lstack] 1Password changes waiting for review ({}); starting with the last approved values (lstack secret review {name})", keys.join(", ")),
+                );
+            }
+        }
+        Ok(vars)
+    }
+
     /// Start a log follower for every running container that doesn't have one yet.
     fn ensure_followers(self: &Arc<Self>, name: &str, gen: u64) {
         self.with(name, Some(gen), |m| {
@@ -288,15 +312,26 @@ impl Sup {
             for v in cfg.volumes.iter().flatten() {
                 args.extend(["-v".into(), expand_home(v)]);
             }
+            let file_env = match self.env_file_vars(name, &cfg) {
+                Ok(e) => e,
+                Err(e) => return self.fail(name, gen, &e),
+            };
             for (k, v) in cfg.env.iter().flatten() {
-                args.extend(["-e".into(), format!("{k}={v}")]);
+                if !file_env.iter().any(|(f, _)| f == k) {
+                    args.extend(["-e".into(), format!("{k}={v}")]);
+                }
             }
             // `-e NAME` without a value: docker reads it from its own environment, so secret
-            // values never appear on a command line or in the logged command.
+            // values (and env file values, which may be sensitive) never appear on a command line
+            // or in the logged command.
             let secret_env = match super::secrets::env_for(&cfg) {
                 Ok(e) => e,
                 Err(e) => return self.fail(name, gen, &e),
             };
+            let mut pass_env = file_env;
+            pass_env.retain(|(k, _)| !secret_env.iter().any(|(s, _)| s == k));
+            pass_env.extend(secret_env);
+            let secret_env = pass_env;
             for (k, _) in &secret_env {
                 args.extend(["-e".into(), k.clone()]);
             }
@@ -450,6 +485,10 @@ impl Sup {
         args.extend(cfg.args.iter().flatten().cloned());
         self.system_log(name, &format!("$ docker {}", args.join(" ")));
         let mut env: Vec<(String, String)> = cfg.env.clone().unwrap_or_default().into_iter().collect();
+        match self.env_file_vars(name, &cfg) {
+            Ok(e) => env.extend(e),
+            Err(e) => return self.fail(name, gen, &e),
+        }
         match super::secrets::env_for(&cfg) {
             Ok(e) => env.extend(e),
             Err(e) => return self.fail(name, gen, &e),
@@ -480,6 +519,7 @@ impl Sup {
         args.push("stop".into());
         self.system_log(name, &format!("$ docker {}", args.join(" ")));
         let mut env: Vec<(String, String)> = cfg.env.clone().unwrap_or_default().into_iter().collect();
+        env.extend(super::envimport::plain_env(&cfg).map(|(e, _)| e).unwrap_or_default());
         env.extend(super::secrets::env_for(&cfg).unwrap_or_default());
         stream_cmd(logs, &docker_api::docker_bin(), &args, Some(&cwd), &env).await;
         self.with(name, None, |m| {

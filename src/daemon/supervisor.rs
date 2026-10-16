@@ -141,6 +141,8 @@ pub struct Managed {
     pub heartbeat: Option<crate::types::HeartbeatStatus>,
     /// Published docker/compose ports: (host port, loopback-only).
     pub ext_ports: Vec<(u16, bool)>,
+    /// Summary of unapproved 1Password changes in the service's env files (see `envimport.rs`).
+    pub secrets_pending: Option<serde_json::Value>,
 }
 
 impl Managed {
@@ -178,6 +180,7 @@ impl Managed {
             urls: if self.rt.status == "running" { self.urls.clone() } else { vec![] },
             heartbeat: self.heartbeat.clone(),
             machine: None,
+            secrets_pending: self.secrets_pending.clone(),
             config: self.pending.clone().unwrap_or_else(|| self.cfg.clone()),
         }
     }
@@ -536,6 +539,10 @@ impl Sup {
     pub fn configs(&self) -> Vec<ServiceConfig> {
         self.lock().services.values().map(|m| m.cfg.clone()).collect()
     }
+    /// Configs including changes queued until the next restart (what the service will run with).
+    pub fn effective_configs(&self) -> Vec<ServiceConfig> {
+        self.lock().services.values().map(|m| m.pending.clone().unwrap_or_else(|| m.cfg.clone())).collect()
+    }
 
     /// Mask a newly added secret in logs already written (memory + files, including the daemon log).
     pub fn rescrub_logs(&self) {
@@ -578,6 +585,7 @@ impl Sup {
             urls: vec![],
             heartbeat: None,
             ext_ports: vec![],
+            secrets_pending: None,
         }
     }
 

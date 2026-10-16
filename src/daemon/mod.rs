@@ -1,5 +1,6 @@
 //! The long-running daemon (`lstack daemon run`), normally started by launchd at login.
 pub mod docker_api;
+pub mod envimport;
 mod drivers;
 pub mod exec;
 pub mod health;
@@ -7,6 +8,7 @@ pub mod forwards;
 pub mod link;
 pub mod heartbeat;
 pub mod peers;
+pub mod secretshare;
 pub mod logs;
 pub mod procinfo;
 pub mod remote;
@@ -151,10 +153,12 @@ async fn serve() -> i32 {
         signal(SignalKind::interrupt()).unwrap(),
         signal(SignalKind::hangup()).unwrap(),
     );
-    let s2 = sup.clone();
+    let (s2, p2) = (sup.clone(), peers.clone());
     heartbeat::start(&sup);
     tokio::spawn(async move {
         s2.boot().await;
+        envimport::spawn_watcher(s2.clone());
+        secretshare::spawn_sync(s2.clone(), p2);
         for e in s2.config_errors() {
             log(&format!("config error: {e}"));
         }
