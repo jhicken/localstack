@@ -64,6 +64,15 @@ struct SecretsSettings: View {
                     }
                 }
                 Divider().padding(.leading, 52)
+                SetupRow(icon: "touchid", tint: store.approvals?.enabled == true ? .green : .orange, title: "Touch ID approvals",
+                         detail: store.approvalProblem ?? (store.approvals?.enabled == true
+                            ? "On. A service holding secrets gets them only for a configuration and values you approved with Touch ID; restarts of an approved one need nobody."
+                            : "Off until this app registers its Secure Enclave key.")) {
+                    if store.approvals?.enabled != true {
+                        Button("Turn On") { Task { await store.registerApprovals() } }.controlSize(.small)
+                    }
+                }
+                Divider().padding(.leading, 52)
                 Label("Add secrets, plain variables, env files and 1Password references on each service: Environment Variables… in its ⋯ menu. A secret stored for one service can be picked on any other.", systemImage: "info.circle")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -353,11 +362,6 @@ struct MachinesSettings: View {
     @State private var openForwards: Set<String> = []
     @State private var addresses: [ShareAddress] = []
     @State private var findingAddresses = false
-    @State private var authKey = ""
-    @State private var tailnetBusy = false
-    @State private var tailnetNote: String?
-    /// Machines with a transport switch being sent (before the daemon reports progress).
-    @State private var switching: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -390,7 +394,6 @@ struct MachinesSettings: View {
                     }
                 }
             }
-            tailscaleCard
             // Forwards of a machine not in the list (e.g. just removed) still show until they close.
             let orphans = forwards.filter { f in !store.machines.contains { $0.name == f.machine } }
             if !orphans.isEmpty {
@@ -430,7 +433,6 @@ struct MachinesSettings: View {
                         }
                         .controlSize(.small)
                         .disabled((r.shareUrls ?? []).isEmpty)
-                        transportPolicy(r).padding(.top, 4)
                     }
                     .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
                 }
@@ -475,7 +477,6 @@ struct MachinesSettings: View {
     }
 
     private func reload() async {
-        await store.refreshTailnet()
         await store.refreshNetwork()
         peers = await store.sharedPeers()
         identity = await store.linkIdentity()
@@ -501,7 +502,7 @@ struct MachinesSettings: View {
     }
 
     private func addressLabel(_ a: ShareAddress) -> String {
-        let kind = ["ip": "IP address", "dns": "DNS name", "bonjour": "Bonjour", "tailscale": "Tailscale"][a.kind] ?? a.kind
+        let kind = ["ip": "IP address", "dns": "DNS name", "bonjour": "Bonjour"][a.kind] ?? a.kind
         return "\(a.address)  —  \(kind)\(a.pointsHere ? "" : " ⚠︎ doesn't reach this Mac")"
     }
 
@@ -534,227 +535,18 @@ struct MachinesSettings: View {
         }
     }
 
-    // MARK: Tailscale
-
-    private var tailnetOn: Bool { store.tailnet?.enabled ?? false }
-
-    private var tailnetMacs: [TailnetStatus.Peer] {
-        guard let t = store.tailnet, t.running else { return [] }
-        return (t.peers ?? []).filter { $0.isLStack == true }
-    }
-
-    private var tailscaleDetail: String {
-        guard tailnetOn else {
-            return "Reach paired Macs from anywhere, not just this network: LStack's own Tailscale helper joins your tailnet as a separate device (no VPN, no admin rights). The machine link stays end-to-end encrypted inside it. Downloaded only when turned on."
-        }
-        return "Paired Macs can use Tailscale instead of the local network (Use Tailscale on a machine). Tailscale picks a direct path when both Macs are on the same network."
-    }
-
-    private var tailscaleCard: some View {
-        SettingsCard {
-            SetupRow(icon: "point.3.connected.trianglepath.dotted", tint: store.tailnet?.running == true ? .indigo : .secondary, title: "Tailscale", detail: tailscaleDetail) {
-                Toggle("", isOn: Binding(get: { tailnetOn }, set: { v in setTailnet(v) }))
-                    .toggleStyle(.switch).labelsHidden().disabled(tailnetBusy || store.tailnet == nil)
-            }
-            if tailnetOn, let t = store.tailnet {
-                Divider().padding(.leading, 52)
-                tailnetDetail(t).padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
-            }
-        }
-    }
-
-    private func setTailnet(_ on: Bool) {
-        var ack: Bool?
-        if on && store.tailnet?.acknowledged != true {
-            let a = NSAlert()
-            a.messageText = "Turn on Tailscale?"
-            a.informativeText = "This Mac's machine link becomes reachable from your whole tailnet, not just the local network — anywhere your tailnet reaches, over the internet. Only Macs you pair with (and that you switch to Tailscale) are accepted, and the link stays end-to-end encrypted with each Mac's key, but it's a wider door than the LAN.\n\nLStack downloads its Tailscale helper (about 25 MB, signed) and keeps it updated. You'll sign in to Tailscale once."
-            a.addButton(withTitle: "Turn On")
-            a.addButton(withTitle: "Cancel")
-            a.alertStyle = .warning
-            guard a.runModal() == .alertFirstButtonReturn else { return }
-            ack = true
-        }
-        tailnetBusy = true
-        Task {
-            error = await store.setTailnet(enabled: on, acknowledged: ack)
-            tailnetBusy = false
-        }
-    }
-
-    private func phaseText(_ t: TailnetStatus) -> (String, Color) {
-        switch t.phase {
-        case "running":
-            var who: [String] = []
-            for v in [t.user, t.tailnet] { if let v, !v.isEmpty, !who.contains(v) { who.append(v) } }
-            return ("Connected\(who.isEmpty ? "" : " — \(who.joined(separator: " · "))")", .green)
-        case "needs-login": return ("Sign in to Tailscale to use it", .orange)
-        case "installing": return ("Downloading the Tailscale helper…", .secondary)
-        case "starting": return ("Starting…", .secondary)
-        case "error": return (t.error ?? "The Tailscale helper failed", .red)
-        default: return (t.phase, .secondary)
-        }
-    }
-
-    private func tailnetDetail(_ t: TailnetStatus) -> some View {
-        let (phase, color) = phaseText(t)
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Circle().fill(color).frame(width: 7, height: 7)
-                Text(phase).font(.system(size: 11))
-                if ["installing", "starting"].contains(t.phase) { ProgressView().controlSize(.mini) }
-                Spacer()
-                if t.running {
-                    Button("Sign Out") { Task { tailnetBusy = true; error = await store.tailnetLogout(); tailnetBusy = false } }
-                        .controlSize(.small).disabled(tailnetBusy)
-                }
-            }
-            if t.phase == "needs-login" {
-                HStack(spacing: 6) {
-                    Button("Sign In…") { Task { tailnetBusy = true; error = await store.tailnetLogin(); tailnetBusy = false } }
-                        .controlSize(.small).disabled(tailnetBusy)
-                    if let u = t.authURL, !u.isEmpty {
-                        Button("Open Link Again") { if let url = URL(string: u) { NSWorkspace.shared.open(url) } }
-                            .buttonStyle(.link).font(.system(size: 10))
-                    }
-                    Text("or").font(.system(size: 10)).foregroundStyle(.secondary)
-                    SecureField("Auth key (tskey-…)", text: $authKey).textFieldStyle(.roundedBorder).controlSize(.small).frame(width: 170)
-                    Button("Use Key") {
-                        Task {
-                            tailnetBusy = true
-                            error = await store.tailnetLogin(authKey: authKey)
-                            if error == nil { authKey = "" }
-                            tailnetBusy = false
-                        }
-                    }
-                    .controlSize(.small).disabled(tailnetBusy || authKey.isEmpty)
-                }
-            }
-            if let d = t.`self`?.dnsName, !d.isEmpty {
-                Label("This Mac: \(d)", systemImage: "desktopcomputer").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
-            } else if let d = t.deviceName {
-                Label("Joins as \(d)", systemImage: "desktopcomputer").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
-            }
-            ForEach(t.health ?? [], id: \.self) { h in
-                Label(h, systemImage: "exclamationmark.triangle").font(.system(size: 10)).foregroundStyle(.orange).lineLimit(2)
-            }
-            if let v = store.vpn, v.active, t.running {
-                Label("A VPN is on (\(v.interface ?? "VPN")). Tailscale may go through a relay while it's on (slower), and stops if the VPN blocks it.", systemImage: "lock.shield")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 8) {
-                Text("Helper \(t.version ?? t.installedVersion ?? "—")\(t.devBinary == true ? " (dev build)" : "")").font(.system(size: 10)).foregroundStyle(.secondary)
-                Toggle("Update automatically", isOn: Binding(get: { t.autoUpdate ?? true }, set: { v in
-                    Task { error = await store.setTailnet(autoUpdate: v) }
-                }))
-                .toggleStyle(.checkbox).font(.system(size: 10))
-                Button {
-                    Task {
-                        tailnetBusy = true
-                        let r = await store.tailnetUpdate()
-                        error = r.error
-                        tailnetNote = r.message
-                        tailnetBusy = false
-                    }
-                } label: {
-                    if t.checking == true { ProgressView().controlSize(.mini) } else { Text("Check for Updates") }
-                }
-                .controlSize(.small).disabled(tailnetBusy || t.checking == true || t.devBinary == true)
-                .help("Updating also asks Macs connected over Tailscale to update their helper, then reconnects")
-                Spacer()
-            }
-            if let n = tailnetNote { Text(n).font(.system(size: 10)).foregroundStyle(.secondary) }
-        }
-    }
-
-    /// "LAN" or "Tailscale · direct/relayed", plus progress and VPN hints for a watched machine.
+    /// How the link to a watched machine travels (always direct on the local network), plus a VPN hint.
     @ViewBuilder
-    private func transportLine(_ m: Machine) -> some View {
-        let peer = store.tailnet?.peers?.first { $0.dnsName == m.tailnetName }
+    private func linkLine(_ m: Machine) -> some View {
         HStack(spacing: 4) {
-            Text(m.onTailscale ? "Tailscale" : "LAN").font(.system(size: 9, weight: .medium)).padding(.horizontal, 5).padding(.vertical, 1)
-                .background(Capsule().fill((m.onTailscale ? Color.indigo : Color.secondary).opacity(0.15)))
-                .foregroundStyle(m.onTailscale ? Color.indigo : .secondary)
+            Text("LAN · encrypted").font(.system(size: 9, weight: .medium)).padding(.horizontal, 5).padding(.vertical, 1)
+                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                .foregroundStyle(.secondary)
                 .help(m.linkDescription)
-            if m.online, let v = m.via {
-                if v.kind == "tailscale" {
-                    let path = peer?.path == "relay" ? "relayed\(peer?.relay.map { " (DERP \($0))" } ?? "")" : (peer?.path == "direct" ? "direct" : "")
-                    if !path.isEmpty { Text(path).font(.system(size: 10)).foregroundStyle(.secondary) }
-                } else if m.onTailscale {
-                    Text("over the LAN until Tailscale reconnects").font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-            }
         }
-        if let c = m.transportChange {
-            HStack(spacing: 4) {
-                if c.busy { ProgressView().controlSize(.mini) }
-                Text(c.message ?? c.state).font(.system(size: 10)).foregroundStyle(c.busy ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange)).lineLimit(2)
-            }
-        }
-        if let v = store.vpn, v.active {
-            if !m.onTailscale && !m.online && m.status != "repair" {
-                Text("A VPN is on (\(v.interface ?? "VPN")) and may be blocking the local network. Try Tailscale, or allow local network access in the VPN.")
-                    .font(.system(size: 10)).foregroundStyle(.orange).lineLimit(3)
-            } else if m.onTailscale, peer?.path == "relay" {
-                Text("A VPN is on: LStack is going through Tailscale's relay (slower).").font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func transportButton(_ m: Machine) -> some View {
-        let busy = switching.contains(m.name) || m.transportChange?.busy == true
-        if m.onTailscale {
-            Button("Use Local Network") { switchTransport(m, "local") }
-                .controlSize(.small).disabled(busy)
-                .help("Connect to \(m.name) over the local network only (checks it answers there first)")
-        } else {
-            let ready = store.tailnet?.running == true
-            Button("Use Tailscale") { switchTransport(m, "tailscale") }
-                .controlSize(.small).disabled(busy || !ready || !m.online)
-                .help(ready ? (m.online ? "Connect to \(m.name) over Tailscale: it turns Tailscale on there too (it may need signing in there once)" : "\(m.name) must be online to switch")
-                    : "Turn on Tailscale on this Mac first (Tailscale, below)")
-        }
-    }
-
-    private func switchTransport(_ m: Machine, _ t: String, force: Bool = false) {
-        switching.insert(m.name)
-        Task {
-            let r = await store.setTransport(m.name, t, force: force)
-            switching.remove(m.name)
-            switch r {
-            case .ok: error = nil
-            case .error(let e): error = e
-            case .unreachable(let msg):
-                let a = NSAlert()
-                a.messageText = "\(m.name) doesn't answer on this network"
-                a.informativeText = msg.replacingOccurrences(of: " Switch anyway?", with: "") + "\n\nIf you switch, \(m.name) stays offline until both Macs are on the same network."
-                a.addButton(withTitle: "Keep Tailscale")
-                a.addButton(withTitle: "Switch Anyway")
-                a.alertStyle = .warning
-                if a.runModal() == .alertSecondButtonReturn { switchTransport(m, t, force: true) }
-            }
-        }
-    }
-
-    /// Share this Mac: whether paired Macs may switch transport without asking, and requests waiting here.
-    private func transportPolicy(_ r: RemoteStatus) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Toggle("Allow paired Macs to switch between LAN and Tailscale without asking", isOn: Binding(get: { r.autoApproveTransport ?? true }, set: { v in
-                Task { error = await store.updateRemote(RemotePatch(autoApproveTransport: v)) }
-            }))
-            .toggleStyle(.checkbox).font(.system(size: 11))
-            .help("A paired Mac can ask this one to turn on Tailscale and connect over it (or back to the LAN). You get a notification either way.")
-            ForEach(r.transportRequests ?? []) { q in
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.left.arrow.right").font(.system(size: 10)).foregroundStyle(.orange)
-                    Text("\(q.name) wants to connect \(q.transport == "tailscale" ? "over Tailscale" : "on the local network only")").font(.system(size: 11))
-                    Spacer()
-                    Button("Deny") { Task { error = await store.decideTransport(q.peerId, allow: false) } }.controlSize(.small)
-                    Button("Allow") { Task { error = await store.decideTransport(q.peerId, allow: true); await reload() } }.controlSize(.small)
-                }
-                .padding(.leading, 18)
-            }
+        if let v = store.vpn, v.active, !m.online, m.status != "repair" {
+            Text("A VPN is on (\(v.interface ?? "VPN")) and may be blocking the local network. Allow local network access in the VPN, or turn it off.")
+                .font(.system(size: 10)).foregroundStyle(.orange).lineLimit(3)
         }
     }
 
@@ -764,7 +556,7 @@ struct MachinesSettings: View {
         }
         let port = store.remote?.linkPort.map { " (port \($0))" } ?? ""
         let tfa = store.remote?.totp == true ? " and a 2FA code from your authenticator app" : ""
-        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below\(tfa). Everything between paired Macs is end-to-end encrypted\(port) and tied to each Mac's own key."
+        return "Show a one-time code (valid 10 minutes) and enter it on the other Mac with one of the addresses below\(tfa). Paired Macs connect directly over the local network, LStack to LStack: everything between them is end-to-end encrypted\(port) and tied to each Mac's own key."
     }
 
     private func sectionTitle(_ t: String) -> some View {
@@ -776,16 +568,6 @@ struct MachinesSettings: View {
             HStack(spacing: 6) {
                 TextField("Address, e.g. studio.local or 192.168.1.20", text: $address)
                 TextField("Name (optional)", text: $label).frame(width: 120)
-                let macs = tailnetMacs
-                if !macs.isEmpty {
-                    Menu {
-                        ForEach(macs) { p in
-                            Button("\(p.hostName ?? p.dnsName)\(p.online == false ? " (offline)" : "")") { address = p.dnsName }
-                        }
-                    } label: { Image(systemName: "point.3.connected.trianglepath.dotted") }
-                        .menuStyle(.borderlessButton).fixedSize()
-                        .help("Macs running LStack on your tailnet — pick one to fill in its address (its pairing code is still needed)")
-                }
             }
             HStack(spacing: 6) {
                 TextField("Code XXXX-XXXX", text: $code).font(.system(size: 12, design: .monospaced)).frame(width: 120)
@@ -810,13 +592,12 @@ struct MachinesSettings: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(m.address ?? m.url ?? "").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
                 Text(statusLine(m)).font(.system(size: 10)).foregroundStyle(m.online ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange)).lineLimit(2)
-                transportLine(m)
+                linkLine(m)
                 if let f = m.fingerprint {
                     Text(f).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary).textSelection(.enabled)
                 }
             }
             Spacer()
-            if !m.needsRepair { transportButton(m) }
             if m.needsRepair {
                 Button("Pair Again") {
                     address = m.address ?? m.hostname ?? m.name
@@ -895,7 +676,7 @@ struct MachinesSettings: View {
                 Text(p.name).font(.system(size: 12, weight: .medium))
                 Group {
                     if p.online == true {
-                        Text("connected\(p.via == "tailscale" ? " over Tailscale" : "")\(p.address.map { " from \($0)" } ?? "")")
+                        Text("connected\(p.address.map { " from \($0)" } ?? "")")
                     } else if let s = p.lastSeen {
                         Text("seen ") + Text(Date(timeIntervalSince1970: s / 1000), style: .relative) + Text(" ago")
                     } else {
@@ -904,15 +685,6 @@ struct MachinesSettings: View {
                 }
                 .font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
-                if p.transport == "tailscale" {
-                    Text("Tailscale").font(.system(size: 9, weight: .medium)).padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(Capsule().fill(Color.indigo.opacity(0.15))).foregroundStyle(.indigo)
-                    Button("Local Only") {
-                        Task { error = await store.setPeerTransport(p.id, "local"); await reload() }
-                    }
-                    .controlSize(.small)
-                    .help("Accept \(p.name) only from the local network again; it switches back to connecting over the LAN")
-                }
                 Button("Revoke", role: .destructive) {
                     Task { error = await store.revokePeer(p.id); await reload() }
                 }

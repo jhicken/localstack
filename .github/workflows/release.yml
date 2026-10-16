@@ -30,11 +30,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: tailnet/go.mod
-          cache-dependency-path: tailnet/go.sum
-
       - name: Check tag matches Cargo.toml version
         run: |
           VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -44,18 +39,9 @@ jobs:
       - name: Test
         run: |
           cargo test --release --quiet
-          (cd tailnet && go test ./...)
 
       - name: Build app, zip and dmg
         run: macos/build.sh
-
-      - name: Build the Tailscale helper (signed manifest)
-        env:
-          TAILNET_SIGNING_KEY: ${{ secrets.TAILNET_SIGNING_KEY }}
-        run: |
-          [[ -n "$TAILNET_SIGNING_KEY" ]] || { echo "::error::the TAILNET_SIGNING_KEY secret is not set"; exit 1; }
-          tailnet/build.sh
-          echo "TAILNET_VERSION=$(tr -d '[:space:]' < tailnet/VERSION)" >> "$GITHUB_ENV"
 
       - name: Checksums
         run: |
@@ -67,9 +53,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ASSETS=("dist/LStack-$VERSION-arm64.dmg" "dist/LStack-$VERSION-arm64.zip" "dist/LStack-$VERSION-arm64.sha256"
-                  "dist/tailnet/lstack-tailnet-$TAILNET_VERSION-darwin-universal.tar.gz"
-                  "dist/tailnet/tailnet-manifest.json" "dist/tailnet/tailnet-manifest.sig")
+          ASSETS=("dist/LStack-$VERSION-arm64.dmg" "dist/LStack-$VERSION-arm64.zip" "dist/LStack-$VERSION-arm64.sha256")
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${ASSETS[@]}" --clobber
           else

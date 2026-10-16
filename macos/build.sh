@@ -50,8 +50,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 # Sign inside-out: the helper first, then the bundle.
-RUNTIME=()
-[[ "$SIGN" != "-" ]] && RUNTIME=(--options runtime --timestamp)
+# Hardened runtime even for ad-hoc builds: other processes of yours can't attach a debugger to read
+# memory, and DYLD_* variables can't inject code.
+RUNTIME=(--options runtime)
+[[ "$SIGN" != "-" ]] && RUNTIME+=(--timestamp)
 codesign --force --sign "$SIGN" "${RUNTIME[@]+"${RUNTIME[@]}"}" --identifier dev.lstack.cli "$APP/Contents/Helpers/lstack"
 codesign --force --sign "$SIGN" "${RUNTIME[@]+"${RUNTIME[@]}"}" "$APP"
 codesign --verify --strict "$APP"

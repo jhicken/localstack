@@ -15,6 +15,8 @@ struct OPStatusBadge: View {
         case "missing": return ("not cached", .red)
         case "blocked": return ("blocked", .red)
         case "refresh": return ("refresh", .teal)
+        case "approve": return ("needs approval", .orange)
+        case "notStored": return ("not stored", .red)
         default: return (status, .secondary)
         }
     }

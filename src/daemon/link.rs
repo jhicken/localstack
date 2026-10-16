@@ -21,10 +21,6 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Semaphore};
 use zeroize::Zeroizing;
 
-/// Any byte stream a link can run over: TCP on the LAN, or a Unix socket to the tailnet helper.
-pub trait Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn for T {}
-
 pub const DEFAULT_PORT: u16 = 7381;
 pub const MAGIC_LINK: &[u8; 6] = b"LSTKL1";
 pub const MAGIC_PAIR: &[u8; 6] = b"LSTKP1";
@@ -42,21 +38,6 @@ const IDENTITY_SECRET: &str = "LSTACK_IDENTITY";
 pub struct Identity {
     private: Zeroizing<Vec<u8>>,
     pub public: [u8; 32],
-}
-
-#[cfg(test)]
-impl Identity {
-    pub fn generate() -> Identity {
-        let (private, public) = generate();
-        Identity { private, public }
-    }
-}
-
-#[cfg(test)]
-impl Clone for Identity {
-    fn clone(&self) -> Identity {
-        Identity { private: self.private.clone(), public: self.public }
-    }
 }
 
 static IDENTITY: Mutex<Option<Arc<Identity>>> = Mutex::new(None);
@@ -215,13 +196,9 @@ async fn dial(addr: &str) -> io::Result<TcpStream> {
 /// Dial a paired machine's link port. Fails unless it holds the private key matching `their`
 /// and has pinned our key.
 pub async fn connect(addr: &str, id: &Identity, their: &[u8; 32], hello: Value) -> io::Result<(Arc<Mux>, Value)> {
-    let tcp = dial(addr).await?;
+    // Always a direct TCP connection dialed by this daemon: the Noise session ends in this process.
+    let mut tcp = dial(addr).await?;
     let _ = tcp.set_nodelay(true);
-    connect_over(tcp, id, their, hello).await
-}
-
-/// `connect` over an already open stream (e.g. through the tailnet helper).
-pub async fn connect_over<S: Conn>(mut tcp: S, id: &Identity, their: &[u8; 32], hello: Value) -> io::Result<(Arc<Mux>, Value)> {
     let mut hs = snow::Builder::new(NOISE.parse().unwrap())
         .local_private_key(&id.private)
         .remote_public_key(their)
@@ -259,7 +236,7 @@ pub struct Accepted {
 
 /// Server half of the link handshake (after `MAGIC_LINK` was read). `authorize` maps the caller's static
 /// key to a reply payload, or refuses with a message.
-pub async fn accept<S: Conn>(mut tcp: S, id: &Identity, authorize: impl FnOnce(&[u8; 32], &Value) -> Result<Value, String>) -> io::Result<Accepted> {
+pub async fn accept(mut tcp: TcpStream, id: &Identity, authorize: impl FnOnce(&[u8; 32], &Value) -> Result<Value, String>) -> io::Result<Accepted> {
     let mut hs = snow::Builder::new(NOISE.parse().unwrap()).local_private_key(&id.private).prologue(PROLOGUE).build_responder().map_err(ioerr)?;
     let msg = timed(Duration::from_secs(10), read_frame(&mut tcp)).await?;
     let mut buf = vec![0u8; MAX_MSG];
@@ -300,9 +277,6 @@ const F_BYE: u8 = 8;
 
 /// `F_BYE` reason: the pairing was removed on the sending side; the receiver should forget it too.
 pub const BYE_REVOKED: &str = "revoked";
-/// Link goodbye reason prefix: the shared Mac changed how this link travels (`transport-local` / `transport-tailscale`);
-/// the watching Mac switches and redials.
-pub const BYE_TRANSPORT: &str = "transport-";
 /// Link refusal text for a key the shared Mac revoked while that Mac was offline.
 pub const REFUSED_REVOKED: &str = "revoked this Mac's access";
 
@@ -345,7 +319,7 @@ fn frame(kind: u8, id: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 impl Mux {
-    fn start<S: Conn>(tcp: S, ts: snow::TransportState, client: bool, incoming: Option<mpsc::Sender<Incoming>>) -> Arc<Mux> {
+    fn start(tcp: TcpStream, ts: snow::TransportState, client: bool, incoming: Option<mpsc::Sender<Incoming>>) -> Arc<Mux> {
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
         let mux = Arc::new(Mux {
             out: out_tx,
@@ -359,7 +333,7 @@ impl Mux {
             opened_at: now_ms(),
         });
         let ts = Arc::new(Mutex::new(ts));
-        let (mut rd, mut wr) = tokio::io::split(tcp);
+        let (mut rd, mut wr) = tcp.into_split();
         let wts = ts.clone();
         let wm = mux.clone();
         let writer = tokio::spawn(async move {
@@ -756,14 +730,9 @@ pub struct Paired {
 
 /// Host side: pair with the machine at `addr` using its one-time code (`auth` may carry a 2FA `totp` code).
 pub async fn pair_client(addr: &str, code: &str, auth: Value, host_name: &str) -> Result<Paired, String> {
-    let tcp = dial(addr).await.map_err(|e| format!("can't reach {addr}: {e} (is “Share this Mac” on there?)"))?;
-    pair_client_over(tcp, addr, code, auth, host_name).await
-}
-
-/// `pair_client` over an already open stream; `addr` is only used in messages.
-pub async fn pair_client_over<S: Conn>(mut tcp: S, addr: &str, code: &str, auth: Value, host_name: &str) -> Result<Paired, String> {
     use spake2::{Ed25519Group, Password, Spake2};
     let id = identity()?;
+    let mut tcp = dial(addr).await.map_err(|e| format!("can't reach {addr}: {e} (is “Share this Mac” on there?)"))?;
     let (a, b) = spake_ids();
     let (st, msg) = Spake2::<Ed25519Group>::start_a(&Password::new(normalize_code(code)), &a, &b);
     let io = async {
@@ -816,7 +785,7 @@ fn pair_io_error(addr: &str, e: &io::Error) -> String {
 }
 
 /// Shared-Mac side: refuse a pairing attempt with a message the other Mac can show.
-pub async fn pair_refuse<S: Conn>(mut tcp: S, msg: &str) {
+pub async fn pair_refuse(mut tcp: TcpStream, msg: &str) {
     // Read what was sent first: closing with unread data makes the kernel reset the connection, which can
     // throw away the reply before the other Mac reads it.
     let _ = timed(Duration::from_secs(5), read_frame(&mut tcp)).await;
@@ -838,7 +807,7 @@ pub trait PairPolicy: Send + Sync {
 }
 
 /// Shared-Mac side of pairing (after `MAGIC_PAIR` was read).
-pub async fn pair_server<P: PairPolicy, S: Conn>(mut tcp: S, policy: &P) -> io::Result<()> {
+pub async fn pair_server<P: PairPolicy>(mut tcp: TcpStream, policy: &P) -> io::Result<()> {
     use spake2::{Ed25519Group, Password, Spake2};
     let first = timed(Duration::from_secs(10), read_frame(&mut tcp)).await?;
     let Some(first) = as_plain(&first) else { return Ok(()) };

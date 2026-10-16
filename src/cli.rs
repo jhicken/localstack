@@ -31,6 +31,11 @@ fn help() -> String {
   lstack remote [on|off|passwd|share|status]   web dashboard for other machines (see below)
   lstack terminal [terminal|iterm|cmux|ghostty]   app used to open the dashboard / attach
   lstack terminal cmux --fix     let LStack open cmux workspaces (socket password mode)
+  lstack env <name> [--values]   variables in the service's env files (secrets are never shown)
+  lstack env <name> set KEY=VALUE…|rm KEY… [--file .env.lstack]   edit the env file
+  lstack env <name> secret KEY [--name N] [--stdin|--prompt]   store KEY's value (default: the one in
+                                 the file) in LStack; the file then says lstack://N
+  lstack env <name> link KEY NAME | approve [KEY…]   use a stored secret / approve lstack:// lines
   lstack secret set|ls|rm|rotate-key|unlock   write-only secrets passed to services as env vars
   lstack secret review <service|file>   op:// references in the service's envFiles and what's approved
   lstack secret import [<service|file>] [--env-file .env] [--keys A,B] [--environment <mount>] [--account <a>] [-y]
@@ -42,8 +47,7 @@ fn help() -> String {
   lstack secret share|unshare <machine> <NAME|op://…>…   send a paired Mac cached 1Password values
   lstack secret sync [<service>]   take values paired Macs share with you now (from their cache)
   lstack ps [--machine <m>]      busy processes (over the CPU/mem/net thresholds), per machine
-  lstack machine ls|add|rm|rename|transport   watch other Macs (their services show up everywhere)
-  lstack tailnet on|off|status|login|logout|update   Tailscale transport for paired Macs (see below)
+  lstack machine ls|add|rm|rename   watch other Macs (their services show up everywhere)
   lstack heartbeat [status|key|machine|set|off|test]   healthchecks.io-compatible pings
   lstack daemon run|start|stop|restart|status|logs
   lstack reload                  re-read {}
@@ -84,9 +88,6 @@ fn help() -> String {
   lstack remote grant <mac> [control|no-control] [--tunnel all|none|svc,svc]   what a paired Mac may do
   lstack remote revoke <mac>     unpair a Mac now (its link and tunnels drop; it forgets this Mac too)
   lstack remote activity         recent links, pairings, tunnels and refusals
-  lstack remote auto-approve on|off   paired Macs may switch their transport (LAN ↔ Tailscale) without asking
-  lstack remote requests         transport changes waiting for approval   lstack remote allow|deny <mac>
-  lstack remote transport <mac> local|tailscale   change how a paired Mac reaches this one (it follows)
 
 {}
   lstack machine pair studio.local --code K7QP-3M9X [--totp 123456] [--name studio]
@@ -96,14 +97,9 @@ fn help() -> String {
   lstack machine id              this install's key fingerprint     lstack machine rekey
   lstack ls                      services grouped by machine; address them as name@machine
   lstack logs api@studio -f      lstack restart worker@studio
-  lstack forwards                services of paired Macs forwarded to localhost (encrypted link)
+  lstack forwards                services of paired Macs forwarded to localhost (the only way to reach them)
   lstack forwards pause|resume web@studio
-  lstack machine transport studio tailscale [--yes]   reach studio over Tailscale (it turns Tailscale on too)
-  lstack machine transport studio local [--yes]       back to the local network (checks it's reachable)
   lstack machine reconnect       redial machines that are offline now
-  lstack tailnet on [--yes]      install + start LStack's Tailscale helper (its own device, lstack-<host>)
-  lstack tailnet login [--auth-key tskey-…]   sign in (opens the browser, or uses a key)
-  lstack tailnet update | logout | off | status
 
 {}
   lstack heartbeat key                           healthchecks.io project ping key (stored encrypted)
@@ -162,8 +158,8 @@ pub fn main(argv: Vec<String>) -> i32 {
         "security" => cmd_security(&rest),
         "terminal" => cmd_terminal(&rest),
         "secret" | "secrets" => crate::cli_more::cmd_secret(&rest),
+        "env" => crate::cli_more::cmd_env(&rest),
         "machine" | "machines" => crate::cli_more::cmd_machine(&rest),
-        "tailnet" | "tailscale" => crate::cli_more::cmd_tailnet(&rest),
         "forwards" | "forward" | "tunnels" => crate::cli_more::cmd_forwards(&rest),
         "ps" | "processes" => crate::cli_more::cmd_ps(&rest),
         "heartbeat" | "heartbeats" | "hc" => crate::cli_more::cmd_heartbeat(&rest),
@@ -279,6 +275,7 @@ fn url_cell(s: &ServiceState) -> String {
             let more = if s.urls.len() > 1 { c::dim(&format!(" +{}", s.urls.len() - 1)) } else { String::new() };
             let warn = match &u.via {
                 Some(m) => c::dim(&format!(" (via {m})")),
+                None if u.blocked.as_deref() == Some("untunneled") => c::yellow(" (no tunnel)"),
                 None if u.local_only && s.machine.is_some() => c::yellow(" (local only)"),
                 None => String::new(),
             };
@@ -364,8 +361,15 @@ fn print_services(services: &[ServiceState], local: bool) {
         }
         println!("{}", c::table(&rows, &headers));
         for s in services.iter().filter(|s| s.secrets_pending.is_some()) {
-            let how = if local { format!("lstack secret review {}", s.name) } else { "review it on that Mac".into() };
-            println!("{} {}: 1Password references to review — {how}", c::yellow("!"), s.name);
+            let stored_only = s.secrets_pending.as_ref().is_some_and(|p| {
+                ["new", "changed", "missing", "removed"].iter().all(|k| p[*k].as_array().is_none_or(|a| a.is_empty()))
+            });
+            let cmd = if stored_only { format!("lstack env {}", s.name) } else { format!("lstack secret review {}", s.name) };
+            let how = if local { cmd } else { "review it on that Mac".into() };
+            println!("{} {}: env file secrets to review — {how}", c::yellow("!"), s.name);
+        }
+        for s in services.iter().filter(|s| s.env_stale.as_ref().is_some_and(|k| !k.is_empty()) && s.status == "running") {
+            println!("{} {}: env file changed ({}) — lstack restart {}", c::cyan("↻"), s.name, s.env_stale.clone().unwrap_or_default().join(", "), s.name);
         }
     }
 }
@@ -383,8 +387,11 @@ fn cmd_show(args: &[String]) -> R {
         println!("{}", c::dim(d));
     }
     if let Some(p) = &s.secrets_pending {
-        let keys: Vec<&str> = ["new", "changed", "missing", "blocked", "removed"].iter().flat_map(|k| p[*k].as_array().into_iter().flatten()).filter_map(|v| v.as_str()).collect();
-        println!("{} 1Password references to review: {}  {}", c::yellow("!"), keys.join(", "), c::cyan(&format!("lstack secret review {}", s.name)));
+        let keys: Vec<&str> = ["new", "changed", "missing", "blocked", "removed", "link", "notStored"].iter().flat_map(|k| p[*k].as_array().into_iter().flatten()).filter_map(|v| v.as_str()).collect();
+        println!("{} env file secrets to review: {}  {}", c::yellow("!"), keys.join(", "), c::cyan(&format!("lstack env {0} · lstack secret review {0}", s.name)));
+    }
+    if let Some(k) = s.env_stale.as_ref().filter(|k| !k.is_empty() && s.status == "running") {
+        println!("{} env file changed since it started: {}  {}", c::cyan("↻"), k.join(", "), c::cyan(&format!("lstack restart {}", s.name)));
     }
     let met = s.metrics.as_ref();
     let mut kv = vec![
@@ -403,6 +410,7 @@ fn cmd_show(args: &[String]) -> R {
         let label = u.label.as_deref().map(|l| format!(" {}", c::dim(l))).unwrap_or_default();
         let note = match &u.via {
             Some(m) => c::dim(&format!(" (forwarded from {m} over the encrypted link; port {})", u.port.map(|p| p.to_string()).unwrap_or_default())),
+            None if u.blocked.as_deref() == Some("untunneled") => c::dim(" (no tunnel permission from that Mac: only reachable through the encrypted link)"),
             None if u.local_only => c::dim(if s.machine.is_some() { " (bound to localhost there: not reachable from here)" } else { " (localhost only)" }),
             None => String::new(),
         };
@@ -756,6 +764,31 @@ fn cmd_action(action: &str, args: &[String]) -> R {
         let hs: Vec<_> = names.iter().map(|n| sc.spawn(|| cl.action(n, action))).collect();
         hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("panicked".into()))).collect()
     });
+    // Starts held back for a Touch ID approval: wait for each, then show where it ended up.
+    let results: Vec<Result<ServiceState, String>> = names
+        .iter()
+        .zip(results)
+        .map(|(n, r)| match r {
+            Ok(s) if action != "stop" && s.approval.is_some() => {
+                let ap = s.approval.clone().unwrap_or_default();
+                let summary: Vec<&str> = ap["summary"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+                let msg = format!("{n} needs your approval in LStack.app (Touch ID):\n  {} [approval:{}]", summary.join("\n  "), ap["id"].as_str().unwrap_or(""));
+                cl.wait_approval(&msg)?;
+                if action == "restart" && cl.get(n)?.status == "running" {
+                    return cl.action(n, "restart");
+                }
+                for _ in 0..50 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let s = cl.get(n)?;
+                    if !matches!(s.status.as_str(), "starting" | "errored" | "stopped") || s.approval.is_some() {
+                        return Ok(s);
+                    }
+                }
+                cl.get(n)
+            }
+            r => r,
+        })
+        .collect();
     let mut failed = false;
     for (n, r) in names.iter().zip(results) {
         match r {
@@ -829,6 +862,11 @@ fn cmd_attach(args: &[String]) -> R {
     if s.kind != "process" {
         return cmd_exec(args);
     }
+    if let Err(e) = cl.stdin(&name, "") {
+        if !cl.wait_approval(&e)? && !e.contains("does not accept input") {
+            return Err(e);
+        }
+    }
     println!("{}", c::dim(&format!("attached to {name} — lines you type are sent to stdin. Ctrl-C to detach (the process keeps running).")));
     let (cl2, n2) = (cl.clone(), name.clone());
     std::thread::spawn(move || {
@@ -873,7 +911,11 @@ fn cmd_exec(args: &[String]) -> R {
     let name = need(args.first())?;
     let cl = client::connect(true)?;
     // Runs through the daemon so output gets the same secret scrubbing as logs.
-    match crate::daemon::exec::run_client(&cl.info, &name, &args[1..])? {
+    let r = match crate::daemon::exec::run_client(&cl.info, &name, &args[1..]) {
+        Err(e) if cl.wait_approval(&e)? => crate::daemon::exec::run_client(&cl.info, &name, &args[1..]),
+        r => r,
+    };
+    match r? {
         0 => Ok(()),
         code => std::process::exit(code),
     }
@@ -969,11 +1011,6 @@ fn print_remote(v: &serde_json::Value) {
     }
     if share {
         println!("  {:<9} {} paired Mac(s) — lstack remote peers", c::dim("paired"), v["pairedMachines"].as_u64().unwrap_or(0));
-        let auto = v["autoApproveTransport"].as_bool().unwrap_or(true);
-        println!("  {:<9} {}", c::dim("transport"), if auto { "paired Macs may switch LAN ↔ Tailscale (auto-approved)" } else { "changes need approval — lstack remote requests" });
-        for r in v["transportRequests"].as_array().into_iter().flatten() {
-            println!("  {:<9} {} asks to use {} — lstack remote allow|deny {}", c::dim("request"), c::bold(r["name"].as_str().unwrap_or("?")), r["transport"].as_str().unwrap_or("?"), r["name"].as_str().unwrap_or("?"));
-        }
     }
     if let Some(e) = v["error"].as_str() {
         println!("  {:<9} {}", c::dim("error"), c::red(e));
@@ -987,10 +1024,10 @@ fn print_remote(v: &serde_json::Value) {
         println!("  {:<9} {}{tag}", c::dim("link"), c::cyan(u.as_str().unwrap_or("")));
     }
     if share {
-        println!("{}", c::dim("  Paired Macs connect over an encrypted, key-pinned link (Noise) on the link port."));
+        println!("{}", c::dim("  Paired Macs connect daemon to daemon over an encrypted, key-pinned link (Noise), local network only."));
     }
     if web && v["webRemote"].as_bool().unwrap_or(false) {
-        println!("{}", c::dim("  The web dashboard is plain HTTP: use it on a trusted network or over a VPN such as Tailscale."));
+        println!("{}", c::dim("  The web dashboard is plain HTTP: use it on a trusted network only."));
     }
 }
 
@@ -1014,9 +1051,6 @@ fn cmd_remote(args: &[String]) -> R {
     )?;
     let cl = client::connect(true)?;
     let sub = a.pos.first().map(String::as_str).unwrap_or("status");
-    if matches!(sub, "requests" | "transport-requests" | "allow" | "deny" | "transport") {
-        return crate::cli_more::cmd_remote_transport(&cl, sub, &a.pos[1..], a.has("json"));
-    }
     if matches!(sub, "pair" | "peers" | "grant" | "revoke" | "activity") {
         return crate::cli_more::cmd_remote_peers(&cl, sub, &a.pos[1..], a.get("tunnel"), a.has("json"));
     }
@@ -1109,15 +1143,6 @@ fn cmd_remote(args: &[String]) -> R {
                 patch.insert("shareAddress".into(), json!(addr));
             }
         },
-        "auto-approve" | "autoapprove" => match arg {
-            Some("on") => {
-                patch.insert("autoApproveTransport".into(), json!(true));
-            }
-            Some("off") => {
-                patch.insert("autoApproveTransport".into(), json!(false));
-            }
-            _ => return Err("usage: lstack remote auto-approve on|off".into()),
-        },
         "share" | "sharing" => match arg {
             Some("on") => {
                 patch.insert("sharing".into(), json!(true));
@@ -1127,7 +1152,7 @@ fn cmd_remote(args: &[String]) -> R {
             }
             _ => return Err("usage: lstack remote share on|off".into()),
         },
-        other => return Err(format!("unknown remote command {other:?} (on, off, web, share, address, auto-approve, requests, transport, passwd, status)")),
+        other => return Err(format!("unknown remote command {other:?} (on, off, web, share, address, passwd, status)")),
     }
     let v: serde_json::Value = cl.req("PUT", "/api/remote", Some(serde_json::Value::Object(patch)))?;
     print_remote(&v);

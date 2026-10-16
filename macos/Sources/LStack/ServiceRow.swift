@@ -68,6 +68,7 @@ struct ServiceRow: View {
                             .help("Heartbeat ping failed: \(hb.error ?? "unknown error")")
                     }
                     if let p = service.secretsPending, !service.isRemote { pendingBadge(p) }
+                    if let k = service.envStale, !k.isEmpty, service.isRunning, !service.isRemote { staleBadge(k) }
                 }
                 Text(subtitle)
                     .font(.system(size: 11))
@@ -111,15 +112,35 @@ struct ServiceRow: View {
         .padding(.vertical, 8)
     }
 
-    /// 1Password references in the env files waiting for review; opens the review (nothing is read yet).
+    /// The env files changed while it runs: a restart applies them.
+    private func staleBadge(_ keys: [String]) -> some View {
+        Button {
+            store.perform(service, "restart")
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.clockwise").font(.system(size: 8, weight: .bold))
+                Text("Env changed").font(.system(size: 9, weight: .semibold))
+            }
+            .lineLimit(1).fixedSize()
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Capsule().fill(Color.blue.opacity(0.15)))
+            .foregroundStyle(.blue)
+        }
+        .buttonStyle(.plain)
+        .help("Changed in the env file since it started: \(keys.joined(separator: ", "))\nClick to restart and apply")
+    }
+
+    /// Env file secrets waiting for review: 1Password references open the review (nothing is read
+    /// yet); `lstack://` lines open the editor, where they're approved.
     private func pendingBadge(_ p: SecretsPending) -> some View {
         Button {
+            if p.onlyStored { openEditor(.environment); return }
             openWindow(id: "op-review", value: service.name)
             bringToFront()
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "key.horizontal.fill").font(.system(size: 8))
-                Text(p.count > 0 ? "1Password: \(p.count) to review" : "1Password: needs a look")
+                Text(p.onlyStored ? "Secrets: \(p.count) to approve" : p.count > 0 ? "1Password: \(p.count) to review" : "1Password: needs a look")
                     .font(.system(size: 9, weight: .semibold))
             }
             .lineLimit(1).fixedSize()
@@ -133,11 +154,12 @@ struct ServiceRow: View {
 
     private func pendingHelp(_ p: SecretsPending) -> String {
         var lines: [String] = []
-        for (label, keys) in [("New", p.new), ("Changed", p.changed), ("Not cached", p.missing), ("Blocked", p.blocked), ("Removed", p.removed)] {
+        for (label, keys) in [("New", p.new), ("Changed", p.changed), ("Not cached", p.missing), ("Blocked", p.blocked), ("Removed", p.removed),
+                              ("Stored secret to approve", p.link), ("Not stored", p.notStored)] {
             if let keys, !keys.isEmpty { lines.append("\(label): \(keys.joined(separator: ", "))") }
         }
         lines += p.errors ?? []
-        return (["Review 1Password references from the env files"] + lines).joined(separator: "\n")
+        return ([p.onlyStored ? "Approve lstack:// secrets from the env files" : "Review secrets from the env files"] + lines).joined(separator: "\n")
     }
 
     @ViewBuilder private var healthIcon: some View {
@@ -233,14 +255,15 @@ struct ServiceRow: View {
 
     private var secretKeys: [String] { (service.config.secrets?.pairs ?? []).map(\.key) }
     private var plainKeys: [String] { (service.config.env ?? [:]).keys.sorted() }
-    private var hasEnvironment: Bool { !secretKeys.isEmpty || !plainKeys.isEmpty || !(service.config.envFiles ?? []).isEmpty }
+    private var fileKeys: [String] { service.envFileKeys ?? [] }
+    private var hasEnvironment: Bool { !secretKeys.isEmpty || !plainKeys.isEmpty || !fileKeys.isEmpty || !(service.config.envFiles ?? []).isEmpty }
 
     /// Env files, variables and secrets as chips that wrap onto more lines (names only, never values).
     private var environmentChips: some View {
         let max = 14
         let items: [(String, String?)] = (service.config.envFiles ?? []).map { ($0, "doc.text") }
             + secretKeys.map { ($0, "key.fill") }
-            + plainKeys.filter { !secretKeys.contains($0) }.map { ($0, nil) }
+            + (plainKeys + fileKeys).reduce(into: [String]()) { if !$0.contains($1) && !secretKeys.contains($1) { $0.append($1) } }.map { ($0, nil) }
         return FlowLayout(spacing: 4, lineSpacing: 4) {
             ForEach(items.prefix(max), id: \.0) { item in
                 HStack(spacing: 3) {
@@ -297,6 +320,9 @@ struct ServiceRow: View {
                     Button("Edit…") { openEditor(.general) }
                     Button("Environment Variables…") { openEditor(.environment) }
                     if !(service.config.envFiles ?? []).isEmpty {
+                        if service.isRunning, !(service.envStale ?? []).isEmpty {
+                            Button("Restart to Apply Env Changes") { store.perform(service, "restart") }
+                        }
                         Button("Review 1Password References…") {
                             openWindow(id: "op-review", value: service.name)
                             bringToFront()

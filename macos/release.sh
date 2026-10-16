@@ -6,8 +6,7 @@
 #   1. requires a clean tree that is up to date with origin, and the GitHub CLI (`gh auth login`)
 #   2. cargo test + cargo clippy (warnings are errors)
 #   3. bumps `version` in Cargo.toml (default: patch) + Cargo.lock, commits "chore: release vX.Y.Z", tags it
-#   4. builds dist/LStack-X.Y.Z-<arch>.{dmg,zip,sha256} with macos/build.sh, and the Tailscale helper with
-#      tailnet/build.sh (its manifest must be signed: TAILNET_SIGNING_KEY or the keychain item, see that script)
+#   4. builds dist/LStack-X.Y.Z-<arch>.{dmg,zip,sha256} with macos/build.sh
 #   5. pushes the branch and tag together, then creates the GitHub release with those files (gh)
 #   If anything fails before the push (checks, build), the bump commit and tag are undone.
 #   If only the upload fails, rerun with `current --skip-build` to retry it.
@@ -82,8 +81,6 @@ if [[ $CHECKS == 1 ]]; then
   cargo test --quiet
   step "cargo clippy"
   cargo clippy --quiet --all-targets -- -D warnings
-  step "go test (tailnet helper)"
-  (cd tailnet && "${GO:-$(command -v go || echo /opt/homebrew/bin/go)}" test ./...)
 fi
 
 if [[ $DRY == 1 ]]; then
@@ -125,18 +122,12 @@ fi
 # 4. Build here, before anything leaves this Mac, so a broken build rolls back cleanly.
 ARCH="$(uname -m)"
 ASSETS=("dist/LStack-$NEW-$ARCH.dmg" "dist/LStack-$NEW-$ARCH.zip" "dist/LStack-$NEW-$ARCH.sha256")
-# Every release carries the helper so `releases/latest/download/tailnet-manifest.json` always resolves.
-TAILNET_VERSION="$(tr -d '[:space:]' < tailnet/VERSION)"
-TAILNET_ASSETS=("dist/tailnet/lstack-tailnet-$TAILNET_VERSION-darwin-universal.tar.gz" "dist/tailnet/tailnet-manifest.json" "dist/tailnet/tailnet-manifest.sig")
 if [[ $LOCAL == 1 ]]; then
   if [[ $BUILD == 1 ]]; then
     step "building LStack $NEW"
     macos/build.sh
-    step "building the Tailscale helper $TAILNET_VERSION"
-    tailnet/build.sh
   fi
-  for a in "${ASSETS[@]:0:2}" "${TAILNET_ASSETS[@]}"; do [[ -f "$a" ]] || die "missing $a"; done
-  ASSETS+=("${TAILNET_ASSETS[@]}")
+  for a in "${ASSETS[@]:0:2}"; do [[ -f "$a" ]] || die "missing $a"; done
   (cd dist && shasum -a 256 "LStack-$NEW-$ARCH.dmg" "LStack-$NEW-$ARCH.zip" > "LStack-$NEW-$ARCH.sha256")
 fi
 

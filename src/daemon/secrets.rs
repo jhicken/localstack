@@ -15,11 +15,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const AAD: &[u8] = b"lstack-secrets-v1";
 const KEYCHAIN_SERVICE: &str = "dev.lstack.secrets";
 const MAX_VALUE: usize = 64 * 1024;
+/// Internal entry holding the Touch ID approval state (see `approvals.rs`). Never scrubbed or injected.
+pub const APPROVALS_NAME: &str = "LSTACK_APPROVALS";
 /// Names starting with this are used by LStack itself (cmux socket password, healthchecks ping key).
 pub const INTERNAL_PREFIX: &str = "LSTACK_";
 
@@ -93,6 +95,34 @@ impl Meta {
 impl Drop for Entry {
     fn drop(&mut self) {
         self.value.zeroize();
+    }
+}
+
+/// A value as the running daemon holds it: encrypted under a per-boot key that never leaves locked
+/// memory, opened only when it's injected, sent to a paired Mac or written to disk.
+struct Held {
+    nonce: [u8; 12],
+    ct: Vec<u8>,
+    set_at: i64,
+    meta: Meta,
+}
+
+impl Held {
+    fn seal(mem: &Key, name: &str, value: &str, set_at: i64, meta: Meta) -> Result<Held, String> {
+        let nonce = random::<12>();
+        let ct = ChaCha20Poly1305::new_from_slice(&mem.0[..])
+            .map_err(|e| e.to_string())?
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: value.as_bytes(), aad: name.as_bytes() })
+            .map_err(|_| "encryption failed".to_string())?;
+        Ok(Held { nonce, ct, set_at, meta })
+    }
+
+    fn open(&self, mem: &Key, name: &str) -> Option<Zeroizing<String>> {
+        let pt = ChaCha20Poly1305::new_from_slice(&mem.0[..])
+            .ok()?
+            .decrypt(Nonce::from_slice(&self.nonce), Payload { msg: &self.ct, aad: name.as_bytes() })
+            .ok()?;
+        String::from_utf8(pt).map(Zeroizing::new).map_err(|e| e.into_bytes().zeroize()).ok()
     }
 }
 
@@ -215,7 +245,9 @@ pub struct Vault {
     dir: PathBuf,
     share_b: ShareB,
     key: Option<Key>,
-    values: BTreeMap<String, Entry>,
+    /// Seals `values` in memory; random per process.
+    mem: Key,
+    values: BTreeMap<String, Held>,
     /// Why the store can't be read (missing share, Keychain locked, tampered file…).
     error: Option<String>,
     /// Bumped on every change, so watchers can tell when to re-check.
@@ -238,7 +270,7 @@ impl Vault {
         } else {
             ShareB::File(dir.join("secrets.share2"))
         };
-        let mut v = Vault { dir, share_b, key: None, values: BTreeMap::new(), error: None, generation: 0, scrubbed: None };
+        let mut v = Vault { dir, share_b, key: None, mem: Key::new(random::<32>()), values: BTreeMap::new(), error: None, generation: 0, scrubbed: None };
         if let Err(e) = v.load() {
             v.error = Some(e);
         }
@@ -278,7 +310,10 @@ impl Vault {
             .map_err(|_| "secrets.enc failed authentication (wrong key share or tampered file)".to_string())?;
         let parsed = serde_json::from_slice::<BTreeMap<String, Entry>>(&pt);
         pt.zeroize();
-        self.values = parsed.map_err(|_| "secrets.enc is corrupt".to_string())?;
+        for (name, e) in parsed.map_err(|_| "secrets.enc is corrupt".to_string())? {
+            let h = Held::seal(&self.mem, &name, &e.value, e.set_at, e.meta.clone())?;
+            self.values.insert(name, h);
+        }
         self.key = Some(key);
         Ok(())
     }
@@ -310,7 +345,13 @@ impl Vault {
         let key = self.key.as_ref().unwrap();
         let cipher = ChaCha20Poly1305::new_from_slice(&key.0[..]).map_err(|e| e.to_string())?;
         let nonce = random::<12>();
-        let mut pt = serde_json::to_vec(&self.values).map_err(|e| e.to_string())?;
+        let mut plain = BTreeMap::new();
+        for (name, h) in &self.values {
+            let v = h.open(&self.mem, name).ok_or("secret store memory is corrupt")?;
+            plain.insert(name.as_str(), Entry { value: v.to_string(), set_at: h.set_at, meta: h.meta.clone() });
+        }
+        let mut pt = serde_json::to_vec(&plain).map_err(|e| e.to_string())?;
+        drop(plain);
         let ct = cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: &pt, aad: AAD });
         pt.zeroize();
         let ct = ct.map_err(|_| "encryption failed".to_string())?;
@@ -362,8 +403,10 @@ impl Vault {
             Self::check(n, v)?;
         }
         let mut prev = Vec::new();
-        for (name, value, meta) in items {
-            let p = self.values.insert(name.clone(), Entry { value, set_at: paths::now_ms(), meta });
+        for (name, mut value, meta) in items {
+            let h = Held::seal(&self.mem, &name, &value, paths::now_ms(), meta);
+            value.zeroize();
+            let p = self.values.insert(name.clone(), h?);
             prev.push((name, p));
         }
         if let Err(e) = self.save() {
@@ -420,8 +463,12 @@ impl Vault {
         self.generation += 1;
     }
 
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.values.get(name).map(|e| e.value.as_str())
+    pub fn get(&self, name: &str) -> Option<Zeroizing<String>> {
+        self.values.get(name).and_then(|h| h.open(&self.mem, name))
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.values.contains_key(name)
     }
 
     pub fn names(&self) -> Vec<(String, i64)> {
@@ -438,7 +485,9 @@ impl Vault {
         if self.scrubbed == Some(self.generation) {
             return;
         }
-        crate::scrub::set_secrets(self.values.iter().map(|(k, e)| (k.as_str(), e.value.as_str())));
+        let open: Vec<(&str, Zeroizing<String>)> =
+            self.values.iter().filter(|(k, _)| !k.starts_with(APPROVALS_NAME)).filter_map(|(k, h)| Some((k.as_str(), h.open(&self.mem, k)?))).collect();
+        crate::scrub::set_secrets(open.iter().map(|(k, v)| (*k, v.as_str())));
         self.scrubbed = Some(self.generation);
     }
 }
@@ -503,11 +552,23 @@ pub fn is_locked() -> bool {
 
 /// For the daemon's own use only (env injection, cmux password, ping key). Never sent to clients.
 pub fn internal_get(name: &str) -> Option<String> {
-    with(|v| v.get(name).map(String::from))
+    with(|v| v.get(name).map(|s| s.to_string()))
 }
 
-/// Environment variables for a service's `secrets:` references: (env name, value).
+/// HMAC of a stored value under `key` (for approvals: notices a changed value without revealing it).
+pub fn keyed_digest(name: &str, key: &[u8]) -> Option<String> {
+    with(|v| v.get(name).map(|s| super::approvals::keyed(key, name, s.as_bytes())))
+}
+
+/// Environment variables for a service's `secrets:` references: (env name, value). Withheld until
+/// the service's configuration is approved (see `approvals`).
 pub fn env_for(cfg: &crate::types::ServiceConfig) -> Result<Vec<(String, String)>, String> {
+    super::approvals::gate(cfg)?;
+    env_for_ungated(cfg)
+}
+
+/// Only for stopping (compose down needs the same variables to parse its file); never to start anything.
+pub fn env_for_ungated(cfg: &crate::types::ServiceConfig) -> Result<Vec<(String, String)>, String> {
     let refs = cfg.secret_refs();
     if refs.is_empty() {
         return Ok(vec![]);
@@ -517,11 +578,11 @@ pub fn env_for(cfg: &crate::types::ServiceConfig) -> Result<Vec<(String, String)
     }
     with(|v| {
         v.ready()?;
-        let missing: Vec<&str> = refs.iter().filter(|(_, s)| v.get(s).is_none()).map(|(_, s)| s.as_str()).collect();
+        let missing: Vec<&str> = refs.iter().filter(|(_, s)| !v.has(s)).map(|(_, s)| s.as_str()).collect();
         if !missing.is_empty() {
             return Err(format!("secret(s) not set: {} (lstack secret set <NAME>)", missing.join(", ")));
         }
-        Ok(refs.iter().map(|(e, s)| (e.clone(), v.get(s).unwrap().to_string())).collect())
+        refs.iter().map(|(e, s)| Ok((e.clone(), v.get(s).ok_or("secret store memory is corrupt")?.to_string()))).collect()
     })
 }
 
@@ -545,7 +606,7 @@ pub fn status(services: &[crate::types::ServiceConfig]) -> Value {
         // Referenced but not set yet, so the UI can prompt for them.
         for c in services {
             for (_, s) in c.secret_refs() {
-                if v.get(&s).is_none() && !items.iter().any(|i| i["name"] == s.as_str()) {
+                if !v.has(&s) && !items.iter().any(|i| i["name"] == s.as_str()) {
                     let used_by: Vec<&str> =
                         services.iter().filter(|c| c.secret_refs().iter().any(|(_, x)| *x == s)).map(|c| c.name.as_str()).collect();
                     items.push(json!({ "name": s, "setAt": null, "usedBy": used_by, "internal": false, "missing": true }));
@@ -592,17 +653,18 @@ mod tests {
 
         let v2 = Vault::open(dir.clone(), false);
         assert!(v2.error.is_none());
-        assert_eq!(v2.get("API_TOKEN"), Some("tok-123456"));
+        assert_eq!(v2.get("API_TOKEN").as_deref().map(String::as_str), Some("tok-123456"));
+        assert!(!v2.values["API_TOKEN"].ct.windows(10).any(|w| w == b"tok-123456"), "sealed in memory");
 
         // rotation keeps values, changes shares
         let mut v3 = Vault::open(dir.clone(), false);
         v3.rotate().unwrap();
         assert_ne!(std::fs::read_to_string(dir.join("secrets.key")).unwrap(), a);
-        assert_eq!(Vault::open(dir.clone(), false).get("API_TOKEN"), Some("tok-123456"));
+        assert_eq!(Vault::open(dir.clone(), false).get("API_TOKEN").as_deref().map(String::as_str), Some("tok-123456"));
 
         assert!(v3.remove("API_TOKEN").unwrap());
         assert!(!v3.remove("API_TOKEN").unwrap());
-        assert_eq!(Vault::open(dir.clone(), false).get("API_TOKEN"), None);
+        assert!(Vault::open(dir.clone(), false).get("API_TOKEN").is_none());
         std::fs::remove_dir_all(dir).ok();
     }
 

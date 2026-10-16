@@ -11,6 +11,7 @@
 //!   from keys earlier in the file, then the given environment; unknown names become empty.
 //! - A value that is entirely `op://…` (after expansion) is a 1Password secret reference.
 //! - Duplicate keys: the last one wins.
+//! - `lstack://NAME` (LStack's own syntax, ignored by `op run`) points at a secret stored in LStack.
 
 /// One `KEY=value` from the file (after expansion), in file order, duplicates removed (last wins).
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +28,26 @@ impl Var {
     pub fn op_ref(&self) -> Option<&str> {
         is_op_ref(&self.value).then_some(self.value.as_str())
     }
+
+    /// The LStack secret name, when the whole value is `lstack://NAME`.
+    pub fn lstack_ref(&self) -> Option<&str> {
+        lstack_ref(&self.value)
+    }
+
+    /// Neither kind of reference: passed to the service as written.
+    pub fn is_plain(&self) -> bool {
+        self.op_ref().is_none() && self.lstack_ref().is_none()
+    }
+}
+
+pub const LSTACK_SCHEME: &str = "lstack://";
+
+/// `lstack://NAME` → `NAME` (letters, digits and `_`, not starting with a digit).
+pub fn lstack_ref(v: &str) -> Option<&str> {
+    let n = v.strip_prefix(LSTACK_SCHEME)?;
+    let mut cs = n.chars();
+    let first = cs.next()?;
+    ((first.is_ascii_alphabetic() || first == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_') && n.len() <= 128).then_some(n)
 }
 
 /// Vault, item and field names may contain spaces (`op://Home Automation/Mongo/password`), as `op run` allows.
@@ -152,7 +173,22 @@ fn var_at(c: &[char], vars: &[(String, String)], lookup: &dyn Fn(&str) -> Option
 
 /// Parse an env file. `lookup` supplies variables not defined earlier in the file.
 pub fn parse(src: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Var>, String> {
+    parse_spans(src, lookup).map(|(v, _)| v)
+}
+
+/// Where one assignment sits in the (`\r\n`-normalized) text, in chars: from the start of its line
+/// through its trailing newline. Duplicates each get one.
+#[derive(Debug, Clone, PartialEq)]
+struct Span {
+    key: String,
+    start: usize,
+    end: usize,
+    export: bool,
+}
+
+fn parse_spans(src: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<(Vec<Var>, Vec<Span>), String> {
     let src = src.replace("\r\n", "\n");
+    let mut spans: Vec<Span> = Vec::new();
     let mut p = P { c: src.chars().collect(), i: 0, line: 1, col: 1, lookup };
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut out: Vec<Var> = Vec::new();
@@ -171,6 +207,8 @@ pub fn parse(src: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<V
             break;
         }
         let line = p.line;
+        let start = p.c[..p.i].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+        let mut export = false;
         // Key, with an optional `export ` prefix.
         let mut key = String::new();
         while let Some(c) = p.peek() {
@@ -183,6 +221,7 @@ pub fn parse(src: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<V
         }
         if key == "export" && matches!(p.peek(), Some(' ' | '\t')) {
             p.skip_inline_space();
+            export = true;
             key.clear();
             while let Some(c) = p.peek() {
                 if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
@@ -275,10 +314,69 @@ pub fn parse(src: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<V
             }
         };
         vars.push((key.clone(), value.clone()));
+        let end = if p.peek() == Some('\n') { p.i + 1 } else { p.i };
+        spans.push(Span { key: key.clone(), start, end, export });
         out.retain(|v: &Var| v.key != key);
         out.push(Var { key, value, template, line });
     }
-    Ok(out)
+    Ok((out, spans))
+}
+
+/// How `value` is written so `parse` (and `op run`) read it back unchanged: bare when it's simple,
+/// else single-quoted (literal), else double-quoted with escapes.
+pub fn format_value(value: &str) -> String {
+    let bare = |c: char| c.is_ascii_alphanumeric() || "_-./:@,+%=~^!?*&<>|[]{}()".contains(c);
+    if !value.is_empty() && value.chars().all(bare) {
+        return value.to_string();
+    }
+    if !value.contains('\'') && !value.contains('\n') {
+        return format!("'{value}'");
+    }
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '$' => out.push_str("\\$"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `src` with `key` set to `value` (the last assignment rewritten in place, earlier duplicates
+/// dropped; appended when absent), or with every assignment of `key` removed (`value` = None).
+/// Comments, order and other lines stay as they are.
+pub fn edit(src: &str, key: &str, value: Option<&str>) -> Result<String, String> {
+    let crlf = src.contains("\r\n");
+    let norm = src.replace("\r\n", "\n");
+    let (_, spans) = parse_spans(&norm, &|_| None)?;
+    let chars: Vec<char> = norm.chars().collect();
+    let mine: Vec<&Span> = spans.iter().filter(|s| s.key == key).collect();
+    let line = |export: bool| value.map(|v| format!("{}{key}={}\n", if export { "export " } else { "" }, format_value(v)));
+    let mut out = String::new();
+    let mut i = 0;
+    for (n, s) in mine.iter().enumerate() {
+        out.extend(&chars[i..s.start]);
+        if n + 1 == mine.len() {
+            if let Some(l) = line(s.export) {
+                out.push_str(&l);
+            }
+        }
+        i = s.end;
+    }
+    out.extend(&chars[i..]);
+    if mine.is_empty() {
+        if let Some(l) = line(false) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&l);
+        }
+    }
+    Ok(if crlf { out.replace('\n', "\r\n") } else { out })
 }
 
 fn after_quote(p: &mut P) -> Result<(), String> {
@@ -357,6 +455,38 @@ mod tests {
         assert_eq!(get(&v, "M7"), "crlf");
         assert_eq!(get(&v, "M10"), "a=b=c");
         assert_eq!(get(&v, "M11"), "x");
+    }
+
+    #[test]
+    fn lstack_references() {
+        let v = parse("A=lstack://GH_TOKEN\nB=lstack://bad-name\nC=\"lstack://X1\"\nD=op://a/b/c\n", &env).unwrap();
+        let g = |k: &str| v.iter().find(|x| x.key == k).unwrap().clone();
+        assert_eq!(g("A").lstack_ref(), Some("GH_TOKEN"));
+        assert!(g("B").lstack_ref().is_none() && g("B").is_plain());
+        assert_eq!(g("C").lstack_ref(), Some("X1"));
+        assert!(!g("D").is_plain() && g("D").lstack_ref().is_none());
+        assert!(lstack_ref("lstack://9X").is_none() && lstack_ref("lstack://").is_none());
+    }
+
+    #[test]
+    fn edits_round_trip() {
+        let src = "# top\nA=1\nexport B=\"two\nlines\" # c\n\n# keep\nA=dup\nC='x'\n";
+        let e = edit(src, "A", Some("new value")).unwrap();
+        assert_eq!(e, "# top\nexport B=\"two\nlines\" # c\n\n# keep\nA='new value'\nC='x'\n");
+        let e = edit(&e, "B", Some("it's $HOME\nx")).unwrap();
+        assert!(e.contains("export B=\"it's \\$HOME\\nx\"\n"));
+        assert_eq!(get(&parse(&e, &env).unwrap(), "B"), "it's $HOME\nx");
+        let e = edit(&e, "D", Some("lstack://D")).unwrap();
+        assert!(e.ends_with("C='x'\nD=lstack://D\n"));
+        let e = edit(&e, "B", None).unwrap();
+        assert_eq!(e, "# top\n\n# keep\nA='new value'\nC='x'\nD=lstack://D\n");
+        assert_eq!(edit("X=1", "Y", Some("")).unwrap(), "X=1\nY=''\n");
+        assert_eq!(edit("X=1\r\nY=2\r\n", "X", Some("3")).unwrap(), "X=3\r\nY=2\r\n");
+        assert_eq!(edit("", "K", Some("v")).unwrap(), "K=v\n");
+        for v in ["plain", "with space", "q'uote", "back\\slash $X \"d\"", "", "a#b", "op://Home Vault/x/y"] {
+            let e = edit("", "K", Some(v)).unwrap();
+            assert_eq!(get(&parse(&e, &env).unwrap(), "K"), v, "{e}");
+        }
     }
 
     #[test]

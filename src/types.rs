@@ -150,6 +150,10 @@ pub struct ServiceConfig {
     /// into the secret store and injected through `secrets:`. Applies to every service type.
     #[serde(skip_serializing_if = "Option::is_none", default, deserialize_with = "string_or_vec")]
     pub env_files: Option<Vec<String>>,
+    /// Keys of `secrets:` that were approved from an `lstack://NAME` line in the env files; removing
+    /// the line stops passing the secret.
+    #[serde(skip_serializing_if = "Option::is_none", default, deserialize_with = "string_or_vec")]
+    pub file_secrets: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     /// Files sourced before the command (default: the shell's rc file, e.g. ~/.zshrc). `[]` = none.
@@ -224,7 +228,8 @@ pub struct ServiceUrl {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub via: Option<String>,
     /// Why it can't be opened from here as is: "paused" (its local forward is paused; resume it) or
-    /// "lan" (the other Mac's LAN address, but that Mac is reached over Tailscale).
+    /// "untunneled" (it's on another Mac that doesn't let this one tunnel to it; services on other Macs
+    /// are only reached through the encrypted link, never directly over the network).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub blocked: Option<String>,
 }
@@ -324,6 +329,15 @@ pub struct ServiceState {
     /// 1Password references in `envFiles` that changed since they were last approved (names and refs only).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub secrets_pending: Option<serde_json::Value>,
+    /// Plain env-file keys edited since the service started (a restart applies them).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub env_stale: Option<Vec<String>>,
+    /// Keys defined in the service's env files (names only).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub env_file_keys: Vec<String>,
+    /// A Touch ID approval this service is waiting on (its secrets are withheld until then).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval: Option<serde_json::Value>,
     pub config: ServiceConfig,
 }
 

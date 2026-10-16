@@ -152,9 +152,13 @@ struct PopoverView: View {
         let pending = store.pendingReviews.map(\.name)
         if store.connected, !pending.isEmpty, Set(pending) != hiddenReviews {
             Banner(icon: "key.horizontal.fill", tint: .blue,
-                   text: "1Password changes to review: \(pending.joined(separator: ", "))",
+                   text: "Env file secrets to review: \(pending.joined(separator: ", "))",
                    action: "Review…", perform: {
-                       openWindow(id: "op-review", value: pending[0])
+                       if let s = store.pendingReviews.first, s.secretsPending?.onlyStored == true {
+                           openWindow(id: "service", value: EditorTarget(service: s.name, tab: .environment))
+                       } else {
+                           openWindow(id: "op-review", value: pending[0])
+                       }
                        bringToFront()
                    },
                    dismiss: { hiddenReviews = Set(pending) },

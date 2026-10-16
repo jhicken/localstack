@@ -210,7 +210,19 @@ fn end_to_end() {
     assert_eq!(r["added"], json!(["later"]));
 
     // SSE events stream delivers a snapshot first
-    let resp = ureq::get(&format!("http://127.0.0.1:{}/api/events?token={}", d.port, d.token)).call().unwrap();
+    // The token is accepted only in the header; browsers (Origin) and foreign Host names are refused.
+    let url = |p: &str| format!("http://127.0.0.1:{}{p}", d.port);
+    let status = |r: Result<ureq::Response, ureq::Error>| match r {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(c, _)) => c,
+        Err(e) => panic!("{e}"),
+    };
+    let auth = format!("Bearer {}", d.token);
+    assert_eq!(status(ureq::get(&url(&format!("/api/services?token={}", d.token))).call()), 401);
+    assert_eq!(status(ureq::get(&url("/api/services")).set("Authorization", &auth).set("Origin", "https://evil.example").call()), 403);
+    assert_eq!(status(ureq::get(&url("/api/services")).set("Authorization", &auth).set("Host", "evil.example:7317").call()), 403);
+    assert_eq!(d.call("PUT", "/api/secrets/LSTACK_LINK_IDENTITY", Some(json!({ "value": "nope-nope" }))).unwrap_err().0, 403);
+    let resp = ureq::get(&url("/api/events")).set("Authorization", &auth).call().unwrap();
     let mut rd = std::io::BufReader::new(resp.into_reader());
     let mut buf = String::new();
     while !buf.contains("event: snapshot") {
@@ -275,13 +287,98 @@ fn secrets_are_write_only_injected_and_scrubbed() {
     wait_until("file rescrubbed", 5, || !std::fs::read_to_string(home.join("logs/early.log")).unwrap_or_default().contains("late-secret-42"));
 
     // Internal secrets can't be handed to services.
-    d.call("PUT", "/api/secrets/LSTACK_CMUX_PASSWORD", Some(json!({ "value": "internal-pw" }))).unwrap();
+    assert_eq!(d.call("PUT", "/api/secrets/LSTACK_CMUX_PASSWORD", Some(json!({ "value": "internal-pw" }))).unwrap_err().0, 403);
     d.post("/api/services", Some(json!({ "name": "sneaky", "type": "process", "restart": "never", "secrets": ["LSTACK_CMUX_PASSWORD"], "command": "env" }))).unwrap();
     let _ = d.post("/api/services/sneaky/start", None);
     assert!(d.svc("sneaky")["lastError"].as_str().unwrap_or("").contains("reserved"));
 
     d.call("DELETE", "/api/secrets/API_KEY", None).unwrap();
     assert_eq!(d.call("DELETE", "/api/secrets/API_KEY", None).unwrap_err().0, 404);
+}
+
+/// Touch ID approvals (the Secure Enclave key is simulated with a software P-256 key): once a key is
+/// registered, a service holding secrets gets them only for the configuration and values approved.
+#[test]
+fn approvals_gate_services_with_secrets() {
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+    let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let home = std::env::temp_dir().join(format!("lstack-it-approvals-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let d = Daemon::start(&home);
+    let sk = SigningKey::from_slice(&[9u8; 32]).unwrap();
+    let pk = hex(sk.verifying_key().to_sec1_point(false).as_bytes());
+    let sign = |k: &SigningKey, msg: &str| {
+        let s: Signature = k.sign(msg.as_bytes());
+        hex(s.to_der().as_bytes())
+    };
+    let approve = |id: &str| {
+        let a = d.get(&format!("/api/approvals/{id}")).unwrap();
+        d.post(&format!("/api/approvals/{id}"), Some(json!({ "signature": sign(&sk, a["message"].as_str().unwrap()) }))).unwrap()
+    };
+
+    d.call("PUT", "/api/secrets/API_KEY", Some(json!({ "value": "approved-value-1234" }))).unwrap();
+    d.post("/api/services?start=1", Some(json!({ "name": "api", "type": "process", "restart": "never", "secrets": ["API_KEY"],
+        "command": "echo run=one; cat" }))).unwrap();
+    wait_until("api running", 10, || d.svc("api")["status"] == "running");
+
+    // First registration approves what's there; registering again with another key needs the old one.
+    let r = d.post("/api/approvals/key", Some(json!({ "publicKey": pk }))).unwrap();
+    assert_eq!(r["enabled"], true);
+    assert_eq!(r["approved"], json!(["api"]));
+    let other = SigningKey::from_slice(&[3u8; 32]).unwrap();
+    let opk = hex(other.verifying_key().to_sec1_point(false).as_bytes());
+    assert_eq!(d.post("/api/approvals/key", Some(json!({ "publicKey": opk }))).unwrap_err().0, 409);
+    assert_eq!(d.post("/api/approvals/key", Some(json!({ "publicKey": opk, "signature": sign(&other, &format!("lstack-approval-rekey\n{opk}")) }))).unwrap_err().0, 403);
+    assert_eq!(d.call("PUT", "/api/secrets/LSTACK_APPROVALS", Some(json!({ "value": "{}" }))).unwrap_err().0, 403);
+    assert_eq!(d.call("DELETE", "/api/secrets/LSTACK_APPROVALS", None).unwrap_err().0, 403);
+
+    // An approved spec restarts with nobody there.
+    d.post("/api/services/api/restart", None).unwrap();
+    wait_until("api restarted", 10, || d.svc("api")["status"] == "running");
+
+    // Changing what it runs: the restart is refused (it keeps running as approved) until approved.
+    d.call("PATCH", "/api/services/api", Some(json!({ "command": "echo run=two; cat" }))).unwrap();
+    let st = d.post("/api/services/api/restart", None).unwrap();
+    assert_eq!(st["status"], "running", "{st}");
+    let ap = st["approval"].clone();
+    assert!(ap["summary"].to_string().contains("run=two"), "{ap}");
+    assert!(d.get("/api/approvals").unwrap()["pending"].to_string().contains(ap["id"].as_str().unwrap()));
+    let id = ap["id"].as_str().unwrap();
+    let bad = d.post(&format!("/api/approvals/{id}"), Some(json!({ "signature": sign(&other, "lstack-approval-v1\nx") }))).unwrap_err();
+    assert_eq!(bad.0, 403, "{bad:?}");
+    assert_eq!(approve(id)["status"], "approved");
+    d.post("/api/services/api/restart", None).unwrap();
+    wait_until("run=two", 10, || d.logs("api").contains("run=two"));
+
+    // A stopped service whose secret value changed doesn't start, then starts once approved.
+    d.post("/api/services/api/stop", None).unwrap();
+    d.call("PUT", "/api/secrets/API_KEY", Some(json!({ "value": "swapped-value-5678" }))).unwrap();
+    let _ = d.post("/api/services/api/start", None);
+    let st = d.svc("api");
+    assert_eq!(st["status"], "errored", "{st}");
+    assert!(st["lastError"].as_str().unwrap().contains("[approval:"), "{st}");
+    let ap = st["approval"].clone();
+    assert!(ap["summary"].to_string().contains("value of secret API_KEY changed"), "{ap}");
+    assert!(!ap.to_string().contains("swapped-value"), "{ap}");
+    approve(ap["id"].as_str().unwrap());
+    wait_until("api auto-started after approval", 10, || d.svc("api")["status"] == "running");
+
+    // Typing into it needs its own approval, then works for a while.
+    let (code, err) = d.post("/api/services/api/stdin", Some(json!({ "data": "hi\n" }))).unwrap_err();
+    assert_eq!(code, 428, "{err}");
+    let cid = err.split("[approval:").nth(1).unwrap().split(']').next().unwrap().to_string();
+    let p = d.post(&format!("/api/approvals/{cid}/deny"), None).unwrap();
+    assert_eq!(p["status"], "denied");
+    let (_, err) = d.post("/api/services/api/stdin", Some(json!({ "data": "hi\n" }))).unwrap_err();
+    let cid = err.split("[approval:").nth(1).unwrap().split(']').next().unwrap().to_string();
+    approve(&cid);
+    d.post("/api/services/api/stdin", Some(json!({ "data": "typed-line\n" }))).unwrap();
+    wait_until("stdin echoed", 10, || d.logs("api").contains("typed-line"));
+
+    // The audit log records answers, never values.
+    let audit = std::fs::read_to_string(home.join("secrets-audit.log")).unwrap();
+    assert!(audit.contains("approval-approved") && audit.contains("approval-denied") && !audit.contains("swapped-value"), "{audit}");
 }
 
 /// 1Password references in an env file: flagged for review, imported with values a client read (here
@@ -357,6 +454,74 @@ fn onepassword_env_file_import() {
     d.post("/api/services/api/stop", None).unwrap();
     let _ = d.post("/api/services/api/start", None);
     wait_until("start fails", 10, || d.svc("api")["lastError"].as_str().unwrap_or("").contains(".env.missing"));
+}
+
+/// The env file is the source of truth: plain edits flag a restart, Convert to Secret stores the
+/// value and writes `lstack://NAME`, and hand-written `lstack://` lines wait for approval.
+#[test]
+fn env_file_editing_and_lstack_secrets() {
+    let home = std::env::temp_dir().join(format!("lstack-it-env-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let d = Daemon::start(&home);
+    let app = home.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    let env = app.join(".env.lstack");
+    std::fs::write(&env, "# config\nPORT=3000\nAPI_KEY=sk-live-Zr8\n").unwrap();
+    d.post("/api/services", Some(json!({ "name": "web", "type": "process", "restart": "never", "cwd": app.to_string_lossy(),
+        "envFiles": [".env.lstack"], "command": "echo port=$PORT key=${API_KEY:-unset} gh=${GH:-unset}; sleep 60" }))).unwrap();
+
+    let pv = d.post("/api/env/preview", Some(json!({ "service": "web" }))).unwrap();
+    let vars = pv["vars"].as_array().unwrap();
+    assert_eq!(vars.len(), 2, "{pv}");
+    assert_eq!(vars[1]["kind"], "plain");
+    assert_eq!(vars[1]["value"], "sk-live-Zr8");
+    let folder = d.post("/api/env/preview", Some(json!({ "dir": app.to_string_lossy(), "files": [".env.lstack"] }))).unwrap();
+    assert_eq!(folder["vars"].as_array().unwrap().len(), 2);
+    wait_until("keys", 10, || d.svc("web")["envFileKeys"] == json!(["PORT", "API_KEY"]));
+
+    d.post("/api/services/web/start", None).unwrap();
+    wait_until("first run", 10, || d.logs("web").contains("port=3000 key=sk-live-Zr8"));
+
+    // A plain edit made outside LStack: flagged for a restart.
+    std::fs::write(&env, "# config\nPORT=4000\nAPI_KEY=sk-live-Zr8\n").unwrap();
+    wait_until("stale", 10, || d.svc("web")["envStale"] == json!(["PORT"]));
+    assert!(d.logs("web").contains("env file changed: PORT"));
+
+    // Convert to Secret: stored, the file now references it, and the service gets it on restart.
+    let r = d.post("/api/services/web/env", Some(json!({ "ops": [{ "op": "secret", "key": "API_KEY" }, { "op": "set", "key": "EXTRA", "value": "two words" }] }))).unwrap();
+    let text = std::fs::read_to_string(&env).unwrap();
+    assert_eq!(text, "# config\nPORT=4000\nAPI_KEY=lstack://API_KEY\nEXTRA='two words'\n");
+    let key = r["vars"].as_array().unwrap().iter().find(|v| v["key"] == "API_KEY").unwrap().clone();
+    assert_eq!(key["kind"], "lstack", "{r}");
+    assert_eq!(key["status"], "ok", "approved because it was converted here: {r}");
+    assert!(!r.to_string().contains("sk-live-Zr8"), "the value isn't shown any more");
+    assert_eq!(d.svc("web")["config"]["fileSecrets"], json!(["API_KEY"]));
+    d.post("/api/services/web/restart", None).unwrap();
+    wait_until("secret injected", 10, || d.logs("web").contains("port=4000 key=••••[API_KEY]"));
+    assert!(d.svc("web")["envStale"].is_null());
+
+    // A hand-written reference to a stored secret waits for approval.
+    d.call("PUT", "/api/secrets/GH_PAT", Some(json!({ "value": "ghp-abc-123" }))).unwrap();
+    std::fs::write(&env, format!("{text}GH=lstack://GH_PAT\n")).unwrap();
+    wait_until("link pending", 10, || d.svc("web")["secretsPending"]["link"] == json!(["GH"]));
+    d.post("/api/services/web/restart", None).unwrap();
+    wait_until("not yet", 10, || d.logs("web").contains("gh=unset") && d.logs("web").matches("port=4000").count() >= 2);
+    d.post("/api/services/web/env/approve", Some(json!({ "keys": ["GH"] }))).unwrap();
+    wait_until("approved", 10, || d.svc("web")["secretsPending"].is_null());
+    d.post("/api/services/web/restart", None).unwrap();
+    wait_until("linked", 10, || d.logs("web").contains("gh=••••[GH_PAT]"));
+
+    // Removing the line stops passing the secret (and keeps it stored for reuse).
+    d.post("/api/services/web/env", Some(json!({ "ops": [{ "op": "remove", "key": "GH" }] }))).unwrap();
+    assert!(!std::fs::read_to_string(&env).unwrap().contains("GH="));
+    assert_eq!(d.svc("web")["config"]["secrets"], json!({ "API_KEY": "API_KEY" }));
+    assert!(d.get("/api/secrets").unwrap().to_string().contains("GH_PAT"));
+
+    // Edits only touch the service's own env files.
+    let e = d.post("/api/services/web/env", Some(json!({ "ops": [{ "op": "set", "file": "../../etc/x", "key": "A", "value": "1" }] }))).unwrap_err();
+    assert_eq!(e.0, 400);
+    let audit = d.get("/api/onepassword/audit").unwrap().to_string();
+    assert!(audit.contains("env-edit") && !audit.contains("sk-live-Zr8") && !audit.contains("two words"), "{audit}");
 }
 
 /// A paired Mac receives a 1Password value only after it's shared with it, from the other Mac's store.
@@ -538,12 +703,25 @@ fn machines_pair_and_proxy() {
     assert_eq!(ms["local"]["local"], true);
     assert_eq!(ms["machines"][0]["name"], "studio");
 
+    // Without a tunnel grant the service is never offered directly over the network: no forward, URL flagged.
+    let id = peers[0]["id"].as_str().unwrap().to_string();
+    client.call("PATCH", &format!("/api/remote/peers/{id}"), Some(json!({ "tunnel": "none" }))).unwrap();
+    let web_url = || {
+        let v = host.get("/api/machines/studio").unwrap();
+        v["services"].as_array().unwrap().iter().find(|s| s["name"] == "web").map(|s| s["urls"][0].clone()).unwrap_or_default()
+    };
+    wait_until("untunneled url flagged", 30, || web_url()["blocked"] == "untunneled" && web_url()["via"].is_null());
+    assert!(host.get("/api/forwards").unwrap().as_array().unwrap().is_empty());
+    client.call("PATCH", &format!("/api/remote/peers/{id}"), Some(json!({ "tunnel": "all" }))).unwrap();
+    wait_until("forward back", 30, || forwarded().is_some());
+    // Machines are paired over the local network only, never through a VPN address.
+    assert_eq!(host.post("/api/machines", Some(json!({ "address": "100.101.102.103", "code": "AAAA-AAAA" }))).unwrap_err().0, 400);
+
     // Proxied logs and details over the link; control needs the control grant.
     assert!(host.get("/api/machines/studio/services/web").unwrap()["status"] == "running");
     assert!(host.get("/api/machines/studio/services/web/logs?tail=50").unwrap()["lines"].is_array());
     assert!(host.get("/api/machines/studio/services/web/metrics?range=5m").unwrap()["samples"].is_array());
     assert_eq!(host.post("/api/machines/studio/services/web/stop", None).unwrap_err().0, 403);
-    let id = peers[0]["id"].as_str().unwrap().to_string();
     client.call("PATCH", &format!("/api/remote/peers/{id}"), Some(json!({ "control": true }))).unwrap();
     wait_until("control granted", 20, || host.post("/api/machines/studio/services/web/stop", None).is_ok());
     wait_until("peer stop seen on host", 20, || {
@@ -582,104 +760,3 @@ fn machines_pair_and_proxy() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Both Macs on a fake tailnet (`tests/fake_tailnet.py` stands in for the Tailscale helper): upgrade with the other
-/// Mac turning Tailscale on and signing in, downgrades from either side, approval when auto-approve is off, and
-/// unpairing over the tailnet.
-#[test]
-fn tailscale_transport() {
-    // Short paths: unix socket paths are limited to 104 bytes.
-    let base = PathBuf::from(format!("/tmp/lsts-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_tailnet.py");
-    let env = |name: &str| {
-        vec![
-            ("LSTACK_TAILNET_BIN", fake.to_string_lossy().into_owned()),
-            ("FAKE_TAILNET_REGISTRY", base.join("reg").to_string_lossy().into_owned()),
-            ("LSTACK_TAILNET_HOSTNAME", name.to_string()),
-        ]
-    };
-    let host = Daemon::start_with(&base.join("h"), &env("lstack-host"));
-    let client = Daemon::start_with(&base.join("c"), &env("lstack-client"));
-    let lport = free_port();
-    client.call("PUT", "/api/remote", Some(json!({ "enabled": false, "sharing": true, "bind": "127.0.0.1", "linkPort": lport }))).unwrap();
-    let addr = format!("127.0.0.1:{lport}");
-    wait_until("link listener", 10, || std::net::TcpStream::connect(&addr).is_ok());
-    let code = client.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
-    host.post("/api/machines", Some(json!({ "address": addr, "code": code, "name": "studio" }))).unwrap();
-    let m = || host.get("/api/machines/studio").unwrap();
-    wait_until("link up", 30, || m()["status"] == "online");
-    assert_eq!(m()["transport"], "local");
-    assert_eq!(m()["via"]["kind"], "lan");
-
-    // Upgrading needs Tailscale here first; turning it on needs the exposure acknowledged.
-    let up = || host.post("/api/machines/studio/transport", Some(json!({ "transport": "tailscale" })));
-    assert_eq!(up().unwrap_err().0, 409);
-    assert_eq!(host.post("/api/tailnet", Some(json!({ "enabled": true }))).unwrap_err().0, 409);
-    host.post("/api/tailnet", Some(json!({ "enabled": true, "acknowledged": true }))).unwrap();
-    wait_until("helper needs login", 20, || host.get("/api/tailnet").unwrap()["phase"] == "needs-login");
-    assert!(host.get("/api/tailnet").unwrap()["authURL"].as_str().unwrap().starts_with("https://"));
-    host.post("/api/tailnet/login", Some(json!({}))).unwrap();
-    wait_until("helper running", 20, || host.get("/api/tailnet").unwrap()["phase"] == "running");
-    let addrs = host.get("/api/remote/addresses").unwrap();
-    assert!(addrs.as_array().unwrap().iter().any(|a| a["kind"] == "tailscale" && a["address"] == "lstack-host.fake.ts.net"), "{addrs}");
-
-    // Upgrade: the other Mac turns Tailscale on by itself (auto-approve), then waits for someone to sign in there.
-    up().unwrap();
-    wait_until("waiting for the other Mac to sign in", 30, || m()["transportChange"]["state"] == "waiting-login");
-    assert_eq!(client.get("/api/tailnet").unwrap()["enabled"], true);
-    client.post("/api/tailnet/login", Some(json!({}))).unwrap();
-    wait_until("switched to tailscale", 60, || {
-        let v = m();
-        v["transport"] == "tailscale" && v["via"]["kind"] == "tailscale" && v["status"] == "online" && v["transportChange"].is_null()
-    });
-    assert_eq!(m()["tailnetName"], "lstack-client.fake.ts.net");
-    let peer = || client.get("/api/remote/peers").unwrap()[0].clone();
-    wait_until("shared side sees the tailnet link", 10, || peer()["via"] == "tailscale");
-    assert_eq!(peer()["transport"], "tailscale");
-    assert_eq!(peer()["tailnet"]["tailnet"], "fake.ts.net");
-    assert!(std::fs::read_to_string(base.join("h/peers.json")).unwrap().contains("\"tailscale\""));
-    assert!(host.get("/api/machines/studio/services/nope").is_err_and(|e| e.0 == 404), "peer API works over the tailnet");
-
-    // The shared Mac moves it back to the local network on its own: the watcher follows.
-    let id = peer()["id"].as_str().unwrap().to_string();
-    client.post(&format!("/api/remote/peers/{id}/transport"), Some(json!({ "transport": "local" }))).unwrap();
-    wait_until("followed the shared Mac to the LAN", 30, || {
-        let v = m();
-        v["transport"] == "local" && v["via"]["kind"] == "lan" && v["status"] == "online"
-    });
-    // A Mac on the local transport isn't accepted over the tailnet.
-    let refused = client.get("/api/remote/activity").unwrap();
-    assert!(refused["events"].as_array().unwrap().iter().all(|e| e["event"] != "link-refused"), "{refused}");
-
-    // Upgrade again (both sides already signed in: no waiting), then downgrade from the watcher with approval.
-    up().unwrap();
-    wait_until("tailscale again", 60, || m()["transport"] == "tailscale" && m()["via"]["kind"] == "tailscale");
-    client.call("PUT", "/api/remote", Some(json!({ "autoApproveTransport": false }))).unwrap();
-    host.post("/api/machines/studio/transport", Some(json!({ "transport": "local" }))).unwrap();
-    wait_until("waiting for approval", 30, || m()["transportChange"]["state"] == "waiting-approval");
-    assert_eq!(m()["pendingTransport"], "local");
-    let rs = client.get("/api/remote").unwrap();
-    assert_eq!(rs["transportRequests"][0]["transport"], "local", "{rs}");
-    assert_eq!(peer()["transport"], "tailscale", "not applied before approval");
-    client.post(&format!("/api/remote/transport-requests/{id}/allow"), None).unwrap();
-    wait_until("approved downgrade applied", 30, || {
-        let v = m();
-        v["transport"] == "local" && v["pendingTransport"].is_null() && v["transportChange"].is_null() && v["status"] == "online"
-    });
-    assert_eq!(peer()["transport"], "local");
-    assert!(client.get("/api/remote").unwrap()["transportRequests"].as_array().unwrap().is_empty());
-
-    // Over Tailscale again, unpairing still tells the other Mac.
-    client.call("PUT", "/api/remote", Some(json!({ "autoApproveTransport": true }))).unwrap();
-    up().unwrap();
-    wait_until("tailscale for unpair", 60, || m()["transport"] == "tailscale" && m()["via"]["kind"] == "tailscale" && m()["status"] == "online");
-    let (ok, out) = host.cli(&["machine", "ls"]);
-    assert!(ok && out.contains("tailscale"), "{out}");
-    let (ok, out) = host.cli(&["tailnet", "status"]);
-    assert!(ok && out.contains("running") && out.contains("lstack-client.fake.ts.net"), "{out}");
-    host.call("DELETE", "/api/machines/studio", None).unwrap();
-    wait_until("client forgets the host", 15, || client.get("/api/remote/peers").unwrap().as_array().unwrap().is_empty());
-    drop(host);
-    drop(client);
-    let _ = std::fs::remove_dir_all(&base);
-}

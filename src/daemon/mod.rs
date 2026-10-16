@@ -1,4 +1,5 @@
 //! The long-running daemon (`lstack daemon run`), normally started by launchd at login.
+pub mod approvals;
 pub mod docker_api;
 pub mod envimport;
 mod drivers;
@@ -17,7 +18,6 @@ pub mod server;
 pub mod share;
 pub mod store;
 pub mod supervisor;
-pub mod tailnet;
 pub mod terminal;
 pub mod totp;
 
@@ -25,8 +25,29 @@ use crate::paths::{self, now_ms, VERSION};
 use crate::types::DaemonInfo;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
+
+/// The daemon holds the secret store: no core dumps, and no debugger attaching to read its memory
+/// (on top of the hardened runtime the app bundle is signed with).
+fn harden() {
+    let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
+        if std::env::var_os("LSTACK_ALLOW_DEBUGGER").is_none() {
+            const PT_DENY_ATTACH: libc::c_int = 31;
+            libc::ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// Port of this daemon's local API (set once it's bound). Tunnels from paired Macs may never reach it.
+static API_PORT: AtomicU16 = AtomicU16::new(0);
+
+pub fn api_port() -> u16 {
+    API_PORT.load(Ordering::Relaxed)
+}
 
 fn log(msg: &str) {
     println!("{} {}", paths::iso(now_ms()), crate::scrub::scrub(msg));
@@ -69,6 +90,7 @@ pub fn run() -> i32 {
 }
 
 async fn serve() -> i32 {
+    harden();
     if let Some(e) = secrets::init() {
         log(&format!("secret store: {e}"));
     }
@@ -79,6 +101,7 @@ async fn serve() -> i32 {
             return 1;
         }
     };
+    approvals::init(&sup);
     let base = paths::default_port();
     let mut bound = None;
     for port in base..base.saturating_add(10) {
@@ -91,6 +114,7 @@ async fn serve() -> i32 {
         log(&format!("could not bind 127.0.0.1:{base}-{}", base + 9));
         return 1;
     };
+    API_PORT.store(port, Ordering::Relaxed);
     let token = token();
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let remote = remote::Remote::new();
@@ -110,34 +134,19 @@ async fn serve() -> i32 {
     write_info(&info);
     log(&format!("lstack daemon v{VERSION} listening on 127.0.0.1:{port} (pid {})", info.pid));
     {
-        // Follow the Tailscale helper: reconnect machines once it's up, and have paired Macs update with it.
-        let (tn, peers) = (remote.tailnet.clone(), peers.clone());
-        let mut updated = tn.updated.subscribe();
+        // Redial machines that are down right after the Mac wakes up.
+        let peers = peers.clone();
         tokio::spawn(async move {
-            let mut was = false;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             // The monotonic clock stops while the Mac sleeps; the wall clock doesn't.
             let mut mono = std::time::Instant::now();
             let mut wall = now_ms();
             loop {
-                tokio::select! {
-                    v = updated.recv() => match v {
-                        Ok(v) => {
-                            let p = peers.clone();
-                            tokio::task::spawn_blocking(move || p.follow_helper_update(&v));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(_) => return,
-                    },
-                    _ = tick.tick() => {
-                        let now = tn.running();
-                        let slept = (now_ms() - wall) - mono.elapsed().as_millis() as i64 > 5_000;
-                        (mono, wall) = (std::time::Instant::now(), now_ms());
-                        if (now && !was) || slept {
-                            peers.reconnect_down();
-                        }
-                        was = now;
-                    }
+                tick.tick().await;
+                let slept = (now_ms() - wall) - mono.elapsed().as_millis() as i64 > 5_000;
+                (mono, wall) = (std::time::Instant::now(), now_ms());
+                if slept {
+                    peers.reconnect_down();
                 }
             }
         });

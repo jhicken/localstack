@@ -94,8 +94,11 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 | `op` runner | Checks the codesign AgileBits Team ID, runs with a minimal environment (token variables stripped), values over a pipe with zeroized buffers, a timeout, and `op signout` after each batch. |
 | Watcher | Checks file metadata every 2 s. New or changed references become `secretsPending` with a notification, and nothing is pulled. Removals apply automatically. Cached values nothing uses are garbage-collected, deferred until running users restart. Never opens FIFOs (Environment mounts). |
 | Environments | A mounted 1Password Environment (FIFO) is read by the client when you ask (`--environment`), with the values held by the daemon only until you confirm. |
+| LStack references | `KEY=lstack://NAME` in an env file uses a secret from LStack's store (`fileSecrets:` lists the keys the file manages). A hand-written line needs one approval; lines written by Convert to Secret, Use Stored Secret or `lstack env` are approved right away. Removed lines take effect at once. Plain-value changes on a running service raise a notification and an `envStale` badge until restart. |
 | Sharing | Cache-to-cache over the Noise link. Grants are per exact reference and per Mac. Only `op`/`op-env` values are sent, with no re-sharing. The receiver asks only on a user action (or `pullFromPeers`), accepts only references it waits for, binds each value to the sender's pinned key, and never overwrites a value holding a different reference. A received value reaches a service only after a confirmed import that names the sending Mac. Refresh pushes (`pushToPeers`) update only already-confirmed values from the same key. Both sides audit. `lstack secret shares/share/unshare/sync`. |
 | Audit | `secrets-audit.log` (0600, never values). |
+| Same-user hardening | API: header-only bearer (constant-time), refuses browser `Origin` and non-loopback `Host`, refuses `LSTACK_*` set/delete. Values sealed in memory under a per-boot mlock'd key; scrubber patterns sealed. No core dumps, `PT_DENY_ATTACH`, hardened runtime on ad-hoc builds. |
+| Touch ID approvals | Secure Enclave P-256 key (LStack.app, `.userPresence`), TOFU registration, rekey signed by the old key. Approved spec per secret-holding service (config minus cosmetic fields + grants with HMAC'd value digests) stored in the vault. `env_for` withholds secrets on mismatch; restart pre-checks so a running service isn't taken down; approve signs `lstack-approval-v1\nid\nchallenge\nsubject`. Console (stdin/exec) approvals last 10 min. Open without a Developer ID: Keychain share via `/usr/bin/security`, `ps eww`, `docker inspect`, service code edits, writable app bundle. |
 | To verify by hand | Approval prompts when `op` is spawned from LStack.app (no TTY), the number of prompts per batch, whether `op signout` ends the integration session, and Environment FIFO behavior when 1Password is locked. |
 
 ## Phase 2 — Daily-driver polish
@@ -149,12 +152,16 @@ One trustworthy place on your Mac to **define, start, watch, and talk to** every
 - [ ] Homebrew cask for the app (and a formula for CLI-only installs).
 - [ ] Universal (arm64 + x86_64) build via `lipo`.
 - [ ] Developer ID signing, notarization, and Sparkle auto-update for the app.
+- [ ] **Secret-store hardening that needs a Developer ID.** Today the app and daemon are signed ad hoc (no Team ID), which leaves two same-user gaps (README → "What approvals and the store can't stop"):
+  - **Keychain share readable via `/usr/bin/security`.** The vault key's Keychain half is created through `/usr/bin/security` so ad-hoc rebuilds don't re-prompt. As a result, its ACL trusts that tool, and any process running as you can read it. Together with the `0600` file share, that decrypts `secrets.enc` offline with no prompt, which bypasses Touch ID approvals completely. Fix: the signed daemon writes the item itself, using the Data Protection Keychain with a `keychain-access-groups` entitlement (`<TeamID>.dev.lstack`), so only LStack-signed code can read it. Migrate by re-wrapping the existing key share on first start. Optionally put the share behind a Secure Enclave key, so a copied file plus Keychain export isn't enough.
+  - **Approval key usable by any same-user process.** LStack.app's Secure Enclave key is stored as a CryptoKit `dataRepresentation` blob in `~/Library/Application Support/LStack/approval-key`. Copying the blob is harmless: it's wrapped by this Mac's Secure Enclave, and every signature needs Touch ID or the login password. But any process running as you can load the blob and trigger a Touch ID prompt with its own text (prompt phishing). Fix: store the key as a Keychain item (`kSecAttrTokenIDSecureEnclave`) in LStack's access group, so only LStack.app can use it. Re-register it with the daemon through the existing rekey flow (signed by the old key).
+  - Ship with a designated-requirement check: the daemon and app verify each other's Team ID (e.g. `SecCodeCheckValidity` on the connecting peer) before trusting the approval-key registration.
+  - Still out of scope even then: `ps eww` / `docker inspect`, edits to a service's own code, and a user-writable `/Applications/LStack.app`, which root ownership mitigates.
 - [ ] Unix domain socket transport (replaces TCP + token); keep the TCP API opt-in.
 - [ ] Import from PM2 `ecosystem.config.js`, Procfile, and existing compose files; `lstack export`.
 - [ ] Config profiles/workspaces (switch "client-A stack" vs "personal").
 - [ ] Linux support (systemd user units) since the daemon/CLI are portable.
-- [ ] Tailscale integration for machine links: tailnet discovery, several addresses per Mac, fast reconnect after wake or a network change, a Tailscale-only link bind, and an optional tailnet identity check. See [TAILSCALE.md](TAILSCALE.md).
-- [ ] Remote dashboard: built-in HTTPS (self-signed or user-supplied cert), multiple users/roles, an optional Tailscale-only bind, and log streaming for several services at once.
+- [ ] Remote dashboard: built-in HTTPS (self-signed or user-supplied cert), multiple users/roles, and log streaming for several services at once.
 
 ---
 

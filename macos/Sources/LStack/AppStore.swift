@@ -174,7 +174,7 @@ final class AppStore {
     @ObservationIgnored private var notificationsAsked = false
     @ObservationIgnored private let notificationRouter = NotificationRouter()
 
-    /// The daemon's notices (a paired Mac switched transport, asks to, or needs Tailscale signed in here).
+    /// The daemon's notices (e.g. 1Password changes to review, values shared by a paired Mac).
     private func notify(title: String, body: String, review: String? = nil) {
         // Notifications need a real app bundle (not `swift run`).
         guard Bundle.main.bundleIdentifier != nil, Bundle.main.bundleURL.pathExtension == "app" else {
@@ -232,6 +232,7 @@ final class AppStore {
             configErrors = snap.configErrors
             if let m = snap.machine { localName = m }
             for s in services where s.isRunning { Task { await loadHistory(s) } }
+            Task { await registerApprovals() }
             Task {
                 await loadSystem()
                 await refreshSettings()
@@ -249,17 +250,22 @@ final class AppStore {
             guard let e = try? dec.decode(PeerEvent.self, from: data) else { return }
             handlePeer(e.machine, e.event, e.data.data)
         case "notice":
-            struct Notice: Decodable { let title: String; let body: String }
+            struct Notice: Decodable { let title: String; let body: String; let approval: Approval? }
             guard let n = try? dec.decode(Notice.self, from: data) else { return }
+            if let a = n.approval {
+                if let client { Approver.shared.enqueue(a, client) }
+                return
+            }
             // "<service>: review 1Password changes for KEY, …"
             var review: String?
             if n.title == "1Password changes to review", let colon = n.body.range(of: ": review ") {
                 review = String(n.body[..<colon.lowerBound])
             }
             notify(title: n.title, body: n.body, review: review)
-            Task { await refreshRemote(); await refreshTailnet() }
+            Task { await refreshRemote() }
         case "service":
             guard let s = try? dec.decode(ServiceState.self, from: data) else { return }
+            if let a = s.approval, let client { Approver.shared.enqueue(a, client) }
             if let i = services.firstIndex(where: { $0.name == s.name }) {
                 var next = s
                 if next.metrics == nil, next.isRunning { next.metrics = services[i].metrics }
@@ -739,6 +745,9 @@ final class AppStore {
     // MARK: secrets (write-only: values go in, never come back out)
 
     var secrets: SecretsStatus?
+    /// Touch ID approvals (nil until registered with the daemon).
+    var approvals: ApprovalsStatus?
+    var approvalProblem: String?
 
     func refreshSecrets() async {
         secrets = try? await client?.send("GET", "/api/secrets", as: SecretsStatus.self)
@@ -790,6 +799,26 @@ final class AppStore {
     func opReview(_ service: String) async throws -> OPReview {
         guard let client else { throw DaemonError.notRunning }
         return try await client.send("GET", "/api/onepassword/review/\(service.urlPath)", as: OPReview.self)
+    }
+
+    /// Every variable in a service's env files (`files` overrides its list), or in a folder's.
+    func envPreview(service: String?, dir: String?, files: [String]) async throws -> EnvPreview {
+        var body: [String: Any] = ["files": files]
+        if let service { body["service"] = service }
+        if let dir { body["dir"] = dir }
+        return try JSONDecoder().decode(EnvPreview.self, from: await sendJSON("POST", "/api/env/preview", body))
+    }
+
+    /// Edit a service's env files: `set`, `remove`, `secret` (store in LStack) or `link` ops.
+    func envApply(_ service: String, _ ops: [[String: Any]]) async throws -> EnvPreview {
+        try JSONDecoder().decode(EnvPreview.self, from: await sendJSON("POST", "/api/services/\(service.urlPath)/env", ["ops": ops]))
+    }
+
+    /// Approve `lstack://` lines waiting for review (nil: all of them).
+    func envApprove(_ service: String, keys: [String]? = nil) async throws -> EnvPreview {
+        var body: [String: Any] = [:]
+        if let keys { body["keys"] = keys }
+        return try JSONDecoder().decode(EnvPreview.self, from: await sendJSON("POST", "/api/services/\(service.urlPath)/env/approve", body))
     }
 
     func opDetect(_ dir: String) async -> OPDetect? {
@@ -965,106 +994,13 @@ final class AppStore {
         } catch { return error.localizedDescription }
     }
 
-    // MARK: transports (LAN / Tailscale)
+    // MARK: network
 
-    var tailnet: TailnetStatus?
     var vpn: VpnStatus?
-
-    func refreshTailnet() async {
-        guard let client else { tailnet = nil; return }
-        tailnet = try? await client.send("GET", "/api/tailnet", as: TailnetStatus.self)
-    }
 
     func refreshNetwork() async {
         struct N: Decodable { let vpn: VpnStatus? }
         vpn = (try? await client?.send("GET", "/api/network", as: N.self))?.vpn
-    }
-
-    /// Turn Tailscale on/off (on needs `acknowledged` the first time) or change auto-update.
-    func setTailnet(enabled: Bool? = nil, acknowledged: Bool? = nil, autoUpdate: Bool? = nil) async -> String? {
-        var body: [String: Bool] = [:]
-        body["enabled"] = enabled
-        body["acknowledged"] = acknowledged
-        body["autoUpdate"] = autoUpdate
-        return await tailnetCall("POST", "/api/tailnet", body)
-    }
-
-    /// Sign in: with an auth key, or (none) get a login URL, which is opened in the browser.
-    func tailnetLogin(authKey: String? = nil) async -> String? {
-        var body: [String: String] = [:]
-        if let authKey, !authKey.isEmpty { body["authKey"] = authKey }
-        if let e = await tailnetCall("POST", "/api/tailnet/login", body) { return e }
-        if authKey?.isEmpty ?? true, let u = tailnet?.authURL, let url = URL(string: u), !u.isEmpty { NSWorkspace.shared.open(url) }
-        return nil
-    }
-
-    func tailnetLogout() async -> String? { await tailnetCall("POST", "/api/tailnet/logout", nil as [String: String]?) }
-
-    /// Check for a newer helper now. Returns an error, or a message about the result.
-    func tailnetUpdate() async -> (error: String?, message: String?) {
-        guard let client else { return (DaemonError.notRunning.localizedDescription, nil) }
-        struct R: Decodable { let updated: String? }
-        do {
-            let r = try await client.send("POST", "/api/tailnet/update", as: R.self)
-            await refreshTailnet()
-            return (nil, r.updated.map { "Updated the Tailscale helper to \($0); paired Macs are updated too." } ?? "The Tailscale helper is up to date.")
-        } catch { return (error.localizedDescription, nil) }
-    }
-
-    private func tailnetCall<B: Encodable>(_ method: String, _ path: String, _ body: B?) async -> String? {
-        guard let client else { return DaemonError.notRunning.localizedDescription }
-        do {
-            tailnet = try await client.send(method, path, body: body, as: TailnetStatus.self)
-            return nil
-        } catch {
-            await refreshTailnet()
-            return error.localizedDescription
-        }
-    }
-
-    enum TransportResult: Equatable {
-        case ok
-        case error(String)
-        /// Switching to the LAN, but it doesn't answer there right now.
-        case unreachable(String)
-    }
-
-    /// Move a machine's link to "local" or "tailscale" (`force`: even if it doesn't answer on the LAN).
-    func setTransport(_ machine: String, _ transport: String, force: Bool = false) async -> TransportResult {
-        guard let client else { return .error(DaemonError.notRunning.localizedDescription) }
-        struct Body: Encodable { let transport: String; let force: Bool }
-        do {
-            let m = try await client.send("POST", "/api/machines/\(machine.urlPath)/transport", body: Body(transport: transport, force: force), as: Machine.self)
-            if let i = machines.firstIndex(where: { $0.name == m.name }) {
-                var next = m
-                next.services = machines[i].services
-                next.processes = machines[i].processes
-                next.system = machines[i].system
-                machines[i] = next
-            }
-            return .ok
-        } catch DaemonError.http(409, let msg) where msg.hasSuffix("Switch anyway?") {
-            return .unreachable(msg)
-        } catch { return .error(error.localizedDescription) }
-    }
-
-    /// This Mac's side: allow or deny a paired Mac's transport request.
-    func decideTransport(_ peerId: String, allow: Bool) async -> String? {
-        guard let client else { return DaemonError.notRunning.localizedDescription }
-        do {
-            _ = try await client.send("POST", "/api/remote/transport-requests/\(peerId.urlPath)/\(allow ? "allow" : "deny")", as: EmptyResponse.self)
-            await refreshRemote()
-            return nil
-        } catch { return error.localizedDescription }
-    }
-
-    /// This Mac's side: change how a paired Mac connects (it follows).
-    func setPeerTransport(_ peerId: String, _ transport: String) async -> String? {
-        guard let client else { return DaemonError.notRunning.localizedDescription }
-        do {
-            _ = try await client.send("POST", "/api/remote/peers/\(peerId.urlPath)/transport", body: ["transport": transport], as: EmptyResponse.self)
-            return nil
-        } catch { return error.localizedDescription }
     }
 
     func revokePeer(_ id: String) async -> String? {
@@ -1096,6 +1032,12 @@ final class AppStore {
         let q = before.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? before
         guard let client else { throw URLError(.notConnectedToInternet) }
         return try await client.send("GET", "\(Self.path(name: name, machine: machine))/logs?tail=\(count)&before=\(q)", as: R.self).lines
+    }
+
+    func registerApprovals() async {
+        guard let client else { return }
+        approvals = await Approver.shared.register(client)
+        approvalProblem = Approver.shared.problem
     }
 
     func sendInput(_ name: String, _ text: String) {

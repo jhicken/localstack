@@ -147,7 +147,7 @@ Then open `http://127.0.0.1:7380` (or `http://<this-mac>:7380` from another devi
 - **Login throttling.** Each failed login is delayed. After 5 failures from one IP, that IP is locked out for 5 minutes.
 - **Controls.** Start/stop/restart buttons appear only when **Allow start / stop / restart** is enabled (`--allow-control`, the default). Use `--read-only` for view-only access.
 - **Secrets.** Environment variable values are redacted (`••••`). Responses send a strict CSP, `X-Frame-Options: DENY` and CSRF header checks.
-- **Plain HTTP.** Use it on a trusted network, or over a VPN such as Tailscale. macOS may ask you once to allow incoming connections.
+- **Plain HTTP.** Use it on a trusted network only. macOS may ask you once to allow incoming connections.
 
 ## Secrets
 
@@ -165,15 +165,50 @@ secrets: [GITHUB_TOKEN, NPM_TOKEN]       # env var = secret name
 secrets: { GH_TOKEN: GITHUB_TOKEN }      # or rename: ENV_VAR: SECRET_NAME
 ```
 
-In the app, secrets live with the service that uses them: open a service's **⋯ → Environment Variables…** (or click its environment chips) to see its env files and add or remove plain variables and secrets in one list. A secret you stored for one service can be picked for another with **Use Stored Secret**. **Settings → Secrets** keeps the store itself (lock state, key rotation) and a collapsed **Stored secrets** list for adding, replacing or deleting values directly.
+The usual place for a service's variables is its env file (`envFiles:`; `lstack add` picks up the folder's `.env.lstack`). A line can hold a plain value, a 1Password reference (`op://…`) or a secret stored in LStack, written `KEY=lstack://NAME`:
+
+```sh
+lstack env api                          # every variable in api's env files (plain values: --values)
+lstack env api set PORT=3000            # edit the file (--file picks one of several)
+lstack env api secret DB_PASSWORD       # store the file's current value in LStack; the line becomes lstack://DB_PASSWORD
+lstack env api link GH_TOKEN GITHUB_TOKEN   # use a secret that's already stored
+lstack env api approve                  # approve lstack:// lines you wrote by hand
+```
+
+A `lstack://` line you type into a file yourself needs one approval (in the app or with `lstack env … approve`), so a cloned repo's `.env` can't pull your stored tokens. Lines written by **Convert to Secret**, **Use Stored Secret** or `lstack env` are approved right away. When you edit an env file while its service is running, LStack tells you which keys changed (a notification, an **Env changed** badge and a log line) and applies them on the next restart.
+
+In the app, secrets live with the service that uses them: open a service's **⋯ → Environment Variables…** (or click its environment chips) to see its env files and every variable in them. You can switch or add env files, edit or remove values, and use the lock button (**Convert to Secret**) to move a plain value into the store so it's hidden from then on. A secret you stored for one service can be picked for another with **Use Stored Secret**. Variables set in the service's YAML (`env:`/`secrets:`) show up under **Set in the service definition** only when there are any. **Settings → Secrets** keeps the store itself (lock state, key rotation) and a collapsed **Stored secrets** list for adding, replacing or deleting values directly.
 
 - **At rest.** Secrets are encrypted with ChaCha20-Poly1305 in `secrets.enc`. The 256-bit key is never stored whole. It is split into two XOR shares: one is a Keychain item (`dev.lstack.secrets`, created via `/usr/bin/security` so app updates don't cause new prompts), the other a `0600` file. The daemon reads the Keychain once at boot and keeps the key only in memory, zeroed when dropped. If the Keychain is locked, the store stays locked: services that need secrets fail with a clear error, and `lstack secret unlock` (or **Unlock** in Settings) retries.
 - **Logs are scrubbed.** Every secret value, plus its base64, URL-encoded and hex forms, is replaced with `••••[NAME]`. This applies to log files, live streams, the TUI and web views, crash messages, heartbeat `/fail` bodies, logs sent to other machines and `lstack exec` sessions. The daemon runs `docker exec` on a pseudo-terminal and scrubs the output before it reaches your terminal. Existing log files are scrubbed again when you add a secret. To do this the scrubber keeps those forms in memory; old copies are zeroed whenever the secrets change.
+- **In memory.** The daemon keeps every value sealed (ChaCha20-Poly1305) under a random key made at each start, held in locked memory that's never swapped. A value is opened only for the moment it's needed: starting a service, sending to a paired Mac you shared it with, or writing `secrets.enc`. The scrubber's patterns are one sealed blob, opened per scrub. Nothing changed on disk, so the store still unlocks at boot with nobody there. The daemon also turns off core dumps and refuses debuggers (`PT_DENY_ATTACH`). The app is built with the hardened runtime, even when ad-hoc signed.
 - **Only on this Mac.** Secrets can't be set or read over the remote dashboard or by other machines.
+- **The local API.** It accepts the token only in an `Authorization` header (never in a URL), compared in constant time. It refuses requests that carry a browser `Origin` or a non-loopback `Host`, so a web page can't drive it even through DNS rebinding. `LSTACK_*` names can't be set or deleted through it.
 - **Limitations.**
   - Docker stores container env, so anyone with Docker access can see it via `docker inspect`. A container keeps its old env until it is recreated.
   - A secret embedded in a larger string and then base64-encoded isn't scrubbed.
   - In `lstack exec`, a secret printed one character at a time can show its first two characters before the rest is masked, and any of it can show if the pauses are longer than 0.3 s. Running `docker exec` directly bypasses LStack entirely.
+
+### Touch ID approvals
+
+Anything that can run as you can read LStack's token from `daemon.json` and use the API. Without approvals, that's enough to point a service that holds secrets at a script that sends them somewhere. With approvals on, **a service holding secrets gets them only for a configuration and values you approved with Touch ID on this Mac**. Restarts of an approved service never need anyone.
+
+- **The key.** LStack.app creates a P-256 key inside the Secure Enclave that signs only after Touch ID (or your login password). The private key never leaves the chip; `~/Library/Application Support/LStack/approval-key` is an encrypted handle only this Mac's Secure Enclave can use. The app registers its public key with the daemon on launch. That turns approvals on, and approves every current service as it is. **Settings → Secrets** shows the status.
+- **What's approved.** For each service with secrets: its configuration (command, image, cwd, env, env files, ports, …; not cosmetic fields like description, tags or restart policy) plus, for each secret it gets, the name, source, 1Password reference and a keyed digest of the value. The approved state is stored inside the encrypted store, so it can't be edited on disk, and the API refuses to touch it. Values received from a paired Mac are approved by that Mac's pinned key instead, so its refreshes don't ask again.
+- **When something changes.** If an edited YAML file, an API call, an import or a swapped value changes any of that, a running service keeps running as approved, and a restart or start is held back. LStack.app shows what changed (for example `command: npm start → curl … | sh`, `now gets BANK ← secret BANK from 1Password op://Private/…`, `the value of secret DB changed`). **Approve with Touch ID…** signs the request and the service starts; **Deny** leaves it stopped. The CLI waits: `lstack start`/`restart` print what changed, open LStack.app and continue once you approve.
+- **Consoles.** Typing into a service that holds secrets (`lstack attach`, the app's input field) or `lstack exec` into one needs its own approval, which lasts 10 minutes.
+- **Replacing the key.** A different key is accepted only with a signature from the registered one. If you lose the key (new Mac, deleted file), approvals can't be answered: run `lstack daemon stop`, move `~/.localstack/secrets.*` aside, start again and set your secrets again (1Password ones: `lstack secret import`).
+- **Remote.** Approval details never leave this Mac; the remote dashboard and paired Macs only see that one is pending.
+
+#### What approvals and the store can't stop
+
+These need something LStack doesn't have, or are outside what it controls:
+
+- **The Keychain share.** LStack is signed ad hoc (no Apple Developer ID), so its Keychain item trusts `/usr/bin/security`. Malware running as you can read that share plus the `0600` file and decrypt `secrets.enc` offline, with no prompt. A Developer ID signature would let the item trust only LStack.
+- **A running service's environment.** A process running as you can read another's environment (`ps eww <pid>`), and Docker records container env (`docker inspect`).
+- **A service's own code.** Approvals cover LStack's configuration, not what's in the service's folder. Malware that edits `~/code/api/server.js` gets that service's secrets at its next restart.
+- **The app itself.** `/Applications/LStack.app` is writable by you, so malware could replace it. Owning it by root (`sudo chown -R root:wheel /Applications/LStack.app`) stops that; updates then need `sudo`.
+- **Prompt phishing.** Malware can ask the Secure Enclave to use the key, which shows a Touch ID prompt with its own text. The system names the app asking; approve only prompts that LStack.app shows after its own dialog.
 
 ### 1Password
 
@@ -207,7 +242,7 @@ secrets: { DATABASE_URL: DATABASE_URL }   # written by `secret import`: what you
 ```
 
 - **`.env.lstack`.** Give a project a `.env.lstack` to describe what LStack should inject (plain values and `op://` references) without touching the app's own `.env`. `lstack add` looks for it in the service's folder: on a terminal it asks which file to use (`.env.lstack` by default, any other `.env*` in the folder, or none); otherwise (or with `-y`) it uses `.env.lstack` and says so. `--env-file` picks files explicitly and `--no-env-file` skips them. The app's **Add Service** window preselects it the same way.
-- **In the app.** A service's **Environment Variables…** view lists its env files (with the keys each one sets), its variables and secrets, and its 1Password references with **Review & Pull**, **Link Reference…** and **Import Environment…** for that service.
+- **In the app.** A service's **Environment Variables…** view lists its env files (with the keys each one sets), and every variable in them, including `op://` references with their status and **Review & Pull…** when there's something to pull. To add a reference, put an `op://` line in the env file. A mounted 1Password Environment is imported with `lstack secret import --environment`.
 - **What a service gets.** Plain values come from the env files, read at each start, and they override `env:` like `op run` does. For `op://` lines, a service gets only what you approved, stored in its `secrets:` map with the reference recorded next to each stored value. References are never read from the file at runtime. If someone edits the `.env` to point a key at another secret, nothing changes until you review and import it.
 - **Watching.** LStack checks imported env files every 2 s, using metadata only until something changes. New or changed references show as **1Password changes to review** in `lstack ls`, the service view, the menu bar and a notification. Until you import them, the service keeps starting with what you last approved, and new keys aren't set. It never pulls by itself. A removed line stops being passed right away (`autoApplyRemovals`), and the cached value is deleted once no running service uses it.
 - **What the review flags.** It shows warnings for a vault you haven't imported from before, for Private/Personal/Employee vaults, and for vaults outside `onepassword.allowedVaults`. It refuses `LSTACK_*` keys, TOTP (`?attribute=otp`), references with unset `$VARS`, and references hiding control, zero-width or bidi characters. `$VARS` come from earlier lines, the service's `env:`, and only `HOME`, `USER` and `LOGNAME` from LStack's own environment. It warns about `{{ op://… }}` (that's `op inject` syntax, which `op run` passes as written).
@@ -291,7 +326,6 @@ lstack ps --machine studio
 lstack forwards                   # paired Macs' services forwarded to localhost
 lstack forwards pause web@studio  # or resume
 lstack machine rename studio mini
-lstack machine transport studio tailscale   # or local; needs `lstack tailnet on` + sign-in first
 lstack machine rm mini            # unpair: mini forgets this Mac too
 
 # on the watched Mac
@@ -307,7 +341,8 @@ lstack remote activity            # links, pairings, tunnels and refusals
 - **Forwards.** Forwards appear only for granted services and only for ports that service is listening on *right now*. The watched Mac checks this again for every connection, so another program sitting on a stopped service's port is refused. It only ever connects to its own loopback. On this Mac, forwards listen only on 127.0.0.1/::1 and keep the same port number when it's free (otherwise a remembered fallback, saved in `forwards.json`). Each connection must come from a process owned by your macOS user.
 - **Unpairing is mutual.** Removing a machine on either Mac (`machine rm`, `remote revoke`, or the Remove/Revoke buttons) tells the other Mac over the link, and it forgets the pairing too. If the other Mac is offline, it's told the next time either side can reach the other.
 - **Addresses.** Pair with an IP address or a name: router DNS names such as `studio.lan` and Bonjour `studio.local` keep working when the IP changes. **Settings → Machines → Share this Mac → Show this Mac as** (or `lstack remote address`) lists the names that lead to this Mac and lets you choose the one shown with the pairing code.
-- **Tailscale (optional).** To reach paired Macs away from home, turn on **Settings → Machines → Tailscale** (or `lstack tailnet on`). LStack downloads its own signed, userspace Tailscale helper (no VPN or admin rights; nothing is downloaded until you turn it on) and you sign in once. Then **Use Tailscale** on a machine (or `lstack machine transport studio tailscale`). The other Mac turns Tailscale on by itself; it auto-approves switches between LAN and Tailscale unless you turn that off. The same encrypted link runs inside Tailscale, and **Use Local Network** switches back after checking the Mac answers on the LAN. The helper updates daily and paired Macs follow. See [docs/TAILSCALE.md](docs/TAILSCALE.md).
+- **Forwards are the only way in.** A paired Mac's services are never offered at its network address: the app, web dashboard, CLI and TUI only open them through their local forward. A service you're not allowed to tunnel to has no link (the CLI marks it `no tunnel`).
+- **Local network only.** Paired Macs connect directly, LStack daemon to LStack daemon, over the local network. There's no relay, VPN integration or helper process in the path.
 - **Secrets stay put unless you share them.** Secret values are never sent, except 1Password-sourced values you explicitly share with a specific Mac (see [1Password](#1password)). Env values and ping URLs are redacted, and logs are scrubbed on the watched Mac before they're sent.
 - **Upgrading from an older LStack.** Old pairings used bearer tokens over plain HTTP and are no longer accepted. They show as **pair again**: get a new code on the other Mac and pair again; the name is kept.
 
@@ -331,9 +366,11 @@ Each LStack install has its own X25519 key pair. The private key is kept in the 
 | Another app running as you | Can use forwards, just like your browser can (same trust as your user) |
 | A compromised paired Mac | Limited to its grants: granted services' own ports on the loopback, and the exact 1Password references shared with it; audited and revocable |
 
-- **Over Tailscale.** A Mac on the Local transport is accepted only from this Mac's own LAN subnets (not VPN subnets or the tailnet). A Mac on the Tailscale transport is also accepted through the helper, and only from the tailnet it switched on. The Noise keys still authorize every link.
+- **Daemon to daemon.** Each end of the link is the LStack daemon itself: it dials or accepts the TCP connection, runs the Noise handshake and holds the keys in its own (debugger-protected, no-core-dump) process. No other process ever sees plaintext, so values shared between Macs (such as 1Password secrets) are decrypted only inside the receiving daemon.
+- **Local network only.** Pairings and links are accepted only from this Mac's own LAN subnets (and loopback), never from VPN or overlay ranges such as Tailscale's 100.64.0.0/10; pairing with such an address is refused. The Noise keys still authorize every link.
+- **Tunnels end on the service.** A tunnel stream reaches only a granted service's own listening port on the loopback, never LStack's own ports (its API, web dashboard or link port).
 
-Not supported: reverse tunnels, UDP, and LStack's own relays or NAT traversal (the Tailscale transport covers reaching Macs elsewhere).
+Not supported: reverse tunnels, UDP, relays, NAT traversal or VPN transports. Paired Macs must be on the same local network.
 
 **Future: screen sharing.** The link's typed streams are built so that screen sharing can be added later as two more stream kinds, each with its own grant and a consent prompt on the shared Mac: `screen` (ScreenCaptureKit capture, VideoToolbox H.264/HEVC frames) and `input` (CGEvent injection; needs Accessibility). Those frames would use the same Noise link with no extra crypto. This isn't implemented yet.
 
@@ -415,7 +452,7 @@ autostart: true
 - **Crash loops.** Crashed scripts restart with exponential backoff (1 s → 30 s, up to `maxRestarts`). While a script waits to restart, the menu bar shows **RESTART IN Ns** with a red stop button. `lstack ls` and `lstack top` show `restarting Ns`. Stopping it cancels the pending restart, and stop waits for a start that's already in progress.
 - **Terminal app.** Dashboard, Attach and Shell open in the app chosen under **Settings → Terminal app** (or `lstack terminal <id>`): Terminal, iTerm, cmux or Ghostty. macOS asks once to allow LStack to control iTerm or Terminal.
 - **cmux.** By default, cmux only accepts commands from processes started inside cmux, so the daemon gets "Access denied". When that happens, the menu bar offers **Allow LStack** or **Use Terminal**. You'll find the same switch under **Settings → cmux access**, and in the CLI as `lstack terminal cmux --fix`. Allowing it backs up `~/.config/cmux/cmux.json`, switches `automation.socketControlMode` to `password` with a random password kept in LStack's secret store, and reloads cmux. You can change or undo this anytime in cmux's settings.
-- The API binds to 127.0.0.1 only and requires the token in `daemon.json`.
+- The API binds to 127.0.0.1 only and requires the token in `daemon.json`, sent as `Authorization: Bearer`. Debugging the daemon needs `LSTACK_ALLOW_DEBUGGER=1`.
 
 ## Development
 

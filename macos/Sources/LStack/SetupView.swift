@@ -265,7 +265,7 @@ struct SetupView: View {
         let detail: String
         let can = "view status, metrics and logs\(r?.allowControl == true ? " and start/stop services" : " (read-only)")"
         if let r, r.running, on, r.webRemote == true {
-            detail = "Anyone on your network who signs in as **\(r.username)** can \(can). Plain HTTP — use on a trusted network or a VPN like Tailscale."
+            detail = "Anyone on your network who signs in as **\(r.username)** can \(can). Plain HTTP — use on a trusted network only."
         } else if let r, r.running, on {
             detail = "Only this Mac can open it. Sign in as **\(r.username)** to \(can)."
         } else if on, let e = r?.error {

@@ -1,13 +1,86 @@
 //! Redacts secret values from any text before it is stored or shown (logs, errors, API output).
 //! The patterns are registered by the secret store; every encoding a value commonly leaks in
 //! (raw, base64, base64url, percent-encoded, hex) is matched.
+//!
+//! The patterns are kept encrypted in memory (one blob, ChaCha20-Poly1305 under a random key in locked
+//! memory) and opened only for the length of a scrub, then wiped.
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use std::borrow::Cow;
 use std::sync::RwLock;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Values shorter than this are not scrubbed (too likely to match ordinary text).
 pub const MIN_LEN: usize = 4;
 
-static PATTERNS: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+struct SealedPatterns {
+    key: Box<[u8; 32]>,
+    nonce: [u8; 12],
+    ct: Vec<u8>,
+    /// (offset, length, mask) per pattern in the opened blob, longest first. Lengths and names aren't secret.
+    index: Vec<(usize, usize, String)>,
+}
+
+impl Drop for SealedPatterns {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        unsafe { libc::munlock(self.key.as_ptr() as *const libc::c_void, 32) };
+    }
+}
+
+impl SealedPatterns {
+    fn seal(pats: Vec<(Zeroizing<String>, String)>) -> Option<SealedPatterns> {
+        if pats.is_empty() {
+            return None;
+        }
+        let mut key = Box::new([0u8; 32]);
+        unsafe { libc::mlock(key.as_ptr() as *const libc::c_void, 32) };
+        fill_random(&mut key[..]);
+        let mut nonce = [0u8; 12];
+        fill_random(&mut nonce);
+        let mut blob = Zeroizing::new(Vec::with_capacity(pats.iter().map(|(p, _)| p.len()).sum()));
+        let mut index = Vec::with_capacity(pats.len());
+        for (p, m) in pats {
+            index.push((blob.len(), p.len(), m));
+            blob.extend_from_slice(p.as_bytes());
+        }
+        let ct = ChaCha20Poly1305::new_from_slice(&key[..]).ok()?.encrypt(Nonce::from_slice(&nonce), Payload { msg: &blob, aad: b"scrub" }).ok()?;
+        Some(SealedPatterns { key, nonce, ct, index })
+    }
+
+    fn open(&self) -> Opened<'_> {
+        let blob = ChaCha20Poly1305::new_from_slice(&self.key[..])
+            .ok()
+            .and_then(|c| c.decrypt(Nonce::from_slice(&self.nonce), Payload { msg: &self.ct, aad: b"scrub" }).ok())
+            .unwrap_or_default();
+        Opened { blob: Zeroizing::new(blob), index: &self.index }
+    }
+
+    fn max_len(&self) -> usize {
+        self.index.iter().map(|(_, l, _)| *l).max().unwrap_or(0)
+    }
+}
+
+/// The patterns in plaintext, for one scrub; wiped when dropped.
+struct Opened<'a> {
+    blob: Zeroizing<Vec<u8>>,
+    index: &'a [(usize, usize, String)],
+}
+
+impl Opened<'_> {
+    fn iter(&self) -> impl Iterator<Item = (&[u8], &str)> {
+        self.index.iter().filter_map(|(o, l, m)| self.blob.get(*o..o + l).map(|p| (p, m.as_str())))
+    }
+}
+
+fn fill_random(buf: &mut [u8]) {
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(buf);
+    }
+}
+
+static PATTERNS: RwLock<Option<SealedPatterns>> = RwLock::new(None);
 
 pub fn mask(name: &str) -> String {
     format!("••••[{name}]")
@@ -70,33 +143,35 @@ pub fn variants(value: &str) -> Vec<String> {
 }
 
 /// Replace the registered set of secrets: (name, value).
-pub fn set_secrets<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) {
-    let mut pats: Vec<(String, String)> = secrets
+pub fn set_secrets<'a, S: AsRef<str> + 'a>(secrets: impl IntoIterator<Item = (&'a str, S)>) {
+    let mut pats: Vec<(Zeroizing<String>, String)> = secrets
         .into_iter()
-        .filter(|(_, v)| v.len() >= MIN_LEN)
-        .flat_map(|(n, v)| variants(v).into_iter().map(move |p| (p, mask(n))))
+        .filter(|(_, v)| v.as_ref().len() >= MIN_LEN)
+        .flat_map(|(n, v)| variants(v.as_ref()).into_iter().map(move |p| (Zeroizing::new(p), mask(n))))
         .collect();
     // Longest first, so a value that contains another secret is masked as a whole.
     pats.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-    let mut old = std::mem::replace(&mut *PATTERNS.write().unwrap_or_else(|e| e.into_inner()), pats);
-    for (p, _) in old.iter_mut() {
-        zeroize::Zeroize::zeroize(p);
-    }
+    let sealed = SealedPatterns::seal(pats);
+    *PATTERNS.write().unwrap_or_else(|e| e.into_inner()) = sealed;
 }
 
 pub fn active() -> bool {
-    !PATTERNS.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+    PATTERNS.read().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 pub fn scrub(text: &str) -> Cow<'_, str> {
-    let pats = PATTERNS.read().unwrap_or_else(|e| e.into_inner());
-    if pats.is_empty() || text.len() < MIN_LEN {
+    let g = PATTERNS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(sealed) = g.as_ref().filter(|_| text.len() >= MIN_LEN) else {
         return Cow::Borrowed(text);
-    }
+    };
+    let pats = sealed.open();
     let mut out: Cow<str> = Cow::Borrowed(text);
     for (p, m) in pats.iter() {
-        if out.contains(p.as_str()) {
-            out = Cow::Owned(out.replace(p.as_str(), m));
+        let Ok(p) = std::str::from_utf8(p) else { continue };
+        if out.contains(p) {
+            let mut old = out.into_owned();
+            out = Cow::Owned(old.replace(p, m));
+            old.zeroize();
         }
     }
     out
@@ -133,10 +208,11 @@ fn replace_bytes(hay: &[u8], pat: &[u8], with: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Byte-level `scrub` (terminal output isn't guaranteed to be UTF-8 at chunk boundaries).
-fn scrub_bytes_with(pats: &[(String, String)], data: &[u8]) -> Vec<u8> {
+fn scrub_bytes_with(pats: &Opened, data: &[u8]) -> Vec<u8> {
     let mut out = data.to_vec();
-    for (p, m) in pats {
-        if let Some(r) = replace_bytes(&out, p.as_bytes(), m.as_bytes()) {
+    for (p, m) in pats.iter() {
+        if let Some(r) = replace_bytes(&out, p, m.as_bytes()) {
+            out.zeroize();
             out = r;
         }
     }
@@ -145,10 +221,9 @@ fn scrub_bytes_with(pats: &[(String, String)], data: &[u8]) -> Vec<u8> {
 
 /// Length of the longest suffix of `data` that is the start of a secret (in any encoding), i.e.
 /// bytes that must not be shown yet because the rest of the secret may still be on its way.
-fn pending_prefix(pats: &[(String, String)], data: &[u8]) -> usize {
+fn pending_prefix(pats: &Opened, data: &[u8]) -> usize {
     let mut best = 0;
-    for (p, _) in pats {
-        let p = p.as_bytes();
+    for (p, _) in pats.iter() {
         for n in (best + 1..p.len().min(data.len() + 1)).rev() {
             if data[data.len() - n..] == p[..n] {
                 best = n;
@@ -161,9 +236,8 @@ fn pending_prefix(pats: &[(String, String)], data: &[u8]) -> usize {
 
 /// A secret whose first bytes were already shown (`shown` ends with them) and whose rest starts
 /// `held`: mask the rest, so at most those first bytes leak.
-fn mask_straddling(pats: &[(String, String)], shown: &[u8], held: &[u8]) -> Option<Vec<u8>> {
-    for (p, m) in pats {
-        let p = p.as_bytes();
+fn mask_straddling(pats: &Opened, shown: &[u8], held: &[u8]) -> Option<Vec<u8>> {
+    for (p, m) in pats.iter() {
         for k in (1..p.len()).rev() {
             if shown.ends_with(&p[..k]) && held.starts_with(&p[k..]) {
                 let mut out = m.as_bytes().to_vec();
@@ -201,7 +275,12 @@ impl StreamScrubber {
             return out;
         }
         self.held.extend_from_slice(data);
-        let pats = PATTERNS.read().unwrap_or_else(|e| e.into_inner());
+        let g = PATTERNS.read().unwrap_or_else(|e| e.into_inner());
+        let Some(sealed) = g.as_ref() else {
+            self.shown.clear();
+            return std::mem::take(&mut self.held);
+        };
+        let pats = sealed.open();
         let mut clean = scrub_bytes_with(&pats, &self.held);
         if let Some(c) = mask_straddling(&pats, &self.shown, &clean) {
             clean = c;
@@ -211,8 +290,9 @@ impl StreamScrubber {
         self.partial = pending_prefix(&pats, &window);
         let keep = self.partial.min(clean.len());
         self.held = clean.split_off(clean.len() - keep);
-        let max = pats.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
+        let max = sealed.max_len();
         drop(pats);
+        drop(g);
         self.remember(&clean, max);
         clean
     }
@@ -231,7 +311,7 @@ impl StreamScrubber {
         }
         let out = std::mem::take(&mut self.held);
         self.partial = 0;
-        let max = PATTERNS.read().map(|p| p.iter().map(|(p, _)| p.len()).max().unwrap_or(0)).unwrap_or(0);
+        let max = PATTERNS.read().map(|p| p.as_ref().map_or(0, SealedPatterns::max_len)).unwrap_or(0);
         self.remember(&out, max);
         out
     }
@@ -266,7 +346,7 @@ mod tests {
         assert_eq!(out.matches("••••[TOKEN]").count(), 4);
         assert!(out.ends_with(" ab"), "short values are not scrubbed");
         assert!(matches!(scrub("nothing here"), Cow::Borrowed(_)));
-        set_secrets([]);
+        set_secrets::<&str>([]);
         assert!(!active());
     }
 
@@ -300,6 +380,6 @@ mod tests {
         }
         out.extend(sc.flush(true));
         assert_eq!(String::from_utf8(out).unwrap(), "s3••••[TOKEN]\n");
-        set_secrets([]);
+        set_secrets::<&str>([]);
     }
 }

@@ -143,6 +143,12 @@ pub struct Managed {
     pub ext_ports: Vec<(u16, bool)>,
     /// Summary of unapproved 1Password changes in the service's env files (see `envimport.rs`).
     pub secrets_pending: Option<serde_json::Value>,
+    /// Plain env-file values the running process started with (key → hash; never the values).
+    pub env_applied: Option<BTreeMap<String, u64>>,
+    /// Plain env-file keys that changed since the start (restart to apply).
+    pub env_stale: Option<Vec<String>>,
+    /// Every key in the env files (names only), for the menu bar.
+    pub env_file_keys: Vec<String>,
 }
 
 impl Managed {
@@ -181,6 +187,9 @@ impl Managed {
             heartbeat: self.heartbeat.clone(),
             machine: None,
             secrets_pending: self.secrets_pending.clone(),
+            env_stale: if self.rt.status == "running" { self.env_stale.clone() } else { None },
+            env_file_keys: self.env_file_keys.clone(),
+            approval: super::approvals::pending_for(&self.cfg.name),
             config: self.pending.clone().unwrap_or_else(|| self.cfg.clone()),
         }
     }
@@ -271,6 +280,16 @@ impl Sup {
 
     pub fn changed(&self, m: &Managed) {
         let _ = self.events.send(Event::Service(Box::new(m.state())));
+    }
+
+    /// Re-announce a service's state (e.g. an approval it waited on was answered).
+    pub fn touch(&self, name: &str) {
+        self.with(name, None, |m| self.changed(m));
+    }
+
+    /// Meant to be running but isn't (e.g. its start was held back for an approval).
+    pub fn wants_running(&self, name: &str) -> bool {
+        self.with(name, None, |m| m.want_running && !m.rt.live()).unwrap_or(false)
     }
 
     pub fn set_status(&self, m: &mut Managed, s: &'static str) {
@@ -516,6 +535,12 @@ impl Sup {
     }
 
     pub async fn restart(self: &Arc<Self>, name: &str) -> R<ServiceState> {
+        let cfg = self.get(name, |m| m.pending.clone().unwrap_or_else(|| m.cfg.clone()))?;
+        // Don't take a running service down for a start that would be held back for an approval.
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || super::approvals::gate(&cfg)).await {
+            self.get(name, |m| m.sys(&e))?;
+            return self.get_state(name);
+        }
         self.get(name, |m| m.sys("restart requested"))?;
         self.stop(name).await?;
         self.start(name).await
@@ -586,6 +611,9 @@ impl Sup {
             heartbeat: None,
             ext_ports: vec![],
             secrets_pending: None,
+            env_applied: None,
+            env_stale: None,
+            env_file_keys: vec![],
         }
     }
 
@@ -606,6 +634,13 @@ impl Sup {
                 m.rt.dispose();
                 m.rt = Rt::default();
                 m.gen = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if !m.cfg.secret_refs().is_empty() {
+            // Ask now, while you're here, rather than at the next unattended restart.
+            let c = m.pending.clone().unwrap_or_else(|| m.cfg.clone());
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                h.spawn_blocking(move || super::approvals::prompt_if_needed(&c));
             }
         }
         self.schedule_health_m(m, None);
@@ -650,6 +685,10 @@ impl Sup {
         };
         if let Err(e) = res {
             self.with(name, None, |m| m.sys(&format!("start failed: {e}")));
+            // Held for an approval: not a crash. It starts when approved, so no retries meanwhile.
+            if super::approvals::id_in(&e).is_some() {
+                return;
+            }
             self.on_exit(name, Some(1), false);
             return;
         }

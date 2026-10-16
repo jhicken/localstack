@@ -139,7 +139,8 @@ struct ServiceURL: Codable, Hashable {
     let localOnly: Bool?
     /// Forwarded from this paired Mac over the encrypted link: the URL is on this Mac.
     var via: String? = nil
-    /// "paused": its forward is paused (opening resumes it). "lan": a LAN address of a Mac reached over Tailscale.
+    /// "paused": its forward is paused (opening resumes it). "untunneled": on another Mac that doesn't let this one
+    /// tunnel to it (services on paired Macs are only reached through the encrypted link, never directly).
     var blocked: String? = nil
 
     var display: String {
@@ -185,25 +186,14 @@ struct Machine: Codable, Identifiable, Equatable {
     var processes: [ProcInfo]?
     var configErrors: [String]?
     var system: MachineSystem?
-    /// How the link travels: "local" (LAN) or "tailscale".
-    var transport: String?
-    /// Its Tailscale device name (e.g. lstack-studio.tailnet.ts.net), once known.
-    var tailnetName: String?
-    /// The live link's path: kind "lan" or "tailscale" + the address dialed.
+    /// The live link's path: kind "lan" + the address dialed.
     var via: LinkVia?
-    /// Transport asked for but not yet confirmed by that Mac.
-    var pendingTransport: String?
-    var transportChange: TransportChange?
-    /// That Mac has Tailscale turned on.
-    var tailscaleAvailable: Bool?
 
     var online: Bool { status == "online" }
-    var onTailscale: Bool { transport == "tailscale" }
-    /// "LAN" / "Tailscale" plus what the live link is going through, for tooltips.
+    /// What the live link is going through, for tooltips.
     var linkDescription: String {
-        let t = onTailscale ? "Tailscale" : "local network"
-        guard online, let v = via else { return "Connects over the \(t)" }
-        return "Connected over \(v.kind == "tailscale" ? "Tailscale" : "the local network") (\(v.address))"
+        guard online, let v = via else { return "Connects directly over the local network (encrypted)" }
+        return "Connected directly over the local network, encrypted end to end (\(v.address))"
     }
     var canControl: Bool { allowControl ?? false }
     /// Paired with an older LStack (before the encrypted link): must pair again.
@@ -213,16 +203,6 @@ struct Machine: Codable, Identifiable, Equatable {
 struct LinkVia: Codable, Equatable {
     let kind: String
     let address: String
-}
-
-/// A transport switch in progress or stuck: `state` is preparing, waiting-login, waiting-approval, switching, error
-/// or warning.
-struct TransportChange: Codable, Equatable {
-    let to: String
-    let state: String
-    let message: String?
-
-    var busy: Bool { ["preparing", "waiting-login", "waiting-approval", "switching"].contains(state) }
 }
 
 /// Per-Mac permissions: `{control, tunnel: "all" | "none" | [services]}`.
@@ -396,10 +376,6 @@ struct SharedPeer: Decodable, Identifiable, Equatable {
     let online: Bool?
     let address: String?
     let streams: Int?
-    /// "local" or "tailscale" (what this Mac accepts from it).
-    let transport: String?
-    /// The live link: "lan" or "tailscale".
-    let via: String?
 }
 
 /// This install's link key.
@@ -484,9 +460,15 @@ struct ServiceState: Codable, Identifiable, Hashable {
     let config: ServiceConfig
     /// 1Password references in its env files waiting for review (keys only).
     var secretsPending: SecretsPending? = nil
+    /// Plain env-file keys changed since it started (restart to apply).
+    var envStale: [String]? = nil
+    /// Keys defined in its env files (names only).
+    var envFileKeys: [String]? = nil
+    /// A Touch ID approval its secrets are waiting on.
+    var approval: Approval? = nil
 
-    /// Addresses that can be opened from here (LAN ones are hidden while that Mac is on Tailscale).
-    var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "lan" } }
+    /// Addresses that can be opened from here: a paired Mac's services only through their encrypted forwards.
+    var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "untunneled" } }
     var isRemote: Bool { machine != nil }
 
     var isRunning: Bool { status == "running" }
@@ -607,61 +589,9 @@ struct RemoteStatus: Codable, Equatable {
     var shareAddress: String?
     var linkPort: Int?
     var pairedMachines: Int?
-    /// Transport changes asked for by paired Macs are applied without asking (default on).
-    var autoApproveTransport: Bool?
-    var transportRequests: [TransportRequest]?
 }
 
-/// A paired Mac asked to change how it connects (waiting for Allow/Deny here).
-struct TransportRequest: Codable, Equatable, Identifiable {
-    var id: String { peerId }
-    let peerId: String
-    let name: String
-    let transport: String
-    let at: Double
-}
-
-/// `GET /api/tailnet`: this Mac's Tailscale helper.
-struct TailnetStatus: Decodable, Equatable {
-    struct SelfNode: Decodable, Equatable {
-        let dnsName: String?
-        let ips: [String]?
-    }
-    struct Peer: Decodable, Equatable, Identifiable {
-        var id: String { dnsName }
-        let dnsName: String
-        let hostName: String?
-        let ips: [String]?
-        let online: Bool?
-        let os: String?
-        let isLStack: Bool?
-        /// "direct", "relay" or "" (no traffic yet).
-        let path: String?
-        let relay: String?
-    }
-    let enabled: Bool
-    /// off, installing, starting, needs-login, running, error
-    let phase: String
-    let error: String?
-    let autoUpdate: Bool?
-    let acknowledged: Bool?
-    let installedVersion: String?
-    let version: String?
-    let lastCheck: Double?
-    let checking: Bool?
-    let devBinary: Bool?
-    let deviceName: String?
-    let authURL: String?
-    let `self`: SelfNode?
-    let tailnet: String?
-    let user: String?
-    let health: [String]?
-    let peers: [Peer]?
-
-    var running: Bool { phase == "running" }
-}
-
-/// `GET /api/network`: an active VPN can block the local network or push Tailscale onto a relay.
+/// `GET /api/network`: an active VPN can block the local network that paired Macs connect over.
 struct VpnStatus: Decodable, Equatable {
     let active: Bool
     let interface: String?
@@ -672,7 +602,7 @@ struct VpnStatus: Decodable, Equatable {
 /// `GET /api/remote/addresses`: a way other Macs might reach this one, checked by resolving it.
 struct ShareAddress: Decodable, Identifiable, Hashable {
     let address: String
-    /// ip, dns, bonjour or tailscale
+    /// ip, dns or bonjour
     let kind: String
     let source: String?
     let resolves: [String]
@@ -692,7 +622,6 @@ struct RemotePatch: Encodable {
     var linkPort: Int?
     /// "" = automatic.
     var shareAddress: String?
-    var autoApproveTransport: Bool?
 }
 
 struct TotpSetup: Decodable {
@@ -757,6 +686,15 @@ struct SecretsPending: Codable, Hashable {
     var blocked: [String]?
     var removed: [String]?
     var errors: [String]?
+    /// `lstack://` lines waiting for approval, and ones naming a secret that isn't stored.
+    var link: [String]?
+    var notStored: [String]?
+
+    /// Only `lstack://` lines need a look (handled in the editor, not the 1Password review).
+    var onlyStored: Bool {
+        let op = [new, changed, missing, removed].compactMap { $0 }.joined()
+        return op.isEmpty && (errors ?? []).isEmpty && !((link ?? []).isEmpty && (notStored ?? []).isEmpty)
+    }
 
     var summary: String {
         var parts: [String] = []
@@ -831,7 +769,13 @@ struct OPDetect: Decodable {
         }
         let name: String
         let example: Bool
+        struct Stored: Decodable, Hashable {
+            let key: String
+            let name: String
+        }
         let refs: [Ref]?
+        /// `lstack://NAME` lines.
+        let stored: [Stored]?
         let plain: [String]?
         let fifo: Bool?
         let error: String?
@@ -849,6 +793,46 @@ struct OPDetect: Decodable {
     }
     let dir: String
     let files: [File]
+}
+
+/// `POST /api/env/preview` (and the env edit endpoints): every variable in a service's env files.
+struct EnvPreview: Decodable, Equatable {
+    struct File: Decodable, Hashable {
+        let name: String
+        let path: String
+        /// ok, fifo (1Password Environment mount), missing or error.
+        let state: String
+        let error: String?
+    }
+    struct Var: Decodable, Hashable {
+        let key: String
+        let file: String
+        let line: Int
+        /// plain, op or lstack.
+        let kind: String
+        /// Plain values only.
+        let value: String?
+        let template: String?
+        /// op:// reference.
+        let ref: String?
+        /// lstack://NAME.
+        let name: String?
+        let status: String?
+        let secret: String?
+        let blocked: String?
+        let shadowed: Bool?
+    }
+    struct Overrides: Decodable, Equatable {
+        struct Secret: Decodable, Hashable { let key: String; let name: String }
+        let env: [String]
+        let secrets: [Secret]
+    }
+    let dir: String
+    let files: [File]
+    let vars: [Var]
+    let overrides: Overrides
+    let warnings: [String]?
+    let locked: Bool?
 }
 
 /// `GET/POST /api/onepassword/shares`: cached 1Password values shared with paired Macs (never 1Password itself).

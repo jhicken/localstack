@@ -395,8 +395,8 @@
   const LOCAL_ONLY_TIP = "bound to localhost on that machine – not reachable from here";
 
   function urlChips(s, max) {
-    // LAN addresses of a Mac reached over Tailscale can't be opened from here.
-    const urls = (s.urls || []).filter((u) => u.blocked !== "lan");
+    // Another Mac's services are only reached through encrypted forwards, never directly over the network.
+    const urls = (s.urls || []).filter((u) => u.blocked !== "untunneled");
     const shown = max ? urls.slice(0, max) : urls;
     const more = urls.length - shown.length;
     return shown.map((u) => {
@@ -419,12 +419,13 @@
     const uptime = live(s) && s.startedAt ? dur(Date.now() - s.startedAt) : statusLabel(s);
     const health = s.health && !["none", "unknown"].includes(s.health) ? `<span class="h-${esc(s.health)}">● ${esc(s.health)}</span>` : "";
     const links = s.urls?.length ? `<span class="links">${urlChips(s, 3)}</span>` : "";
-    const op = s.secretsPending ? ` <span class="badge op" title="1Password references to review on its Mac">1Password ${esc(s.secretsPending.count || "!")}</span>` : "";
+    const op = s.secretsPending ? ` <span class="badge op" title="Env file secrets to review on its Mac">secrets ${esc(s.secretsPending.count || "!")}</span>` : "";
+    const stale = s.envStale?.length && s.status === "running" ? ` <span class="badge op" title="Env file changed since it started: ${esc(s.envStale.join(", "))} (restart to apply)">env changed</span>` : "";
     return `<div class="svc ${k === S.selected ? "sel" : ""}" data-key="${esc(k)}">
         <span class="dot ${esc(looping(s) ? "starting" : s.status)}"></span>
         <span class="name">${esc(s.name)}</span>
         <span class="nums"><b>${m ? pct(m.cpu) : "—"}</b> · ${m ? bytes(m.mem) : "—"}</span>
-        <span class="meta"><span class="badge ${esc(s.type)}">${esc(s.type)}</span>${esc(uptime)} ${health}${op}</span>
+        <span class="meta"><span class="badge ${esc(s.type)}">${esc(s.type)}</span>${esc(uptime)} ${health}${op}${stale}</span>
         ${sparkline(live(s) ? hist : [])}
         ${links}
       </div>`;
@@ -688,9 +689,9 @@
     if (p) {
       // Read-only here: pulling from 1Password needs a person at that Mac (LStack app or `lstack secret import`).
       const part = (label, keys) => (keys?.length ? `${label}: ${keys.map(esc).join(", ")}` : "");
-      const what = [part("new", p.new), part("changed", p.changed), part("not cached", p.missing), part("blocked", p.blocked), part("removed", p.removed), ...(p.errors || []).map(esc)].filter(Boolean).join(" · ");
-      const cmd = `lstack secret review ${s.name}`;
-      rows.push(`<div class="irow"><span class="k">1Password</span><span class="op-pending">${what}<br><span class="muted">Review in LStack on ${esc(s.machine || "that Mac")} or run <code>${esc(cmd)}</code> there.</span></span></div>`);
+      const what = [part("new", p.new), part("changed", p.changed), part("not cached", p.missing), part("blocked", p.blocked), part("removed", p.removed), part("lstack:// to approve", p.link), part("not stored", p.notStored), ...(p.errors || []).map(esc)].filter(Boolean).join(" · ");
+      const cmd = p.link?.length || p.notStored?.length ? `lstack env ${s.name}` : `lstack secret review ${s.name}`;
+      rows.push(`<div class="irow"><span class="k">Secrets</span><span class="op-pending">${what}<br><span class="muted">Review in LStack on ${esc(s.machine || "that Mac")} or run <code>${esc(cmd)}</code> there.</span></span></div>`);
     }
     const html = rows.join("");
     if (el._html === html) return;

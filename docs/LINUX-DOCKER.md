@@ -19,8 +19,7 @@ systemd, process-match rules) rather than from `services/*.yaml`. They flow thro
 | Listening ports / forward same-user check | `lsof`, libproc FD walk | `/proc/net/tcp{,6}` + socket inode → pid via `/proc/<pid>/fd` |
 | Secrets key share | Keychain via `/usr/bin/security` | 0600 file + optional `systemd-creds`/env/Docker secret (`LSTACK_SECRET_KEY_FILE`) |
 | Startup | `launchd.rs` LaunchAgents | `systemd.rs`: user unit (`--user`, `loginctl enable-linger`) or system unit |
-| Link "Local" transport | accepts only `en*` physical subnets (`remote.rs:1203`) | interface naming differs (`eth*`, `enp*`, `wlp*`); containers sit behind NAT → needs rethink |
-| Tailnet helper | Go tsnet binary, darwin build | cross-compile linux/amd64+arm64 (tsnet is pure Go) |
+| Machine link (LAN only) | accepts only `en*` physical subnets (`share::link_refusal`) | interface naming differs (`eth*`, `enp*`, `wlp*`); containers sit behind NAT → needs rethink |
 | UI copy | "Mac" everywhere | "machine" |
 
 Approach: a `src/platform/{mod,macos,linux}.rs` layer behind `#[cfg(target_os)]` exposing the same
@@ -58,17 +57,17 @@ functions `procinfo.rs`/`secrets.rs`/`launchd.rs` use now. Keep tests for parser
 - macOS: same `watch` rules; launchd jobs could be a later provider.
 
 ## Running on Linux
-- Artifacts: `lstack-linux-{x86_64,aarch64}` static musl builds (+ `lstack-tailnet`), `install.sh`
+- Artifacts: `lstack-linux-{x86_64,aarch64}` static musl builds, `install.sh`
   (`curl … | sh`), later `.deb`/apt. CI in `release.yml`.
 - `lstack setup install --system` → `/etc/systemd/system/lstack.service`, dedicated `lstack` user in the
   `docker` group (document that this is root-equivalent), state in `/var/lib/lstack` (`LSTACK_HOME`).
   `--user` mode for desktops/dev boxes.
 - Headless pairing already works: `lstack remote share on && lstack remote pair` prints the code; the Mac runs
   `lstack machine pair vps --code …` or uses Settings → Machines.
-- Reachability: a VPS is not on your LAN, so **Tailscale transport becomes the default for Linux servers**
-  (the helper is userspace tsnet — no root, no kernel module). Also generalize the "Local" subnet check to
-  Linux interface names. Possibly add an explicit "Direct (internet)" transport later — Noise IK is already
-  safe to expose, but needs rate limiting review.
+- Reachability: a VPS is not on your LAN, and machine links are deliberately local-network only (daemon to
+  daemon, no helper or VPN in the path). Generalize the LAN subnet check to Linux interface names; reaching
+  remote servers needs a separate decision (e.g. an explicit "Direct (internet)" link — Noise IK is already
+  safe to expose, but needs rate limiting review).
 
 ## Dokploy
 Dokploy runs apps as Docker Swarm services and Compose apps as compose projects/stacks, routed by Traefik.
@@ -77,8 +76,8 @@ Two complementary pieces:
 1. **Deploy lstack inside Dokploy** (container image `ghcr.io/jhicken/lstack`):
    - Compose template: mount `/var/run/docker.sock`, a volume for `LSTACK_HOME`, `pid: host` + `/proc:/host/proc:ro`
      (`LSTACK_PROC_ROOT=/host/proc`) to see host processes, secret key from a Docker secret/env.
-   - Link port 7381 is raw TCP, not HTTP — Traefik won't route it; publish it in host mode, or (better) use the
-     Tailscale transport so nothing is exposed publicly. Web dashboard can go through Traefik with a Dokploy domain.
+   - Link port 7381 is raw TCP, not HTTP — Traefik won't route it; publish it in host mode (the link only accepts
+     LAN sources today, see Reachability). Web dashboard can go through Traefik with a Dokploy domain.
    - Pairing: `docker exec <ctr> lstack remote pair` (or Dokploy's terminal).
    - Multi-node: deploy as a global service so each node reports local container stats; the manager reports swarm
      service/replica state.
@@ -91,7 +90,7 @@ Two complementary pieces:
 ## Phasing
 | Phase | Scope | Done when |
 |---|---|---|
-| L0 Linux port | platform layer, systemd setup, secrets backend, Linux interface handling, CI builds, install.sh, "Mac"→"machine" copy | A Mac pairs (Tailscale or LAN) with a Linux box and sees its system load + busy processes; integration test runs on Linux CI |
+| L0 Linux port | platform layer, systemd setup, secrets backend, Linux interface handling, CI builds, install.sh, "Mac"→"machine" copy | A Mac pairs over the LAN with a Linux box and sees its system load + busy processes; integration test runs on Linux CI |
 | L1 Docker provider | provider trait, `source/group/container` fields, events, grouping, container info view in menu bar/TUI/web, `docker` settings + Mac toggle, read-only default, `docker-control` grant | Containers on Linux (default) and Mac (opt-in) appear grouped by project with stats, logs, health, ports, exec |
 | L2 Process & systemd watching | `watch.yaml` rules, systemd provider | Pre-existing nginx/postgres processes or units show as services with metrics/logs |
 | L3 Dokploy | container image + Dokploy compose template, swarm services/tasks, Dokploy API enrichment (names, domains, deploy status) | lstack deployed via Dokploy shows every Dokploy app grouped by project with domains as URLs |
@@ -103,5 +102,5 @@ Two complementary pieces:
    binary does both; the plan assumes both work but UI work targets watched-first.
 3. Run as root vs. `lstack` user in `docker` group (recommend the latter; `pid: host`/`/proc` read works for both
    with `hidepid` off).
-4. Transport for cloud hosts: Tailscale-first vs. adding a "Direct" transport.
+4. Reaching cloud hosts: machine links are LAN-only; whether to add a "Direct" (internet) link.
 5. Per-process network on Linux: per-container (netns) is easy; per-host-process is not — accept "n/a".

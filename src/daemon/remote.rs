@@ -67,10 +67,6 @@ pub struct RemoteConfig {
     /// Address shown first for reaching this Mac (pairing code, Settings) — e.g. a router DNS name that
     /// survives DHCP changes. None = automatic (LAN IPs, then the host name).
     pub share_address: Option<String>,
-    /// The Tailscale transport (helper on/off, updates).
-    pub tailnet: super::tailnet::TailnetConfig,
-    /// Paired Macs may switch their own transport (LAN ↔ Tailscale) without asking here. Missing = on.
-    pub auto_approve_transport: Option<bool>,
 }
 
 /// A Mac allowed to connect to this one over the link.
@@ -87,49 +83,6 @@ pub struct SharedPeer {
     pub phrase: String,
     pub created_at: i64,
     pub last_seen: Option<i64>,
-    /// How this Mac may reach us: over the local network only, or through the tailnet.
-    pub transport: Transport,
-    /// For `Tailscale`: the tailnet identity it must come from (set when it switched to Tailscale).
-    pub tailnet_id: Option<TailnetId>,
-}
-
-/// How a paired Mac's link travels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Transport {
-    /// The LAN: link connections are accepted only from this Mac's physical network.
-    #[default]
-    Local,
-    /// The tailnet, through the `lstack-tailnet` helper (WireGuard; direct on the LAN, relayed elsewhere).
-    Tailscale,
-}
-
-impl Transport {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Transport::Local => "local",
-            Transport::Tailscale => "tailscale",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Transport> {
-        match s {
-            "local" | "lan" => Some(Transport::Local),
-            "tailscale" | "tailnet" => Some(Transport::Tailscale),
-            _ => None,
-        }
-    }
-}
-
-/// Who a tailnet connection came from, as the helper's `whois` reported it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct TailnetId {
-    /// The tailnet (e.g. `jeff@github` or `example.com`).
-    pub tailnet: String,
-    /// The owning user's login.
-    pub user: String,
-    /// The node's MagicDNS name (informational; nodes may be renamed).
-    pub node: String,
 }
 
 /// What one paired Mac may do here (viewing status is always allowed).
@@ -179,8 +132,6 @@ impl Default for RemoteConfig {
             peers: vec![],
             revoked: vec![],
             share_address: None,
-            tailnet: Default::default(),
-            auto_approve_transport: None,
         }
     }
 }
@@ -301,20 +252,9 @@ pub(super) struct LiveLink {
     pub peer_id: String,
     pub mux: Arc<super::link::Mux>,
     pub addr: SocketAddr,
-    pub via: super::share::Via,
 }
 
 type TunnelKey = (String, String, u16);
-
-/// A paired Mac asked to change how its link travels (kept until allowed or denied here).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransportRequest {
-    pub peer_id: String,
-    pub name: String,
-    pub transport: Transport,
-    pub at: i64,
-}
 
 /// Owns the remote listener's lifecycle, its sessions and login throttling.
 pub struct Remote {
@@ -334,15 +274,11 @@ pub struct Remote {
     /// The link listener (sharing).
     link: Mutex<Option<Running>>,
     pub(super) links: Mutex<Vec<LiveLink>>,
-    /// Transport changes paired Macs asked for while auto-approve is off.
-    transport_requests: Mutex<Vec<TransportRequest>>,
     /// Recent link / tunnel events, newest last.
     activity: Mutex<std::collections::VecDeque<Value>>,
     /// Tunnel use per (peer, service, port): connections, bytes, last at.
     /// (peer, service, port) → (connections, bytes, last used).
     tunnel_stats: Mutex<HashMap<TunnelKey, (u64, u64, i64)>>,
-    /// The Tailscale helper.
-    pub tailnet: Arc<super::tailnet::Tailnet>,
 }
 
 #[derive(Deserialize, Default)]
@@ -359,7 +295,6 @@ pub struct RemotePatch {
     pub allow_control: Option<bool>,
     /// Preferred address to show for this Mac; "" = automatic.
     pub share_address: Option<String>,
-    pub auto_approve_transport: Option<bool>,
 }
 
 impl Remote {
@@ -376,10 +311,8 @@ impl Remote {
             pair_code: Mutex::new(None),
             link: Mutex::new(None),
             links: Mutex::new(vec![]),
-            transport_requests: Mutex::new(vec![]),
             activity: Mutex::new(Default::default()),
             tunnel_stats: Mutex::new(HashMap::new()),
-            tailnet: super::tailnet::Tailnet::new(),
         })
     }
 
@@ -461,39 +394,9 @@ impl Remote {
         f.get(&ip).map_or(0, |(_, last)| ((LOCKOUT_MS - (now_ms() - last)) / 1000).max(1))
     }
 
-    /// Change the Tailscale settings and save them.
-    pub fn set_tailnet(&self, f: impl FnOnce(&mut super::tailnet::TailnetConfig)) -> Result<super::tailnet::TailnetConfig, ApiErr> {
-        let mut cfg = self.config();
-        f(&mut cfg.tailnet);
-        let t = cfg.tailnet.clone();
-        self.save(cfg)?;
-        Ok(t)
-    }
-
-    /// Ways a paired Mac can reach this one: LAN addresses, and the tailnet node when Tailscale is on.
-    pub fn transports(&self) -> Value {
-        let cfg = self.config();
-        let addrs: Vec<String> = self.status()["shareUrls"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|u| u.as_str()).filter(|u| !is_tailscale_host(u)).map(str::to_string).collect())
-            .unwrap_or_default();
-        let ts = self.tailnet.status(&cfg.tailnet);
-        json!({
-            "local": { "addrs": addrs },
-            "tailscale": {
-                "enabled": cfg.tailnet.enabled,
-                "phase": ts["phase"],
-                "error": ts["error"],
-                "dnsName": ts["self"]["dnsName"],
-                "ips": ts["self"]["ips"],
-                "tailnet": ts["tailnet"],
-                "helperVersion": ts["version"],
-            },
-        })
-    }
-
-    pub fn auto_approve_transport(&self) -> bool {
-        self.cfg.lock().unwrap().auto_approve_transport.unwrap_or(true)
+    /// Addresses a paired Mac can reach this one at (the link only runs over the local network).
+    pub fn lan_addrs(&self) -> Vec<String> {
+        self.status()["shareUrls"].as_array().map(|a| a.iter().filter_map(|u| u.as_str()).map(str::to_string).collect()).unwrap_or_default()
     }
 
     fn save(&self, cfg: RemoteConfig) -> Result<(), ApiErr> {
@@ -504,8 +407,7 @@ impl Remote {
 
     /// Pin a newly paired Mac. A Mac pairing again under the same name or key replaces its old entry
     /// (keeping its grants if the key is the same).
-    /// Pairing over the tailnet puts the new Mac on the Tailscale transport (tied to that tailnet identity).
-    pub(super) fn add_peer(&self, name: &str, public: &[u8; 32], phrase: &str, tailnet: Option<TailnetId>) -> Result<SharedPeer, ApiErr> {
+    pub(super) fn add_peer(&self, name: &str, public: &[u8; 32], phrase: &str) -> Result<SharedPeer, ApiErr> {
         let mut cfg = self.config();
         let key = super::link::key_hex(public);
         let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
@@ -513,8 +415,7 @@ impl Remote {
         let grants = cfg.peers.iter().find(|p| p.public_key == key).map(|p| p.grants.clone()).unwrap_or_else(Grants::new_pairing);
         cfg.peers.retain(|p| !old.contains(&p.id));
         cfg.revoked.retain(|k| *k != key);
-        let transport = if tailnet.is_some() { Transport::Tailscale } else { Transport::Local };
-        let peer = SharedPeer { id: random_hex(4), name, public_key: key, grants, phrase: phrase.to_string(), created_at: now_ms(), last_seen: None, transport, tailnet_id: tailnet };
+        let peer = SharedPeer { id: random_hex(4), name, public_key: key, grants, phrase: phrase.to_string(), created_at: now_ms(), last_seen: None };
         cfg.peers.push(peer.clone());
         self.save(cfg)?;
         for id in old {
@@ -600,9 +501,6 @@ impl Remote {
                     "lastSeen": p.last_seen,
                     "online": !live.is_empty(),
                     "address": live.first().map(|l| l.addr.ip().to_string()),
-                    "via": live.first().map(|l| l.via.label()),
-                    "transport": p.transport.as_str(),
-                    "tailnet": p.tailnet_id,
                     "streams": live.iter().map(|l| l.mux.stream_count()).sum::<usize>(),
                     "connectedSince": live.iter().map(|l| l.mux.opened_at).min(),
                 })
@@ -681,87 +579,6 @@ impl Remote {
         Ok(())
     }
 
-    /// Set how a paired Mac's link travels. `tell`: close its links with the new transport so it switches and
-    /// redials (when the change didn't come from that Mac's own request).
-    pub fn set_peer_transport(&self, app: &AppState, id: &str, t: Transport, by: &str, tell: bool) -> Result<Value, ApiErr> {
-        let mut cfg = self.config();
-        let i = Self::find_peer(&cfg, id)?;
-        if t == Transport::Tailscale && !self.tailnet.running() {
-            let phase = self.tailnet.phase();
-            return Err(ApiErr::new(
-                409,
-                match phase {
-                    "off" => format!("Tailscale is off on {} — turn it on there first", hostname()),
-                    "needs-login" => format!("Tailscale on {} needs signing in first", hostname()),
-                    p => format!("Tailscale on {} isn't ready yet ({p})", hostname()),
-                },
-            ));
-        }
-        let p = &mut cfg.peers[i];
-        let (pid, name) = (p.id.clone(), p.name.clone());
-        let changed = p.transport != t;
-        p.transport = t;
-        // Over Tailscale it must come from this Mac's own tailnet (the helpers only see each other there).
-        p.tailnet_id = (t == Transport::Tailscale).then(|| TailnetId { tailnet: self.tailnet.tailnet_id().unwrap_or_default(), ..Default::default() });
-        self.save(cfg)?;
-        self.transport_requests.lock().unwrap().retain(|r| r.peer_id != pid);
-        if changed {
-            self.audit(json!({ "event": "transport", "peer": name, "transport": t.as_str(), "by": by }));
-            let how = if t == Transport::Tailscale { "over Tailscale" } else { "on the local network only" };
-            let body = match by {
-                "request" => format!("{name} switched how it connects: it now reaches this Mac {how}."),
-                _ => format!("{name} now reaches this Mac {how}."),
-            };
-            app.sup.notice("Machine link changed", &body);
-        }
-        if tell {
-            let reason = format!("{}{}", super::link::BYE_TRANSPORT, t.as_str());
-            for l in self.links.lock().unwrap().iter().filter(|l| l.peer_id == pid) {
-                l.mux.bye(&reason);
-            }
-        }
-        Ok(json!({ "transport": t.as_str(), "applied": true }))
-    }
-
-    /// A paired Mac asks to change its transport: applied right away when auto-approve is on, else queued.
-    pub fn request_transport(&self, app: &AppState, id: &str, t: Transport) -> Result<Value, ApiErr> {
-        let cfg = self.config();
-        let p = &cfg.peers[Self::find_peer(&cfg, id)?];
-        if p.transport == t {
-            self.transport_requests.lock().unwrap().retain(|r| r.peer_id != p.id);
-            return Ok(json!({ "transport": t.as_str(), "applied": true }));
-        }
-        if self.auto_approve_transport() {
-            return self.set_peer_transport(app, id, t, "request", false);
-        }
-        let mut q = self.transport_requests.lock().unwrap();
-        let fresh = !q.iter().any(|r| r.peer_id == p.id && r.transport == t);
-        q.retain(|r| r.peer_id != p.id);
-        q.push(TransportRequest { peer_id: p.id.clone(), name: p.name.clone(), transport: t, at: now_ms() });
-        drop(q);
-        if fresh {
-            self.audit(json!({ "event": "transport-requested", "peer": p.name, "transport": t.as_str() }));
-            let how = if t == Transport::Tailscale { "over Tailscale" } else { "on the local network only" };
-            app.sup.notice("Machine link request", &format!("{} asks to connect {how}. Allow it in Settings → Machines.", p.name));
-        }
-        Ok(json!({ "transport": p.transport.as_str(), "applied": false, "pending": t.as_str() }))
-    }
-
-    /// Allow or deny a queued transport request (by the asking Mac's id).
-    pub fn decide_transport(&self, app: &AppState, id: &str, allow: bool) -> Result<Value, ApiErr> {
-        let r = {
-            let q = self.transport_requests.lock().unwrap();
-            q.iter().find(|r| r.peer_id == id).cloned().ok_or_else(|| ApiErr::new(404, "no such transport request"))?
-        };
-        if allow {
-            self.set_peer_transport(app, id, r.transport, "approved", true)?;
-        } else {
-            self.transport_requests.lock().unwrap().retain(|x| x.peer_id != id);
-            self.audit(json!({ "event": "transport-denied", "peer": r.name, "transport": r.transport.as_str() }));
-        }
-        Ok(self.status())
-    }
-
     /// Forget every pairing (after this Mac's key changed, they can't connect anyway).
     pub fn forget_peers(&self) {
         let mut cfg = self.config();
@@ -837,7 +654,8 @@ impl Remote {
         let link = self.link.lock().unwrap();
         let share_urls: Vec<String> = match &*link {
             Some(l) if l.bind == "0.0.0.0" || l.bind == "::" => {
-                let mut v: Vec<String> = local_addresses().into_iter().map(|ip| format!("{ip}:{}", l.port)).collect();
+                // Only local-network addresses: the link refuses connections from anywhere else.
+                let mut v: Vec<String> = local_addresses().into_iter().filter(|ip| !is_tailscale_host(ip)).map(|ip| format!("{ip}:{}", l.port)).collect();
                 // Names work too (router DNS like `studio.lan`, or Bonjour `studio.local`) and survive DHCP changes.
                 let h = hostname();
                 if !v.is_empty() && h != "localhost" {
@@ -867,8 +685,6 @@ impl Remote {
             "username": cfg.username,
             "hasPassword": !cfg.password_hash.is_empty(),
             "allowControl": cfg.allow_control,
-            "autoApproveTransport": cfg.auto_approve_transport.unwrap_or(true),
-            "transportRequests": *self.transport_requests.lock().unwrap(),
             "totp": !cfg.totp_secret.is_empty(),
             "hostname": hostname(),
             "urls": urls,
@@ -924,9 +740,6 @@ impl Remote {
                 return Err(ApiErr::new(400, format!("{a:?} is not a host name or IP address (no port)")));
             };
         }
-        if let Some(a) = patch.auto_approve_transport {
-            cfg.auto_approve_transport = Some(a);
-        }
         if let Some(e) = patch.enabled {
             cfg.enabled = e;
         }
@@ -954,7 +767,6 @@ impl Remote {
 
     /// Make the listeners match the config (called at boot and after every change).
     pub async fn apply(self: &Arc<Self>, app: &AppState) {
-        self.tailnet.apply(app, self);
         self.apply_link(app).await;
         let cfg = self.config();
         let old = self.running.lock().unwrap().take();
@@ -1100,7 +912,6 @@ impl Remote {
     }
 
     pub fn stop(&self) {
-        self.tailnet.stop();
         if let Some(r) = self.running.lock().unwrap().take() {
             r.task.abort();
         }
@@ -1189,7 +1000,7 @@ fn same_subnet(a: IpAddr, b: IpAddr, mask: IpAddr) -> bool {
     }
 }
 
-/// Tailscale's address ranges (CGNAT 100.64/10 and fd7a:115c:a1e0::/48).
+/// CGNAT 100.64/10 and fd7a:115c:a1e0::/48 (used by Tailscale and other overlay VPNs): never the local network.
 pub fn is_tailscale_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => v.octets()[0] == 100 && (64..128).contains(&v.octets()[1]),
@@ -1197,7 +1008,7 @@ pub fn is_tailscale_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// `host[:port]` on the tailnet (100.64/10, Tailscale's IPv6 range, or a MagicDNS name).
+/// `host[:port]` on an overlay VPN (100.64/10, Tailscale's IPv6 range, or a MagicDNS name).
 pub fn is_tailscale_host(hp: &str) -> bool {
     let host = hp.rsplit_once(':').filter(|(h, p)| p.parse::<u16>().is_ok() && (!h.contains(':') || h.ends_with(']'))).map_or(hp, |(h, _)| h);
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -1322,9 +1133,9 @@ pub(super) fn scutil(args: &[&str]) -> String {
 /// names under the network's search domains (router DNS such as `studio.lan`). Names are resolved
 /// and marked `pointsHere` when they lead back to one of this Mac's addresses. Blocking (a few seconds).
 pub fn discover_addresses(selected: Option<&str>) -> Vec<Value> {
-    let ips = local_addresses();
+    // The link only accepts the local network, so VPN / Tailscale-app addresses are never offered.
+    let ips: Vec<String> = local_addresses().into_iter().filter(|ip| !is_tailscale_host(ip)).collect();
     let here = interface_ips();
-    let is_ts = |a: &str| a.ends_with(".ts.net") || a.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]));
     // (name, how it was found)
     let mut names: Vec<(String, &str)> = vec![];
     let mut add = |n: String, how: &'static str| {
@@ -1393,14 +1204,16 @@ pub fn discover_addresses(selected: Option<&str>) -> Vec<Value> {
         if !points_here && matches!(*how, "search domain" | "reverse dns") {
             continue; // only a guess, and it doesn't lead here
         }
-        let kind = if is_ts(n) { "tailscale" } else if n.ends_with(".local") { "bonjour" } else { "dns" };
-        let rank = if !points_here { 4 } else if kind == "dns" { 0 } else if kind == "bonjour" { 1 } else { 3 };
+        if is_tailscale_host(n) {
+            continue;
+        }
+        let kind = if n.ends_with(".local") { "bonjour" } else { "dns" };
+        let rank = if !points_here { 4 } else if kind == "dns" { 0 } else { 1 };
         let ips: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
         out.push((rank, json!({ "address": n, "kind": kind, "source": how, "resolves": ips, "pointsHere": points_here })));
     }
     for ip in &ips {
-        let kind = if is_ts(ip) { "tailscale" } else { "ip" };
-        out.push((if kind == "ip" { 2 } else { 3 }, json!({ "address": ip, "kind": kind, "source": "interface", "resolves": [ip], "pointsHere": true })));
+        out.push((2, json!({ "address": ip, "kind": "ip", "source": "interface", "resolves": [ip], "pointsHere": true })));
     }
     if let Some(sel) = selected {
         if !out.iter().any(|(_, v)| v["address"] == sel) {
@@ -1492,8 +1305,6 @@ pub(super) fn peer_router(app: AppState, remote: Arc<Remote>, peer_id: String, m
         .route("/peer/api/system", get(|State(rs): State<RState>| async move { Json(rs.app.sup.system()) }))
         .route("/peer/api/processes", get(|State(rs): State<RState>| async move { Json(json!({ "processes": *rs.app.sup.processes() })) }))
         .route("/peer/api/events", get(peer_events))
-        .route("/peer/api/transport", post(peer_transport))
-        .route("/peer/api/tailnet/prepare", post(peer_tailnet_prepare))
         .route("/peer/api/secrets/offer", post(peer_secrets_offer))
         .route("/peer/api/secrets/pull", post(peer_secrets_pull))
         .fallback(|| async { ApiErr::new(404, "not found") })
@@ -1614,71 +1425,21 @@ fn link_grants(rs: &RState) -> Option<(String, Grants)> {
 
 async fn peer_info(State(rs): State<RState>) -> Json<Value> {
     let (name, grants) = link_grants(&rs).unwrap_or_default();
-    let cfg = rs.remote.config();
-    let me = rs.peer.as_ref().and_then(|p| cfg.peers.iter().find(|x| x.id == p.id));
+    let addrs = rs.remote.lan_addrs();
     Json(json!({
         "hostname": hostname(),
         "version": VERSION,
         "you": name,
         "grants": grants.json(),
         "allowControl": grants.control,
-        // How this Mac accepts the caller, and every way it can be reached.
-        "transport": me.map(|p| p.transport.as_str()),
-        "transports": rs.remote.transports(),
-        "autoApproveTransport": rs.remote.auto_approve_transport(),
+        // Every local-network address it can be reached at (the link only runs over the LAN).
+        "addrs": addrs,
+        // For older LStack versions that had other transports: makes them switch back to the local network.
+        "transport": "local",
+        "transports": { "local": { "addrs": addrs } },
         "cores": super::procinfo::host_cores(),
         "memTotal": super::procinfo::host_mem_total(),
     }))
-}
-
-/// The calling Mac asks to change how its link travels: `{transport: "local" | "tailscale"}`.
-async fn peer_transport(State(rs): State<RState>, body: Bytes) -> Response {
-    let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
-    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let Some(t) = v["transport"].as_str().and_then(Transport::parse) else {
-        return ApiErr::new(400, "transport must be \"local\" or \"tailscale\"").into_response();
-    };
-    match rs.remote.request_transport(&rs.app, &lp.id, t) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => e.into_response(),
-    }
-}
-
-/// The calling Mac wants to reach this one over Tailscale: turn the helper on here (installing or updating it to
-/// `minVersion`) when transport changes are auto-approved, and report its state. Never shares the sign-in URL.
-async fn peer_tailnet_prepare(State(rs): State<RState>, body: Bytes) -> Response {
-    let Some((name, _)) = link_grants(&rs) else { return ApiErr::new(403, "link only").into_response() };
-    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let min = v["minVersion"].as_str().map(str::to_string);
-    let remote = rs.remote.clone();
-    let cfg = remote.config();
-    if !cfg.tailnet.enabled {
-        if !remote.auto_approve_transport() {
-            return ApiErr::new(403, format!("{} doesn't auto-approve transport changes — turn on Tailscale there", hostname())).into_response();
-        }
-        if let Err(e) = remote.set_tailnet(|t| t.enabled = true) {
-            return e.into_response();
-        }
-        remote.audit(json!({ "event": "tailnet-enabled", "peer": name }));
-        rs.app.sup.notice("Tailscale turned on", &format!("{name} asked to connect over Tailscale, so LStack turned it on here."));
-        remote.tailnet.apply(&rs.app, &remote);
-    } else if let (Some(min), Some(have)) = (&min, remote.tailnet.version()) {
-        if super::tailnet::version_cmp(&have, min).is_lt() && remote.config().tailnet.auto_update() {
-            let r = remote.clone();
-            tokio::spawn(async move {
-                let _ = r.tailnet.check_update(&r).await;
-            });
-        }
-    }
-    let mut st = remote.tailnet.status(&remote.config().tailnet);
-    if st["phase"] == "needs-login" && st["authURL"].as_str().is_some_and(|u| !u.is_empty()) {
-        rs.app.sup.notice("Sign in to Tailscale", &format!("{name} wants to connect over Tailscale. Sign in under Settings → Machines → Tailscale."));
-    }
-    let keep = ["enabled", "phase", "error", "version", "self", "tailnet", "deviceName"];
-    if let Some(o) = st.as_object_mut() {
-        o.retain(|k, _| keep.contains(&k.as_str()));
-    }
-    Json(st).into_response()
 }
 
 /// The calling Mac says which 1Password references its services wait for (`want`) and which values it holds
@@ -1791,6 +1552,10 @@ pub(super) fn redact(mut s: ServiceState) -> ServiceState {
             hb.url = Some("••••".into());
         }
     }
+    // Approvals are signed only on this Mac; the summary can quote env values.
+    if s.approval.is_some() {
+        s.approval = Some(serde_json::json!({ "pending": true }));
+    }
     s
 }
 
@@ -1875,21 +1640,19 @@ mod tests {
     }
 
     #[test]
-    fn transport_policy() {
-        use super::super::share::{transport_refusal, Via};
-        let ts = |t: &str| TailnetId { tailnet: t.into(), user: "u".into(), node: "n".into() };
-        let lan: IpAddr = "127.0.0.1".parse().unwrap();
-        let far: IpAddr = "100.100.1.1".parse().unwrap();
-        assert!(transport_refusal(Transport::Local, None, &Via::Lan, lan).is_none());
-        assert!(transport_refusal(Transport::Local, None, &Via::Lan, far).is_some());
-        assert!(transport_refusal(Transport::Tailscale, None, &Via::Lan, far).is_some());
-        assert!(transport_refusal(Transport::Local, None, &Via::Tailnet(ts("a")), far).is_some());
-        assert!(transport_refusal(Transport::Tailscale, Some(&ts("a")), &Via::Tailnet(ts("a")), far).is_none());
-        assert!(transport_refusal(Transport::Tailscale, Some(&ts("a")), &Via::Tailnet(ts("b")), far).is_some());
-        assert!(transport_refusal(Transport::Tailscale, None, &Via::Tailnet(ts("b")), far).is_none());
-        assert_eq!(Transport::parse("tailscale"), Some(Transport::Tailscale));
-        let old: SharedPeer = serde_json::from_str(r#"{"id":"a","name":"x","publicKey":"00","phrase":"","createdAt":1}"#).unwrap();
-        assert_eq!(old.transport, Transport::Local);
+    fn link_is_local_network_only() {
+        use super::super::share::link_refusal;
+        assert!(link_refusal("127.0.0.1".parse().unwrap()).is_none());
+        assert!(link_refusal("fe80::1".parse().unwrap()).is_none());
+        // Overlay VPNs (Tailscale's ranges) and public addresses are never the local network.
+        for far in ["100.100.1.1", "fd7a:115c:a1e0::1", "8.8.8.8"] {
+            assert!(link_refusal(far.parse().unwrap()).is_some(), "{far}");
+        }
+        // Configs written by versions with a Tailscale transport still load.
+        let old: SharedPeer = serde_json::from_str(r#"{"id":"a","name":"x","publicKey":"00","phrase":"","createdAt":1,"transport":"tailscale","tailnetId":{"tailnet":"t"}}"#).unwrap();
+        assert_eq!(old.name, "x");
+        let cfg: RemoteConfig = serde_json::from_str(r#"{"enabled":false,"tailnet":{"enabled":true},"autoApproveTransport":false}"#).unwrap();
+        assert!(!cfg.enabled);
     }
 
     #[test]
@@ -1903,7 +1666,8 @@ mod tests {
         assert_eq!(host_for_url("fd00::1"), "[fd00::1]");
         let found = discover_addresses(Some("chosen.invalid"));
         println!("{}", serde_json::to_string_pretty(&found).unwrap());
-        for ip in local_addresses() {
+        for ip in local_addresses().into_iter().filter(|ip| !is_tailscale_host(ip)) {
+            assert!(!found.iter().any(|c| c["kind"] == "tailscale"));
             assert!(found.iter().any(|c| c["address"] == ip.as_str() && c["pointsHere"] == true), "{ip}");
         }
         let chosen = found.iter().find(|c| c["address"] == "chosen.invalid").unwrap();

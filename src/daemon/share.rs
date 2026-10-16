@@ -7,8 +7,12 @@
 //!   (tunnel grant), dialed on loopback only.
 //!
 //! Unknown kinds are refused and audited, so new kinds (e.g. screen sharing) can be added with their own grants.
+//!
+//! The link is accepted only as a direct TCP connection from this Mac's local network, and its Noise session
+//! ends inside this daemon: no helper process or relay ever handles its bytes, encrypted or not. Tunnels can't
+//! reach this daemon's own ports, so the peer API (and the secrets it serves) is only reachable as a link stream.
 use super::link::{self, Incoming, Mux, PairPolicy};
-use super::remote::{LiveLink, Remote, TailnetId, Transport};
+use super::remote::{LiveLink, Remote};
 use super::server::AppState;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
@@ -20,24 +24,6 @@ use tokio::net::{TcpListener, TcpStream};
 /// Concurrent streams one paired Mac may hold open.
 const MAX_STREAMS: usize = 160;
 
-/// Which way a link connection arrived.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Via {
-    /// TCP on the link port (only accepted from this Mac's physical network).
-    Lan,
-    /// Through the tailnet helper, which reports who the node belongs to.
-    Tailnet(TailnetId),
-}
-
-impl Via {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Via::Lan => "lan",
-            Via::Tailnet(_) => "tailscale",
-        }
-    }
-}
-
 pub async fn serve(listener: TcpListener, app: AppState, remote: Arc<Remote>) {
     loop {
         let Ok((tcp, addr)) = listener.accept().await else {
@@ -46,42 +32,28 @@ pub async fn serve(listener: TcpListener, app: AppState, remote: Arc<Remote>) {
         };
         let _ = tcp.set_nodelay(true);
         let (app, remote) = (app.clone(), remote.clone());
-        tokio::spawn(async move { connection(tcp, addr, Via::Lan, app, remote).await });
+        tokio::spawn(async move { connection(tcp, addr, app, remote).await });
     }
 }
 
-/// Whether a paired Mac with `transport` may connect this way (None) or why not.
-pub fn transport_refusal(transport: Transport, expected: Option<&TailnetId>, via: &Via, ip: IpAddr) -> Option<String> {
-    let host = super::remote::hostname();
-    match via {
-        // A Mac on the Tailscale transport reaches us through the tailnet, even at home (Tailscale goes direct
-        // on a shared LAN), so plain TCP is local-only for everyone.
-        Via::Lan if !super::remote::is_local_source(ip) => Some(format!(
-            "{host} only accepts this Mac on its local network (it connected from {ip}) — switch it to Tailscale to connect from elsewhere"
-        )),
-        Via::Lan => None,
-        Via::Tailnet(_) if transport != Transport::Tailscale => {
-            Some(format!("{host} only accepts this Mac on its local network — switch it to Tailscale to connect over the tailnet"))
-        }
-        Via::Tailnet(id) => match expected {
-            Some(e) if !e.tailnet.is_empty() && e.tailnet != id.tailnet => {
-                Some(format!("{host} expects this Mac from tailnet {:?}, not {:?}", e.tailnet, id.tailnet))
-            }
-            _ => None,
-        },
-    }
+/// Whether a link or pairing connection from `ip` may be served (None) or why not: only from this Mac's own
+/// local network (see `remote::is_local_source`), never through a VPN or overlay network.
+pub fn link_refusal(ip: IpAddr) -> Option<String> {
+    (!super::remote::is_local_source(ip)).then(|| {
+        format!("{} only accepts paired Macs on its local network (this one connected from {ip})", super::remote::hostname())
+    })
 }
 
-pub async fn connection<S: link::Conn>(mut tcp: S, addr: SocketAddr, via: Via, app: AppState, remote: Arc<Remote>) {
+async fn connection(mut tcp: TcpStream, addr: SocketAddr, app: AppState, remote: Arc<Remote>) {
     let ip = addr.ip();
     let mut magic = [0u8; 6];
     if tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut magic)).await.map_or(true, |r| r.is_err()) {
         return;
     }
-    if via == Via::Lan && !super::remote::is_local_source(ip) && &magic == link::MAGIC_PAIR {
+    let off_lan = link_refusal(ip);
+    if let (Some(why), true) = (&off_lan, &magic == link::MAGIC_PAIR) {
         remote.audit(json!({ "event": "pair-refused", "address": ip.to_string(), "reason": "not on the local network" }));
-        let host = super::remote::hostname();
-        link::pair_refuse(tcp, &format!("{host} only pairs with Macs on its local network (or over Tailscale when that's on there)")).await;
+        link::pair_refuse(tcp, why).await;
         return;
     }
     if remote.locked_out(ip) {
@@ -94,11 +66,7 @@ pub async fn connection<S: link::Conn>(mut tcp: S, addr: SocketAddr, via: Via, a
         return;
     }
     if &magic == link::MAGIC_PAIR {
-        let tailnet = match &via {
-            Via::Tailnet(id) => Some(id.clone()),
-            Via::Lan => None,
-        };
-        let _ = link::pair_server(tcp, &Pairing { remote: remote.clone(), ip, tailnet }).await;
+        let _ = link::pair_server(tcp, &Pairing { remote: remote.clone(), ip }).await;
         return;
     }
     if &magic != link::MAGIC_LINK {
@@ -111,14 +79,14 @@ pub async fn connection<S: link::Conn>(mut tcp: S, addr: SocketAddr, via: Via, a
     let mut revoked = None;
     let mut wrong_path = None;
     let accepted = link::accept(tcp, &id, |key, _hello| match cfg.peer_by_key(key) {
-        Some(p) => match transport_refusal(p.transport, p.tailnet_id.as_ref(), &via, ip) {
+        Some(p) => match &off_lan {
             Some(why) => {
                 wrong_path = Some(p.name.clone());
-                Err(why)
+                Err(why.clone())
             }
             None => {
                 who = Some((p.id.clone(), p.name.clone()));
-                Ok(json!({ "hostname": super::remote::hostname(), "version": crate::paths::VERSION, "transport": p.transport.as_str() }))
+                Ok(json!({ "hostname": super::remote::hostname(), "version": crate::paths::VERSION }))
             }
         },
         None if remote.is_revoked(key) => {
@@ -134,7 +102,7 @@ pub async fn connection<S: link::Conn>(mut tcp: S, addr: SocketAddr, via: Via, a
             // A known-but-unpaired key retrying isn't guessing anything (keys can't be brute-forced), so only
             // malformed handshakes count toward the per-address lockout that also guards pairing.
             if let Some(name) = wrong_path {
-                remote.audit(json!({ "event": "link-refused", "peer": name, "address": ip.to_string(), "via": via.label(), "reason": e.to_string() }));
+                remote.audit(json!({ "event": "link-refused", "peer": name, "address": ip.to_string(), "reason": e.to_string() }));
             } else if let Some(key) = revoked {
                 remote.revocation_delivered(&key);
                 remote.audit(json!({ "event": "link-refused", "address": ip.to_string(), "reason": "revoked (told it to forget this Mac)" }));
@@ -149,8 +117,8 @@ pub async fn connection<S: link::Conn>(mut tcp: S, addr: SocketAddr, via: Via, a
     let Some((peer_id, peer_name)) = who else { return };
     remote.succeeded(ip);
     remote.touch_peer(&peer_id);
-    remote.links.lock().unwrap().push(LiveLink { peer_id: peer_id.clone(), mux: acc.mux.clone(), addr, via: via.clone() });
-    remote.audit(json!({ "event": "link-up", "peer": peer_name, "address": ip.to_string(), "via": via.label(), "version": acc.hello["version"] }));
+    remote.links.lock().unwrap().push(LiveLink { peer_id: peer_id.clone(), mux: acc.mux.clone(), addr });
+    remote.audit(json!({ "event": "link-up", "peer": peer_name, "address": ip.to_string(), "version": acc.hello["version"] }));
     let router = super::remote::peer_router(app.clone(), remote.clone(), peer_id.clone(), acc.mux.clone());
     let ctx = Arc::new(Ctx { app, remote: remote.clone(), peer_id: peer_id.clone(), peer_name: peer_name.clone(), mux: acc.mux.clone() });
     while let Some(inc) = acc.incoming.recv().await {
@@ -205,6 +173,10 @@ fn tunnel_denied(ctx: &Ctx, service: &str, port: u16) -> Option<&'static str> {
     if !cfg.sharing() || ctx.mux.is_closed() {
         return Some("sharing is off");
     }
+    // Never this daemon itself (local API, web dashboard, machine link), whatever a service claims to listen on.
+    if port == super::api_port() || port == cfg.link_port || (cfg.enabled && port == cfg.port) {
+        return Some("that port belongs to LStack itself");
+    }
     let Some(p) = cfg.peers.iter().find(|p| p.id == ctx.peer_id) else { return Some("not paired") };
     if !p.grants.tunnel_allows(service) {
         return Some("no tunnel permission for this service");
@@ -254,7 +226,6 @@ async fn tunnel(ctx: Arc<Ctx>, inc: Incoming) {
 struct Pairing {
     remote: Arc<Remote>,
     ip: IpAddr,
-    tailnet: Option<TailnetId>,
 }
 
 impl PairPolicy for Pairing {
@@ -283,7 +254,7 @@ impl PairPolicy for Pairing {
             n if n.trim().is_empty() => self.ip.to_string(),
             n => n,
         };
-        let peer = self.remote.add_peer(&name, &public, phrase, self.tailnet.clone()).map_err(|e| e.1)?;
+        let peer = self.remote.add_peer(&name, &public, phrase).map_err(|e| e.1)?;
         self.remote.pair_code_used();
         self.remote.succeeded(self.ip);
         self.remote.audit(json!({ "event": "paired", "peer": peer.name, "address": self.ip.to_string(), "phrase": phrase, "fingerprint": link::fingerprint(&public) }));

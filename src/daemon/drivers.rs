@@ -246,12 +246,17 @@ impl Sup {
         for w in warnings {
             self.system_log(name, &format!("[lstack] {w}"));
         }
+        let applied = super::envimport::hashed(&vars);
+        self.with(name, None, |m| {
+            m.env_applied = Some(applied);
+            m.env_stale = None;
+        });
         if let Some(p) = self.with(name, None, |m| m.secrets_pending.clone()).flatten() {
-            let keys: Vec<&str> = ["new", "changed", "missing"].iter().flat_map(|k| p[*k].as_array().into_iter().flatten()).filter_map(|v| v.as_str()).collect();
+            let keys: Vec<&str> = ["new", "changed", "missing", "link", "notStored"].iter().flat_map(|k| p[*k].as_array().into_iter().flatten()).filter_map(|v| v.as_str()).collect();
             if !keys.is_empty() {
                 self.system_log(
                     name,
-                    &format!("[lstack] 1Password changes waiting for review ({}); starting with the last approved values (lstack secret review {name})", keys.join(", ")),
+                    &format!("[lstack] env file secrets waiting for review ({}); starting with the last approved values (lstack env {name})", keys.join(", ")),
                 );
             }
         }
@@ -520,7 +525,7 @@ impl Sup {
         self.system_log(name, &format!("$ docker {}", args.join(" ")));
         let mut env: Vec<(String, String)> = cfg.env.clone().unwrap_or_default().into_iter().collect();
         env.extend(super::envimport::plain_env(&cfg).map(|(e, _)| e).unwrap_or_default());
-        env.extend(super::secrets::env_for(&cfg).unwrap_or_default());
+        env.extend(super::secrets::env_for_ungated(&cfg).unwrap_or_default());
         stream_cmd(logs, &docker_api::docker_bin(), &args, Some(&cwd), &env).await;
         self.with(name, None, |m| {
             m.rt.dispose();

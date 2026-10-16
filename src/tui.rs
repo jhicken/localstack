@@ -501,7 +501,7 @@ impl Ui {
     fn open_url(&mut self) {
         let Some(s) = self.current() else { return };
         let remote = s.machine.is_some();
-        let url = s.urls.iter().find(|u| u.via.is_some() || !(remote && u.local_only)).map(|u| u.url.clone());
+        let url = s.urls.iter().find(|u| u.via.is_some() || !(remote && (u.local_only || u.blocked.is_some()))).map(|u| u.url.clone());
         let msg = match (url, s.urls.is_empty()) {
             (Some(u), _) => match std::process::Command::new("/usr/bin/open")
                 .arg(&u)
@@ -914,6 +914,8 @@ fn details(s: &ServiceState, hist: &[MetricSample], w: usize) -> Vec<Line<'stati
         }
         if let Some(m) = &u.via {
             v.push(dim(format!("  🔒 via {m}")));
+        } else if u.blocked.as_deref() == Some("untunneled") {
+            v.push(dim("  (no tunnel: not reachable from here)"));
         } else if u.local_only {
             v.push(dim(if s.machine.is_some() { "  (not reachable from here)" } else { "  (localhost only)" }));
         }

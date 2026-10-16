@@ -81,13 +81,27 @@ async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response 
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(String::from);
-    let query_tok = req.uri().query().and_then(|q| {
-        q.split('&').find_map(|kv| kv.strip_prefix("token=").map(String::from))
-    });
-    if header_tok.or(query_tok).as_deref() != Some(st.token.as_str()) {
+    // Only the header: a token in a URL ends up in shell history, logs and process lists.
+    let tok_ok = header_tok.is_some_and(|t| ct_eq(t.as_bytes(), st.token.as_bytes()));
+    if !tok_ok {
         return ApiErr(401, "unauthorized".into()).into_response();
     }
+    // The CLI and the app never send Origin; a browser always does on cross-site requests. Host must be a
+    // loopback name, so a DNS-rebound page can't talk to the API under its own domain.
+    if req.headers().contains_key(header::ORIGIN) || !loopback_host(req.headers().get(header::HOST).and_then(|h| h.to_str().ok())) {
+        return ApiErr(403, "forbidden".into()).into_response();
+    }
     next.run(req).await
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+fn loopback_host(h: Option<&str>) -> bool {
+    let Some(h) = h else { return true }; // HTTP/1.0 clients may omit it
+    let host = if let Some(rest) = h.strip_prefix('[') { rest.split(']').next().unwrap_or("") } else { h.split(':').next().unwrap_or("") };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 pub fn router(st: AppState) -> Router {
@@ -124,50 +138,14 @@ pub fn router(st: AppState) -> Router {
                     ok()
                 }),
         )
-        // How a paired Mac may reach this one (changed here: it's told and redials).
-        .route(
-            "/api/remote/peers/:id/transport",
-            post(|State(st): State<AppState>, Path(id): Path<String>, body: Bytes| async move {
-                let v = parse_body(&body)?;
-                let t = v["transport"].as_str().and_then(super::remote::Transport::parse).ok_or_else(|| ApiErr::new(400, "transport must be \"local\" or \"tailscale\""))?;
-                Ok::<_, ApiErr>(Json(st.remote.set_peer_transport(&st, &id, t, "here", true)?))
-            }),
-        )
-        .route(
-            "/api/remote/transport-requests/:id/:decision",
-            post(|State(st): State<AppState>, Path((id, d)): Path<(String, String)>| async move {
-                let allow = match d.as_str() {
-                    "allow" => true,
-                    "deny" => false,
-                    _ => return Err(ApiErr::new(404, "use allow or deny")),
-                };
-                Ok::<_, ApiErr>(Json(st.remote.decide_transport(&st, &id, allow)?))
-            }),
-        )
         .route(
             "/api/remote/addresses",
             get(|State(st): State<AppState>| async move {
                 let sel = st.remote.config().share_address;
-                let mut found = tokio::task::spawn_blocking(move || super::remote::discover_addresses(sel.as_deref())).await.unwrap_or_default();
-                // The Tailscale helper's own name: reachable from anywhere on the tailnet.
-                if let Some((dns, ips)) = st.remote.tailnet.self_addrs() {
-                    found.retain(|v| v["address"] != dns.as_str());
-                    let pos = found.iter().position(|v| v["pointsHere"] != true).unwrap_or(found.len());
-                    found.insert(pos, json!({ "address": dns, "kind": "tailscale", "source": "tailscale helper", "resolves": ips, "pointsHere": true }));
-                }
+                let found = tokio::task::spawn_blocking(move || super::remote::discover_addresses(sel.as_deref())).await.unwrap_or_default();
                 Json(found)
             }),
         )
-        .route(
-            "/api/tailnet",
-            get(|State(st): State<AppState>| async move { Json(st.remote.tailnet.status(&st.remote.config().tailnet)) }).post(|State(st): State<AppState>, body: Bytes| async move {
-                let p: super::tailnet::TailnetPatch = serde_json::from_slice(if body.is_empty() { b"{}" } else { &body }).map_err(|_| ApiErr::new(400, "invalid JSON body"))?;
-                Ok::<_, ApiErr>(Json(super::tailnet::api_update(&st.remote, &st, p).await?))
-            }),
-        )
-        .route("/api/tailnet/login", post(|State(st): State<AppState>, body: Bytes| async move { Ok::<_, ApiErr>(Json(super::tailnet::api_login(&st.remote, &parse_body(&body)?).await?)) }))
-        .route("/api/tailnet/logout", post(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(super::tailnet::api_logout(&st.remote).await?)) }))
-        .route("/api/tailnet/update", post(|State(st): State<AppState>| async move { Ok::<_, ApiErr>(Json(super::tailnet::api_check_update(&st.remote).await?)) }))
         .route("/api/network", get(|| async { Json(json!({ "vpn": tokio::task::spawn_blocking(super::remote::vpn_status).await.unwrap_or_default() })) }))
         .route("/api/remote/activity", get(|State(st): State<AppState>| async move { Json(st.remote.activity()) }))
         .route("/api/identity", get(identity))
@@ -178,10 +156,17 @@ pub fn router(st: AppState) -> Router {
         .route("/api/settings", get(|| async { to_json(super::terminal::status()) }).put(settings_update))
         .route("/api/split-command", post(split_command))
         .route("/api/secrets", get(secrets_list))
+        .route("/api/approvals", get(approvals_list))
+        .route("/api/approvals/key", post(approval_key))
+        .route("/api/approvals/:id", get(approval_get).post(approval_sign))
+        .route("/api/approvals/:id/deny", post(approval_deny))
         .route("/api/secrets/unlock", post(secrets_unlock))
         .route("/api/secrets/rotate", post(secrets_rotate))
         .route("/api/secrets/:name", axum::routing::put(secret_set).delete(secret_delete))
         // 1Password: the daemon never runs `op`; clients read values after a person approves.
+        .route("/api/env/preview", post(env_preview))
+        .route("/api/services/:name/env", post(env_apply))
+        .route("/api/services/:name/env/approve", post(env_approve))
         .route("/api/onepassword/review/:service", get(op_review))
         .route("/api/onepassword/detect", post(op_detect))
         .route("/api/onepassword/plan", post(op_plan))
@@ -197,16 +182,6 @@ pub fn router(st: AppState) -> Router {
         .route("/api/machines", get(machines_list).post(machine_add))
         .route("/api/machines/:m", get(machine_get).patch(machine_patch).delete(machine_remove))
         .route("/api/machines/reconnect", post(|State(st): State<AppState>| async move { Json(json!({ "reconnecting": st.peers.reconnect_down() })) }))
-        .route(
-            "/api/machines/:m/transport",
-            post(|State(st): State<AppState>, Path(m): Path<String>, body: Bytes| async move {
-                let v = parse_body(&body)?;
-                let t = v["transport"].as_str().and_then(super::remote::Transport::parse).ok_or_else(|| ApiErr::new(400, "transport must be \"local\" or \"tailscale\""))?;
-                let force = v["force"].as_bool().unwrap_or(false);
-                let (peers, tn) = (st.peers.clone(), st.remote.tailnet.clone());
-                Ok::<_, ApiErr>(Json(blocking(move || peers.set_transport(&m, t, force, tn)).await?))
-            }),
-        )
         .route("/api/machines/:m/services/:name", get(m_service))
         .route("/api/machines/:m/services/:name/logs", get(m_logs))
         .route("/api/machines/:m/services/:name/logs/stream", get(m_log_stream))
@@ -272,6 +247,7 @@ async fn restart(State(st): State<AppState>, Path(name): Path<String>) -> Res {
 
 async fn stdin(State(st): State<AppState>, Path(name): Path<String>, body: Bytes) -> Res {
     let v = parse_body(&body)?;
+    console_gate(&st, &name)?;
     let data = match &v["data"] {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -395,6 +371,8 @@ pub(super) async fn events_stream(st: AppState, redact: bool, with_peers: bool, 
                     Ok(Event::Processes(p)) => sse_msg("processes", &json!({ "processes": *p })),
                     Ok(Event::Peer(p)) if with_peers => sse_msg("peer", &json!({ "machine": p.machine, "event": p.event, "data": p.data })),
                     Ok(Event::Peer(_)) => continue,
+                    // Approval requests quote config changes and are answered only on this Mac.
+                    Ok(Event::Notice(n)) if redact && n.get("approval").is_some() => continue,
                     Ok(Event::Notice(n)) if with_peers => sse_msg("notice", &*n),
                     Ok(Event::Notice(_)) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => snapshot(&sup),
@@ -431,7 +409,71 @@ async fn secrets_list(State(st): State<AppState>) -> Res {
     Ok(Json(super::secrets::status(&st.sup.configs())))
 }
 
+/// Typing into (or running commands inside) a service that holds secrets needs a Touch ID approval.
+pub(super) fn console_gate(st: &AppState, name: &str) -> Result<(), ApiErr> {
+    let cfg = st.sup.get_state(name)?.config;
+    super::approvals::console(&cfg).map_err(|e| ApiErr(428, e))
+}
+
+async fn approvals_list() -> Res {
+    Ok(Json(tokio::task::spawn_blocking(super::approvals::list).await.map_err(|e| ApiErr(500, e.to_string()))?))
+}
+
+async fn approval_get(Path(id): Path<String>) -> Res {
+    super::approvals::get(&id).map(Json).ok_or_else(|| ApiErr(404, "no such approval".into()))
+}
+
+async fn approval_sign(State(st): State<AppState>, Path(id): Path<String>, body: Bytes) -> Res {
+    let v = parse_body(&body)?;
+    let sig = v["signature"].as_str().ok_or_else(|| ApiErr(400, "body must be {\"signature\": \"<hex DER>\"}".into()))?.to_string();
+    let id2 = id.clone();
+    let start = tokio::task::spawn_blocking(move || super::approvals::approve(&id2, &sig))
+        .await
+        .map_err(|e| ApiErr(500, e.to_string()))?
+        .map_err(|(c, e)| ApiErr(c, e))?;
+    if let Some(name) = start {
+        // It was held back at start: start it now if it's meant to be running.
+        if st.sup.wants_running(&name) {
+            let sup = st.sup.clone();
+            tokio::spawn(async move {
+                let _ = sup.start(&name).await;
+            });
+        } else {
+            st.sup.touch(&name);
+        }
+    }
+    approval_get(Path(id)).await
+}
+
+async fn approval_deny(State(st): State<AppState>, Path(id): Path<String>) -> Res {
+    super::approvals::deny(&id).map_err(|(c, e)| ApiErr(c, e))?;
+    if let Some(name) = super::approvals::get(&id).and_then(|p| p["service"].as_str().map(String::from)) {
+        st.sup.touch(&name);
+    }
+    approval_get(Path(id)).await
+}
+
+async fn approval_key(State(st): State<AppState>, body: Bytes) -> Res {
+    let v = parse_body(&body)?;
+    let pk = v["publicKey"].as_str().ok_or_else(|| ApiErr(400, "body must be {\"publicKey\": \"<hex>\"}".into()))?.to_string();
+    let sig = v["signature"].as_str().map(String::from);
+    let configs = st.sup.configs();
+    tokio::task::spawn_blocking(move || super::approvals::register(&pk, sig.as_deref(), &configs))
+        .await
+        .map_err(|e| ApiErr(500, e.to_string()))?
+        .map(Json)
+        .map_err(|(c, e)| ApiErr(c, e))
+}
+
+fn not_internal(name: &str) -> Result<(), ApiErr> {
+    if name.starts_with(super::secrets::INTERNAL_PREFIX) {
+        return Err(ApiErr(403, format!("{} names are managed by LStack itself", super::secrets::INTERNAL_PREFIX)));
+    }
+    Ok(())
+}
+
 async fn secret_set(State(st): State<AppState>, Path(name): Path<String>, body: Bytes) -> Res {
+    not_internal(&name)?;
     let v = parse_body(&body)?;
     let value = v.get("value").and_then(Value::as_str).ok_or_else(|| ApiErr(400, "body must be {\"value\": \"…\"}".into()))?.to_string();
     tokio::task::spawn_blocking(move || super::secrets::set(&name, &value))
@@ -444,6 +486,7 @@ async fn secret_set(State(st): State<AppState>, Path(name): Path<String>, body: 
 }
 
 async fn secret_delete(State(st): State<AppState>, Path(name): Path<String>) -> Res {
+    not_internal(&name)?;
     if !super::secrets::remove(&name).map_err(|e| ApiErr(400, e))? {
         return Err(ApiErr(404, format!("no secret named {name}")));
     }
@@ -461,6 +504,42 @@ async fn op_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) 
 async fn op_review(State(st): State<AppState>, Path(service): Path<String>) -> Res {
     let sup = st.sup.clone();
     Ok(Json(op_blocking(move || super::envimport::review_service(&sup, &service)).await?.map_err(op_err)?))
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct EnvPreviewReq {
+    service: Option<String>,
+    dir: Option<String>,
+    files: Option<Vec<String>>,
+}
+
+/// Every variable in a service's (or a folder's) env files, plain values included. Local only.
+async fn env_preview(State(st): State<AppState>, Json(r): Json<EnvPreviewReq>) -> Res {
+    let sup = st.sup.clone();
+    Ok(Json(op_blocking(move || super::envimport::preview(&sup, r.service.as_deref(), r.dir.as_deref(), r.files)).await?.map_err(op_err)?))
+}
+
+#[derive(serde::Deserialize)]
+struct EnvApplyReq {
+    ops: Vec<super::envimport::EnvOp>,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn env_apply(State(st): State<AppState>, Path(name): Path<String>, body: Bytes) -> Res {
+    let r: EnvApplyReq = serde_json::from_slice(&body).map_err(|e| ApiErr(400, format!("bad request: {e}")))?;
+    let sup = st.sup.clone();
+    let actor = r.actor.clone().unwrap_or_else(|| "app".into());
+    Ok(Json(op_blocking(move || super::envimport::apply_env(&sup, &name, r.ops, &actor)).await?.map_err(op_err)?))
+}
+
+async fn env_approve(State(st): State<AppState>, Path(name): Path<String>, body: Bytes) -> Res {
+    let v = if body.is_empty() { Value::Null } else { parse_body(&body)? };
+    let keys: Option<Vec<String>> = v.get("keys").and_then(|k| serde_json::from_value(k.clone()).ok());
+    let actor = v.get("actor").and_then(Value::as_str).unwrap_or("app").to_string();
+    let sup = st.sup.clone();
+    Ok(Json(op_blocking(move || super::envimport::approve_stored(&sup, &name, keys.as_deref(), &actor)).await?.map_err(op_err)?))
 }
 
 async fn op_detect(Json(v): Json<Value>) -> Res {

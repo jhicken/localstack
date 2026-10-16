@@ -95,6 +95,22 @@ impl Client {
         }
     }
 
+    /// If `msg` names a pending Touch ID approval, open LStack.app and wait for it. `Ok(true)`: approved.
+    pub fn wait_approval(&self, msg: &str) -> Res<bool> {
+        let Some(id) = crate::daemon::approvals::id_in(msg) else { return Ok(false) };
+        eprintln!("{}", crate::fmt::dim(&format!("{msg}\nwaiting for approval in LStack.app… (Ctrl-C to stop waiting)")));
+        let _ = std::process::Command::new("/usr/bin/open").args(["-g", "-a", "LStack"]).status();
+        loop {
+            std::thread::sleep(Duration::from_millis(800));
+            let v: Value = self.req("GET", &format!("/api/approvals/{}", enc(id)), None)?;
+            match v["status"].as_str().unwrap_or("") {
+                "pending" => continue,
+                "approved" => return Ok(true),
+                other => return Err(format!("approval {other}")),
+            }
+        }
+    }
+
     pub fn list(&self) -> Res<ListResp> {
         self.req("GET", "/api/services", None)
     }

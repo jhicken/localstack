@@ -57,6 +57,9 @@ pub async fn handler(State(st): State<AppState>, Path(name): Path<String>, Query
         Ok(s) => s,
         Err(e) => return ApiErr::from(e).into_response(),
     };
+    if let Err(e) = super::approvals::console(&s.config) {
+        return ApiErr(428, e).into_response();
+    }
     let container = match tokio::task::spawn_blocking(move || crate::cli::exec_container(&s)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => return ApiErr(400, e).into_response(),
