@@ -246,6 +246,16 @@ impl Sup {
         let _ = self.events.send(Event::Notice(Arc::new(serde_json::json!({ "title": title, "body": body }))));
     }
 
+    /// A notice with data the app acts on (e.g. a request to approve from the notification).
+    pub fn notice_with(&self, title: &str, body: &str, data: serde_json::Value) {
+        println!("{} notice: {title}: {body}", super::paths::iso(super::now_ms()));
+        let mut v = serde_json::json!({ "title": title, "body": body });
+        if let (Some(o), serde_json::Value::Object(d)) = (v.as_object_mut(), data) {
+            o.extend(d);
+        }
+        let _ = self.events.send(Event::Notice(Arc::new(v)));
+    }
+
     pub fn new() -> rusqlite::Result<Arc<Self>> {
         paths::ensure_dirs();
         let (events, _) = broadcast::channel(1024);

@@ -43,9 +43,13 @@ fn help() -> String {
   lstack secret refresh <NAME…>|--service S|--all   re-read cached 1Password values
   lstack secret link <NAME> op://vault/item/field [--service S [--key ENV]]   cache one reference
   lstack secret audit [-n 50]    imports, refreshes, removals and transfers (never values)
-  lstack secret shares           what paired Macs wait for, and what you share with them
-  lstack secret share|unshare <machine> <NAME|op://…>…   send a paired Mac cached 1Password values
-  lstack secret sync [<service>]   take values paired Macs share with you now (from their cache)
+  lstack secret shares           requests from paired Macs, what you share, and pushes waiting here
+  lstack secret share|unshare <machine> <NAME|op://…>…   approve a paired Mac's request (or stop sharing)
+  lstack secret share <machine> --all                   approve all its requests (reads missing ones from 1Password)
+  lstack secret decline <machine> <op://…>…   decline a paired Mac's request
+  lstack secret push <machine> <NAME|op://…>…   offer cached 1Password values; that Mac accepts them
+  lstack secret sync [<service>]   ask paired Macs for values your services wait for; take approved ones
+  lstack secret accept|reject <machine> [op://…]   accept (or reject) values a paired Mac pushed
   lstack ps [--machine <m>]      busy processes (over the CPU/mem/net thresholds), per machine
   lstack machine ls|add|rm|rename   watch other Macs (their services show up everywhere)
   lstack heartbeat [status|key|machine|set|off|test]   healthchecks.io-compatible pings

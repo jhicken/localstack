@@ -363,6 +363,10 @@ struct MachinesSettings: View {
     @State private var addresses: [ShareAddress] = []
     @State private var findingAddresses = false
     @State private var copiedLink = false
+    @State private var pushTo: PushTarget?
+    /// Values watched Macs pushed here, waiting for approval.
+    @State private var incoming: [OPShares.Incoming] = []
+    @State private var answering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -390,6 +394,7 @@ struct MachinesSettings: View {
                     ForEach(Array(store.machines.enumerated()), id: \.element.id) { i, m in
                         if i > 0 { Divider().padding(.leading, 12) }
                         machineRow(m)
+                        pushedGroup(incoming.filter { $0.machine == m.name })
                         let fw = forwards.filter { $0.machine == m.name }
                         if !fw.isEmpty { forwardsGroup(m.name, fw) }
                     }
@@ -469,7 +474,10 @@ struct MachinesSettings: View {
                     Divider().padding(.leading, 52)
                     VStack(alignment: .leading, spacing: 8) {
                         sectionTitle("Paired Macs")
-                        ForEach(peers) { p in peerRow(p) }
+                        ForEach(peers) { p in
+                            peerRow(p)
+                            pushedGroup(incoming.filter { $0.machine == p.name })
+                        }
                     }
                     .padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
                 }
@@ -482,6 +490,7 @@ struct MachinesSettings: View {
             }
             ErrorText(text: error)
         }
+        .sheet(item: $pushTo) { p in PushSecretsSheet(peer: p) }
         .task {
             await store.refreshRemote()
             if sharing { await lookUpAddresses() }
@@ -498,6 +507,7 @@ struct MachinesSettings: View {
         identity = await store.linkIdentity()
         forwards = await store.forwards()
         activity = sharing ? await store.linkActivity() : nil
+        incoming = (try? await store.opShares())?.incoming ?? []
     }
 
     private var sharing: Bool { store.remote?.sharing ?? false }
@@ -641,6 +651,19 @@ struct MachinesSettings: View {
         }
     }
 
+    /// Values that Mac pushed here, waiting for approval.
+    @ViewBuilder
+    private func pushedGroup(_ pushed: [OPShares.Incoming]) -> some View {
+        if !pushed.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(pushed) { i in
+                    IncomingPushRow(item: i, busy: $answering, showMachine: false) { await reload() }
+                }
+            }
+            .padding(.leading, 18).padding(.trailing, 6).padding(.bottom, 8)
+        }
+    }
+
     private func machineRow(_ m: Machine) -> some View {
         HStack(spacing: 8) {
             MachineHeader(name: m.name, status: m.status, detail: nil, help: m.linkDescription).fixedSize()
@@ -659,6 +682,11 @@ struct MachinesSettings: View {
                     label = m.name
                 }
                 .controlSize(.small)
+            }
+            if !m.needsRepair, store.settings?.onepassword?.pushToPeers ?? true {
+                Button("Push Secrets…") { pushTo = PushTarget(id: "machine:\(m.name)", name: m.name) }
+                    .controlSize(.small)
+                    .help("Offer values read from 1Password on this Mac to \(m.name); it accepts them there, then they're sent over this Mac's link")
             }
             Button(role: .destructive) {
                 Task { error = await store.removeMachine(m.name); await reload() }
@@ -740,6 +768,11 @@ struct MachinesSettings: View {
                 }
                 .font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
+                if store.settings?.onepassword?.pushToPeers ?? true {
+                    Button("Push Secrets…") { pushTo = PushTarget(id: p.id, name: p.name) }
+                        .controlSize(.small)
+                        .help("Offer values read from 1Password on this Mac to \(p.name); it accepts them there")
+                }
                 Button("Revoke", role: .destructive) {
                     Task { error = await store.revokePeer(p.id); await reload() }
                 }

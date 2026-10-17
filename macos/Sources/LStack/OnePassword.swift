@@ -86,11 +86,11 @@ struct OnePasswordCLI: Sendable {
         return env
     }
 
-    private func process(_ args: [String]) -> Process {
+    private func process(_ args: [String], extraEnv: [String: String] = [:]) -> Process {
         let p = Process()
         p.executableURL = bin
         p.arguments = args
-        p.environment = environment
+        p.environment = environment.merging(extraEnv) { _, new in new }
         p.standardInput = FileHandle.nullDevice
         return p
     }
@@ -122,6 +122,49 @@ struct OnePasswordCLI: Sendable {
         guard let s = String(data: box.out, encoding: .utf8) else { throw OnePasswordError(message: "\(reference): value isn't UTF-8 text") }
         guard !s.isEmpty else { throw OnePasswordError(message: "\(reference): empty value") }
         return s
+    }
+
+    /// Every reference in one `op run` (so 1Password asks once for the batch, not once per value), blocking.
+    /// References go in as environment variables (not secret); `op run` resolves them for a `/bin/sh` that
+    /// prints them NUL-separated to the stdout pipe. The script is fixed text built from indices only.
+    /// Fails as a whole if any reference fails.
+    func readMany(_ refs: [String]) throws -> [String: String] {
+        guard !refs.isEmpty else { return [:] }
+        var extra: [String: String] = [:]
+        for (i, r) in refs.enumerated() { extra["LSTACK_OP_\(i)"] = r }
+        let script = "printf '%s\\0' " + refs.indices.map { "\"$LSTACK_OP_\($0)\"" }.joined(separator: " ")
+        let p = process(["run", "--no-masking", "--", "/bin/sh", "-c", script], extraEnv: extra)
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        let what = refs.count == 1 ? refs[0] : "\(refs.count) values"
+        do { try p.run() } catch { throw OnePasswordError(message: "op: \(error.localizedDescription)", stopsBatch: true) }
+        let box = PipeBox()
+        let group = DispatchGroup()
+        DispatchQueue.global(qos: .userInitiated).async(group: group) { box.out = out.fileHandleForReading.readDataToEndOfFile() }
+        DispatchQueue.global(qos: .userInitiated).async(group: group) { box.err = err.fileHandleForReading.readDataToEndOfFile() }
+        if group.wait(timeout: .now() + Self.readTimeout) == .timedOut {
+            p.terminate()
+            if group.wait(timeout: .now() + 5) == .timedOut { kill(p.processIdentifier, SIGKILL) }
+            p.waitUntilExit()
+            box.wipe()
+            throw OnePasswordError(message: "\(what): timed out waiting for 1Password (approve the request in the 1Password app)", stopsBatch: true)
+        }
+        p.waitUntilExit()
+        defer { box.wipe() }
+        if p.terminationStatus != 0 {
+            throw Self.explain(String(decoding: box.err, as: UTF8.self), reference: what)
+        }
+        let parts = box.out.split(separator: 0, omittingEmptySubsequences: false)
+        guard parts.count == refs.count + 1 else { throw OnePasswordError(message: "\(what): unexpected output from op run") }
+        var values: [String: String] = [:]
+        for (i, r) in refs.enumerated() {
+            guard let v = String(data: Data(parts[i]), encoding: .utf8), !v.isEmpty, !v.hasPrefix("op://") else {
+                throw OnePasswordError(message: "\(r): empty or unreadable value")
+            }
+            values[r] = v
+        }
+        return values
     }
 
     /// End the CLI's app-integration session so a later `op` call needs a new approval. Errors are ignored.
@@ -276,9 +319,7 @@ final class OnePasswordRun {
 
     /// Prepare, then run straight away (the caller's button is the confirmation).
     func pull(_ body: [String: Any]) async {
-        // Values from a paired Mac are never granted on the same click that asked for them: the plan
-        // stops at .ready so the review shows where they came from, and a second click imports.
-        if await prepare(body), plan?.fromPeers.isEmpty ?? true { await run() }
+        if await prepare(body) { await run() }
     }
 
     /// The user declined: drop the plan.
@@ -287,43 +328,67 @@ final class OnePasswordRun {
         phase = .cancelled
     }
 
-    /// Read what the plan needs from 1Password, then import. Only call from a user's click.
-    func run() async {
+    /// Reads `refs` with one approval in 1Password. If the batch fails for a reason that isn't about
+    /// 1Password itself (declined, locked…), falls back to one read each to tell which failed. Blocking.
+    nonisolated static func readBatch(_ cli: OnePasswordCLI, _ refs: [String]) -> (values: [String: String], errors: [String: String]) {
+        let refs = Array(Set(refs)).sorted()
+        do {
+            return (try cli.readMany(refs), [:])
+        } catch let e as OnePasswordError where e.stopsBatch {
+            return ([:], Dictionary(uniqueKeysWithValues: refs.map { ($0, e.message) }))
+        } catch {}
+        var values: [String: String] = [:], errors: [String: String] = [:]
+        var stop: String?
+        for r in refs {
+            if let stop { errors[r] = stop; continue }
+            do { values[r] = try cli.read(r) } catch {
+                let e = error as? OnePasswordError ?? OnePasswordError(message: error.localizedDescription)
+                errors[r] = e.message
+                if e.stopsBatch { stop = e.message }
+            }
+        }
+        return (values, errors)
+    }
+
+    /// Read what the plan needs from 1Password (one approval for all of it), then import. Only call from a
+    /// user's click. `prefetched` (reference → value): already read by the caller for several plans at once.
+    func run(prefetched: [String: String]? = nil, account prefetchedAccount: String? = nil) async {
         guard let plan, phase == .ready else { return }
         var values: [String: String] = [:]
         defer { values.removeAll() }
-        var account: String?
+        var account: String? = prefetchedAccount
         let reads = plan.reads
         if !reads.isEmpty {
             phase = .reading
-            let cli: OnePasswordCLI
-            do {
-                cli = try await Task.detached(priority: .userInitiated) { try OnePasswordCLI.find() }.value
-            } catch {
-                await store.opCancelPlan(plan.id)
-                self.error = error.localizedDescription
-                phase = .failed
-                return
-            }
-            account = cli.account
-            var stop = false
-            for item in reads {
-                if stop { states[item.name] = .skipped; failed.append(item.name); continue }
-                states[item.name] = .reading
-                let ref = item.ref
+            for item in reads { states[item.name] = .reading }
+            var got: [String: String] = [:], errors: [String: String] = [:]
+            defer { got.removeAll() }
+            if let prefetched {
+                got = prefetched
+            } else {
+                let cli: OnePasswordCLI
                 do {
-                    let v = try await Task.detached(priority: .userInitiated) { try cli.read(ref) }.value
+                    cli = try await Task.detached(priority: .userInitiated) { try OnePasswordCLI.find() }.value
+                } catch {
+                    await store.opCancelPlan(plan.id)
+                    self.error = error.localizedDescription
+                    phase = .failed
+                    return
+                }
+                account = cli.account
+                let refs = reads.map(\.ref)
+                (got, errors) = await Task.detached(priority: .userInitiated) { Self.readBatch(cli, refs) }.value
+                await Task.detached(priority: .utility) { cli.signout() }.value
+            }
+            for item in reads {
+                if let v = got[item.ref] {
                     values[item.name] = v
                     states[item.name] = .read
-                } catch {
-                    let e = error as? OnePasswordError ?? OnePasswordError(message: error.localizedDescription)
-                    states[item.name] = .failed(e.message)
+                } else {
+                    states[item.name] = .failed(errors[item.ref] ?? "\(item.ref): not read")
                     failed.append(item.name)
-                    // A declined prompt or a locked app will fail the rest the same way.
-                    stop = e.stopsBatch
                 }
             }
-            await Task.detached(priority: .utility) { cli.signout() }.value
         }
         let okItems = plan.items.filter { !$0.needsRead || values[$0.name] != nil }.map(\.name)
         if okItems.isEmpty && (plan.removals.isEmpty || !applyRemovals) {

@@ -1,4 +1,5 @@
-//! `lstack secret import | link | refresh | review | audit | share | unshare | shares | sync`: 1Password
+//! `lstack secret import | link | refresh | review | audit | share | unshare | decline | push | shares | sync
+//! | accept | reject`: 1Password
 //! references, read by this CLI (never the daemon) after you confirm, with approval in the 1Password app;
 //! and sharing cached values with paired Macs.
 use crate::cli::{confirm, Args};
@@ -25,7 +26,7 @@ const SPEC: &[(&str, &str, bool)] = &[
 ];
 
 pub fn handles(sub: &str) -> bool {
-    matches!(sub, "import" | "link" | "refresh" | "review" | "audit" | "share" | "unshare" | "shares" | "sync")
+    matches!(sub, "import" | "link" | "refresh" | "review" | "audit" | "share" | "unshare" | "decline" | "push" | "shares" | "sync" | "accept" | "reject")
 }
 
 pub fn cmd(args: &[String]) -> R {
@@ -74,8 +75,11 @@ pub fn cmd(args: &[String]) -> R {
             let (Some(machine), items) = (rest.first(), &rest[rest.len().min(1)..]) else {
                 return Err(format!("usage: lstack secret {sub} <machine> <NAME | op://…>…"));
             };
+            if sub == "share" && a.has("all") {
+                return share_all(&cl, &a, machine);
+            }
             if items.is_empty() {
-                return Err(format!("usage: lstack secret {sub} <machine> <NAME | op://…>…"));
+                return Err(format!("usage: lstack secret {sub} <machine> <NAME | op://…>… | --all"));
             }
             let allow = sub == "share";
             let v: Value = cl.req("POST", "/api/onepassword/shares", Some(json!({ "peer": machine, "items": items, "allow": allow, "actor": "cli" })))?;
@@ -89,22 +93,67 @@ pub fn cmd(args: &[String]) -> R {
             }
             Ok(())
         }
+        "decline" | "push" => {
+            let (Some(machine), items) = (rest.first(), &rest[rest.len().min(1)..]) else {
+                return Err(format!("usage: lstack secret {sub} <machine> <NAME | op://…>…"));
+            };
+            if items.is_empty() {
+                return Err(format!("usage: lstack secret {sub} <machine> <NAME | op://…>…"));
+            }
+            let path = if sub == "push" { "/api/onepassword/push" } else { "/api/onepassword/shares/decline" };
+            let v: Value = cl.req("POST", path, Some(json!({ "peer": machine, "items": items, "actor": "cli" })))?;
+            if sub == "push" {
+                println!("{} offered {} to {machine}; it's sent once someone accepts it there", c::green("✓"), items.join(", "));
+            } else {
+                println!("{} declined {machine}'s request for {}", c::green("✓"), items.join(", "));
+            }
+            if a.has("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            }
+            Ok(())
+        }
+        "accept" | "reject" => {
+            let Some(machine) = rest.first() else { return Err(format!("usage: lstack secret {sub} <machine> [op://…]…")) };
+            let mut body = json!({ "machine": machine });
+            if rest.len() > 1 {
+                body["refs"] = json!(&rest[1..]);
+            }
+            let path = if sub == "accept" { "/api/onepassword/peers/accept" } else { "/api/onepassword/peers/decline" };
+            let v: Value = cl.req("POST", path, Some(body))?;
+            let list = |k: &str| v[k].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+            if sub == "accept" && v["pending"] == true {
+                println!("{} accepted {} — {machine} sends them within 15 s (while it's connected)", c::green("✓"), list("accepted"));
+            } else if sub == "accept" {
+                println!("{} stored {} from {machine}", c::green("✓"), list("stored"));
+                let svcs = list("services");
+                if !svcs.is_empty() {
+                    println!("  now passed to {svcs} (restart running ones to use them)");
+                }
+            } else {
+                println!("{} rejected {} from {machine}", c::green("✓"), list("declined"));
+            }
+            Ok(())
+        }
         "shares" => shares(&cl, &a),
         "sync" => {
             let v: Value = cl.req("POST", "/api/onepassword/peers/sync", Some(json!({ "service": rest.first().map(String::as_str).or(a.get("service")) })))?;
             let mut n = 0;
             for r in v["received"].as_array().into_iter().flatten() {
-                let names: Vec<&str> = r["stored"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let names: Vec<&str> = r["stored"].as_array().into_iter().chain(r["updated"].as_array()).flatten().filter_map(Value::as_str).collect();
+                let svcs: Vec<&str> = r["services"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
                 n += names.len();
-                println!("{} from {}: {}", c::green("✓"), r["machine"].as_str().unwrap_or("?"), names.join(", "));
+                let to = if svcs.is_empty() { String::new() } else { format!(" → {}", svcs.join(", ")) };
+                println!("{} from {}: {}{to}", c::green("✓"), r["machine"].as_str().unwrap_or("?"), names.join(", "));
+            }
+            for r in v["asked"].as_array().into_iter().flatten() {
+                let refs: Vec<&str> = r["refs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                println!("{} asked {} for {} — waiting for approval there", c::yellow("…"), r["machine"].as_str().unwrap_or("?"), refs.join(", "));
             }
             for e in v["errors"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 println!("{} {e}", c::red("✗"));
             }
-            if n == 0 {
+            if n == 0 && v["asked"].as_array().is_none_or(|a| a.is_empty()) {
                 println!("{}", c::dim("nothing new from paired Macs"));
-            } else {
-                println!("Approve new ones for a service with {} (no 1Password prompt needed)", c::cyan("lstack secret import <service>"));
             }
             Ok(())
         }
@@ -322,6 +371,37 @@ fn add_env_file(cl: &Client, service: &str, file: &str) -> R {
 }
 
 /// Show a plan, confirm, read what it needs from 1Password, then hand the values to the daemon.
+/// Approve every open request from `machine` at once: values cached here are shared in one step; ones
+/// that aren't are read from 1Password here first (one confirmation each), then shared.
+fn share_all(cl: &Client, a: &Args, machine: &str) -> R {
+    let v: Value = cl.req("GET", "/api/onepassword/shares", None)?;
+    let peers = v["peers"].as_array().cloned().unwrap_or_default();
+    let p = peers.iter().find(|p| p["id"] == machine).or_else(|| peers.iter().find(|p| p["name"] == machine)).ok_or_else(|| format!("no paired Mac {machine}"))?;
+    let id = p["id"].as_str().unwrap_or(machine).to_string();
+    let open: Vec<&Value> = p["wants"].as_array().into_iter().flatten().filter(|w| w["granted"] != true && w["declined"] != true).collect();
+    if open.is_empty() {
+        println!("no open requests from {machine}");
+        return Ok(());
+    }
+    let (have, missing): (Vec<&Value>, Vec<&Value>) = open.into_iter().partition(|w| w["have"] == true);
+    if !have.is_empty() {
+        let refs: Vec<&str> = have.iter().filter_map(|w| w["ref"].as_str()).collect();
+        let _: Value = cl.req("POST", "/api/onepassword/shares", Some(json!({ "peer": id, "items": refs, "allow": true, "actor": "cli" })))?;
+        let names: Vec<&str> = have.iter().map(|w| w["name"].as_str().or(w["ref"].as_str()).unwrap_or("?")).collect();
+        println!("{} {machine} may now receive {}", c::green("✓"), names.join(", "));
+    }
+    let mut failed = vec![];
+    for w in missing {
+        let r = w["ref"].as_str().unwrap_or_default();
+        println!("{r} isn't on this Mac — reading it from 1Password to share with {machine}");
+        let res = cl.req("POST", "/api/onepassword/plan", Some(json!({ "kind": "link", "ref": r, "hint": w["key"], "sharePeer": id }))).and_then(|plan: Value| run_plan(cl, a, plan));
+        if let Err(e) = res {
+            failed.push(format!("{r}: {e}"));
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("\n")) }
+}
+
 fn run_plan(cl: &Client, a: &Args, plan: Value) -> R {
     let id = plan["id"].as_str().unwrap_or_default().to_string();
     let items = plan["items"].as_array().cloned().unwrap_or_default();
@@ -469,23 +549,41 @@ fn shares(cl: &Client, a: &Args) -> R {
     for p in v["peers"].as_array().into_iter().flatten() {
         let name = p["name"].as_str().unwrap_or("?");
         let granted = p["granted"].as_array().cloned().unwrap_or_default();
-        let wants: Vec<&Value> = p["wants"].as_array().into_iter().flatten().filter(|w| w["granted"] != true).collect();
+        let wants: Vec<&Value> = p["wants"].as_array().into_iter().flatten().filter(|w| w["granted"] != true && w["declined"] != true).collect();
+        let pushing = p["pushing"].as_array().cloned().unwrap_or_default();
         if granted.is_empty() && wants.is_empty() {
             continue;
         }
         any = true;
         println!("{}", c::bold(name));
         for g in &granted {
+            if pushing.iter().any(|x| x["ref"] == g["ref"]) {
+                println!("  {} {} {}", c::yellow("pushed"), g["ref"].as_str().unwrap_or("?"), c::dim("waiting for it to accept"));
+                continue;
+            }
             let note = if g["have"] == true { c::dim(&format!("as {}", g["name"].as_str().unwrap_or("?"))) } else { c::yellow("not stored here any more") };
             println!("  {} {} {note}", c::green("shared"), g["ref"].as_str().unwrap_or("?"));
         }
         for w in wants {
             let r = w["ref"].as_str().unwrap_or("?");
+            let svcs: Vec<&str> = w["services"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let r = &if svcs.is_empty() { r.to_string() } else { format!("{r} (for {})", svcs.join(", ")) };
             if w["have"] == true {
-                println!("  {} {r} — you have it: {}", c::yellow("wants "), c::cyan(&format!("lstack secret share {name} {}", w["name"].as_str().unwrap_or(r))));
+                println!("  {} {r} — approve: {}", c::yellow("wants "), c::cyan(&format!("lstack secret share {name} {}", w["name"].as_str().unwrap_or(r))));
             } else {
                 println!("  {} {r} {}", c::dim("wants "), c::dim("(not stored here)"));
             }
+        }
+    }
+    let incoming = v["incoming"].as_array().cloned().unwrap_or_default();
+    if !incoming.is_empty() {
+        any = true;
+        println!("{}", c::bold("Sent to you, waiting for approval"));
+        for i in &incoming {
+            let m = i["machine"].as_str().unwrap_or("?");
+            let svcs: Vec<&str> = i["services"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let to = if svcs.is_empty() { String::new() } else { format!(" for {}", svcs.join(", ")) };
+            println!("  {} {}{to} from {m} — {}", i["name"].as_str().unwrap_or("?"), c::dim(i["ref"].as_str().unwrap_or("")), c::cyan(&format!("lstack secret accept {m}")));
         }
     }
     let received = v["received"].as_array().cloned().unwrap_or_default();

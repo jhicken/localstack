@@ -297,9 +297,15 @@ struct OnePasswordReviewView: View {
                         .font(.system(size: 10)).foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 } else if let by = x.offeredBy, !by.isEmpty {
-                    Label("Shared by \(by.joined(separator: ", ")) — import needs no 1Password approval", systemImage: "desktopcomputer")
-                        .font(.system(size: 10)).foregroundStyle(.blue)
-                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Label("\(by.joined(separator: ", ")) sent this value — accept to use it (no 1Password approval)", systemImage: "desktopcomputer")
+                            .font(.system(size: 10)).foregroundStyle(.blue)
+                            .fixedSize(horizontal: false, vertical: true)
+                        ForEach(by, id: \.self) { m in
+                            Button(by.count == 1 ? "Accept" : "Accept from \(m)") { Task { await accept(m, x.ref) } }
+                                .controlSize(.mini).disabled(syncing)
+                        }
+                    }
                 }
                 if let b = x.blocked {
                     Label(b, systemImage: "xmark.octagon.fill").font(.system(size: 10)).foregroundStyle(.red)
@@ -323,10 +329,10 @@ struct OnePasswordReviewView: View {
                 Text(syncNote).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                if review?.refs.contains(where: { !($0.offeredBy ?? []).isEmpty }) == true {
-                    Button("Take from Paired Macs") { Task { await takeShared() } }
-                        .disabled(syncing || run?.busy == true || review?.locked == true)
-                        .help("Take values paired Macs share for \(service) (from their cache; no 1Password approval)")
+                if store.settings?.onepassword?.pullFromPeers == true {
+                    Button("Pull Shared Values") { Task { await takeShared() } }
+                        .disabled(syncing || run?.busy == true || review?.locked == true || review?.actionable != true)
+                        .help("Ask paired Macs for the values \(service) waits for. The Mac that has them approves once; they arrive here (from its cache, no 1Password).")
                 }
                 if review?.hasCached == true {
                     Button("Refresh Cached Values") { start(["kind": "refresh", "service": service]) }
@@ -343,17 +349,10 @@ struct OnePasswordReviewView: View {
                 }
                 .keyboardShortcut(.cancelAction)
                 .disabled(run?.busy == true)
-                if let run, run.phase == .ready, let plan = run.plan {
-                    // The plan stopped for confirmation because it uses values from a paired Mac.
-                    Button(peerConfirmTitle(plan)) { Task { await run.run() } }
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
-                } else {
-                    Button("Pull from 1Password") { start(["kind": "env", "service": service]) }
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
-                        .disabled(review?.actionable != true || review?.locked == true || run?.busy == true)
-                }
+                Button("Pull from 1Password") { start(["kind": "env", "service": service]) }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(review?.actionable != true || review?.locked == true || run?.busy == true)
             }
         }
     }
@@ -370,9 +369,16 @@ struct OnePasswordReviewView: View {
         await load()
     }
 
-    private func peerConfirmTitle(_ plan: OPPlan) -> String {
-        let use = "Use \(plan.fromPeers.count) from \(plan.peerNames.joined(separator: ", "))"
-        return plan.reads.isEmpty ? use : "\(use) & Read \(plan.reads.count) from 1Password"
+    private func accept(_ machine: String, _ ref: String) async {
+        syncing = true
+        defer { syncing = false }
+        do {
+            try await store.opAnswerPush(machine: machine, refs: [ref], accept: true)
+            syncNote = nil
+        } catch {
+            syncNote = error.localizedDescription
+        }
+        await load()
     }
 
     private func start(_ body: [String: Any]) {
@@ -691,9 +697,9 @@ struct OnePasswordCard: View {
             toggle("Restart running services when their values change", "restartOnChange", op.restartOnChange ?? false,
                    help: "After an import or refresh; otherwise they pick up new values on their next restart")
             toggle("Share refreshed values with Macs you've shared them with", "pushToPeers", op.pushToPeers ?? true,
-                   help: "After a refresh here, send changed values to paired Macs that were granted them")
+                   help: "After a refresh here, send changed values to paired Macs that were granted them. Also shows Push Secrets… on Settings › Machines, to offer values to a paired Mac (it accepts there).")
             toggle("Ask paired Macs for missing shared values (from their cache; never 1Password)", "pullFromPeers", op.pullFromPeers ?? false,
-                   help: "When a value that came from a paired Mac is missing here, ask that Mac again")
+                   help: "Every 15 s, ask paired Macs for 1Password references your services' env files wait for (they see the reference and the service). The Mac that has the value approves once; it then arrives here, encrypted, and goes to those services. Also shows Pull Shared Values.")
             HStack(spacing: 6) {
                 Text("Allowed vaults").font(.system(size: 11)).frame(width: 90, alignment: .leading)
                 TextField("Any vault", text: $vaults).onSubmit(saveVaults)
@@ -760,6 +766,7 @@ struct OnePasswordCard: View {
 // MARK: - sharing with paired Macs
 
 /// Cached 1Password values shared with paired Macs over the encrypted link. Never contacts 1Password.
+/// One ask, one approval: requests from paired Macs are approved here; values pushed here are accepted here.
 struct OPSharesList: View {
     @Environment(AppStore.self) private var store
     @State private var shares: OPShares?
@@ -769,21 +776,26 @@ struct OPSharesList: View {
 
     private var peers: [OPShares.Peer] { shares?.peers ?? [] }
     private var received: [OPShares.Received] { shares?.received ?? [] }
-    private var available: [OPShares.Available] { shares?.available ?? [] }
+    private var incoming: [OPShares.Incoming] { shares?.incoming ?? [] }
+    private var pulling: Bool { store.settings?.onepassword?.pullFromPeers == true }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 opLabel("Shared with Macs")
                 Spacer()
-                Button("Take Shared Values") { Task { await sync() } }
-                    .disabled(busy || (available.isEmpty && received.isEmpty))
-                    .help("Take the values paired Macs share with this Mac now (from their cache; never 1Password)")
+                if pulling {
+                    Button("Pull Shared Values") { Task { await sync() } }
+                        .disabled(busy)
+                        .help("Ask paired Macs now for the 1Password values your services wait for. The Mac that has them approves once; they arrive here (from its cache; never 1Password).")
+                }
             }
-            if peers.isEmpty && received.isEmpty && available.isEmpty {
-                Text("No paired Macs share 1Password values with this Mac, and none have asked for any.")
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+            if peers.allSatisfy({ $0.requests.isEmpty && $0.missing.isEmpty && ($0.granted ?? []).isEmpty }) && received.isEmpty && incoming.isEmpty {
+                Text(pulling ? "Nothing shared yet. Values your services wait for are requested from paired Macs automatically."
+                             : "Nothing shared yet. Turn on “Ask paired Macs for missing shared values” below to request them, or push them from the other Mac (Settings › Machines).")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
+            ForEach(incoming) { i in IncomingPushRow(item: i, busy: $busy) { await load() } }
             ForEach(peers) { p in peerRows(p) }
             ForEach(received, id: \.self) { r in
                 HStack(spacing: 6) {
@@ -794,11 +806,6 @@ struct OPSharesList: View {
                 }
                 .help(r.ref ?? "")
             }
-            let waiting = available.filter { a in !received.contains { $0.ref == a.ref } }
-            if !waiting.isEmpty {
-                Text("Offered to this Mac: " + waiting.map { "\(shortRef($0.ref)) (\($0.machine))" }.joined(separator: ", "))
-                    .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
             if let message {
                 Text(message).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
@@ -808,50 +815,74 @@ struct OPSharesList: View {
             }
         }
         .controlSize(.small)
-        .task { await load() }
+        .task {
+            // Requests and pushes arrive with the 15 s background sync.
+            while !Task.isCancelled {
+                await load()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
         .onChange(of: store.secrets?.secrets.map(\.fetchedAt)) { Task { await load() } }
     }
 
     @ViewBuilder private func peerRows(_ p: OPShares.Peer) -> some View {
-        let asks = (p.wants ?? []).filter { $0.have == true && $0.granted != true }
+        let asks = p.requests
+        let missing = p.missing
         let granted = p.granted ?? []
-        if !asks.isEmpty || !granted.isEmpty {
+        let pushing = Set((p.pushing ?? []).map(\.ref))
+        if !asks.isEmpty || !missing.isEmpty || !granted.isEmpty {
             HStack(spacing: 5) {
                 Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
                 Text(p.name).font(.system(size: 11, weight: .semibold))
+                Spacer()
+                if asks.count + missing.count > 1 {
+                    Button("Approve All (\(asks.count + missing.count))") { Task { await approveAll(p) } }.disabled(busy)
+                        .buttonStyle(.borderedProminent)
+                        .help(missing.isEmpty ? "Send \(p.name) every value it asked for, in one approval"
+                                              : "Send \(p.name) every value it asked for; \(missing.count) not on this Mac are read from 1Password first (it asks you to unlock)")
+                }
             }
             .padding(.top, 2)
             ForEach(asks, id: \.self) { w in
                 HStack(spacing: 6) {
                     Text(w.name ?? shortRef(w.ref)).font(.system(size: 11, design: .monospaced))
-                    Text("asked for it").font(.system(size: 10)).foregroundStyle(.orange)
+                    Text((w.services ?? []).isEmpty ? "asked for it" : "asked for it for \((w.services ?? []).joined(separator: ", "))")
+                        .font(.system(size: 10)).foregroundStyle(.orange)
                     Spacer()
-                    Button("Share") { Task { await share(p, w.name ?? w.ref, allow: true) } }.disabled(busy)
-                        .help("Let \(p.name) take this cached value over the encrypted link (\(w.ref))")
+                    Button("Decline") { Task { await decline(p, w.ref) } }.disabled(busy)
+                    Button("Approve") { Task { await share(p, w.ref, allow: true) } }.disabled(busy)
+                        .buttonStyle(.borderedProminent)
+                        .help("Send \(p.name) this cached value over the encrypted link (\(w.ref)); it goes straight to the service that asked")
                 }
                 .padding(.leading, 18)
+                .help(w.ref)
+            }
+            ForEach(missing, id: \.self) { w in
+                HStack(spacing: 6) {
+                    Text(w.key ?? shortRef(w.ref)).font(.system(size: 11, design: .monospaced))
+                    Text((w.services ?? []).isEmpty ? "asked · not on this Mac" : "asked for \((w.services ?? []).joined(separator: ", ")) · not on this Mac")
+                        .font(.system(size: 10)).foregroundStyle(.orange)
+                    Spacer()
+                    Button("Decline") { Task { await decline(p, w.ref) } }.disabled(busy)
+                    Button("Read & Approve") { Task { await readAndApprove(p, w.ref) } }.disabled(busy)
+                        .buttonStyle(.borderedProminent)
+                        .help("Read \(w.ref) from 1Password here (it asks you to unlock), store it under a new name, and send it to \(p.name)")
+                }
+                .padding(.leading, 18)
+                .help(w.ref)
             }
             ForEach(granted, id: \.self) { g in
                 HStack(spacing: 6) {
                     Text(g.name ?? shortRef(g.ref)).font(.system(size: 11, design: .monospaced))
-                    Text(g.have == false ? "shared · not cached here" : "shared").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(pushing.contains(g.ref) ? "pushed · waiting for \(p.name) to accept" : (g.have == false ? "shared · not cached here" : "shared"))
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Stop Sharing") { Task { await share(p, g.name ?? g.ref, allow: false) } }.disabled(busy)
+                    Button(pushing.contains(g.ref) ? "Cancel" : "Stop Sharing") { Task { await share(p, g.ref, allow: false) } }.disabled(busy)
                         .help(g.ref)
                 }
                 .padding(.leading, 18)
             }
         }
-    }
-
-    private func shortRef(_ ref: String) -> String {
-        ref.hasPrefix("op://") ? String(ref.dropFirst(5)) : ref
-    }
-
-    private func ageText(_ prefix: String, _ ms: Double?) -> String {
-        guard let ms else { return prefix }
-        let rel = RelativeDateTimeFormatter().localizedString(for: Date(timeIntervalSince1970: ms / 1000), relativeTo: .now)
-        return "\(prefix) · fetched \(rel)"
     }
 
     private func load() async {
@@ -864,6 +895,26 @@ struct OPSharesList: View {
         do { shares = try await store.opShare(peer: p.id, items: [item], allow: allow); error = nil } catch { self.error = error.localizedDescription }
     }
 
+    private func approveAll(_ p: OPShares.Peer) async {
+        busy = true
+        defer { busy = false }
+        message = await store.approveRequest(peer: p.id, refs: [])
+        await load()
+    }
+
+    private func readAndApprove(_ p: OPShares.Peer, _ ref: String) async {
+        busy = true
+        defer { busy = false }
+        message = await store.approveRequest(peer: p.id, refs: [ref])
+        await load()
+    }
+
+    private func decline(_ p: OPShares.Peer, _ ref: String) async {
+        busy = true
+        defer { busy = false }
+        do { shares = try await store.opDeclineRequest(peer: p.id, refs: [ref]); error = nil } catch { self.error = error.localizedDescription }
+    }
+
     private func sync() async {
         busy = true
         defer { busy = false }
@@ -872,6 +923,164 @@ struct OPSharesList: View {
             message = r.summary
             error = (r.errors ?? []).isEmpty ? nil : r.errors!.joined(separator: "\n")
             await load()
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func shortRef(_ ref: String) -> String {
+        ref.hasPrefix("op://") ? String(ref.dropFirst(5)) : ref
+    }
+
+    private func ageText(_ prefix: String, _ ms: Double?) -> String {
+        guard let ms else { return prefix }
+        let rel = RelativeDateTimeFormatter().localizedString(for: Date(timeIntervalSince1970: ms / 1000), relativeTo: .now)
+        return "\(prefix) · fetched \(rel)"
+    }
+}
+
+/// A value a paired Mac pushed here: Accept stores it (encrypted) and passes it to the services whose env
+/// files reference it; Reject tells that Mac. Used in Settings › Secrets and Settings › Machines.
+struct IncomingPushRow: View {
+    @Environment(AppStore.self) private var store
+    let item: OPShares.Incoming
+    @Binding var busy: Bool
+    var showMachine = true
+    let done: () async -> Void
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Image(systemName: "tray.and.arrow.down").foregroundStyle(.orange)
+                Text(item.name).font(.system(size: 11, weight: .medium, design: .monospaced))
+                Text(detail).font(.system(size: 10)).foregroundStyle(.orange)
+                Spacer()
+                Button("Reject") { Task { await answer(false) } }.disabled(busy)
+                Button("Accept") { Task { await answer(true) } }.disabled(busy)
+                    .buttonStyle(.borderedProminent)
+                    .help("Store this value (encrypted, from \(item.machine)'s 1Password cache) — \(item.ref)")
+            }
+            if let error {
+                Text(error).font(.system(size: 10)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .controlSize(.small)
+    }
+
+    private var detail: String {
+        let from = showMachine ? "sent by \(item.machine)" : "sent to this Mac"
+        let svcs = item.services ?? []
+        return svcs.isEmpty ? from : "\(from) for \(svcs.joined(separator: ", "))"
+    }
+
+    private func answer(_ accept: Bool) async {
+        busy = true
+        defer { busy = false }
+        do {
+            try await store.opAnswerPush(machine: item.machine, refs: [item.ref], accept: accept)
+            error = nil
+        } catch { self.error = error.localizedDescription }
+        await done()
+    }
+}
+
+/// Machines › Push Secrets…: offer values read from 1Password here to a paired Mac. Nothing is sent until
+/// someone accepts there.
+/// A paired Mac to push values to: one that watches this Mac (its id) or one this Mac watches
+/// (`machine:<name>`).
+struct PushTarget: Identifiable {
+    let id: String
+    let name: String
+}
+
+struct PushSecretsSheet: View {
+    @Environment(AppStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    let peer: PushTarget
+    @State private var shares: OPShares?
+    @State private var picked: Set<String> = []
+    @State private var busy = false
+    @State private var error: String?
+
+    /// Values read from 1Password on this Mac (the only kind that can be shared), one per reference: the
+    /// other Mac matches by reference, so names don't matter (or clash).
+    private var candidates: [SecretInfo] {
+        var seen = Set<String>()
+        return (store.secrets?.secrets ?? [])
+            .filter { ($0.source == "op" || $0.source == "op-env") && $0.ref != nil && $0.isInternal != true }
+            .sorted { ($0.fetchedAt ?? 0) > ($1.fetchedAt ?? 0) }
+            .filter { seen.insert($0.ref!).inserted }
+            .sorted { $0.name < $1.name }
+    }
+    private var mine: OPShares.Peer? { shares?.peers?.first { $0.id == peer.id } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Push Secrets to \(peer.name)").font(.headline)
+            Text("Choose cached 1Password values to offer. \(peer.name) is asked to accept them; once accepted they're sent over the encrypted link from this Mac's store (1Password isn't asked) and go to its services that reference them.")
+                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if candidates.isEmpty {
+                Text("No values read from 1Password on this Mac yet.").font(.system(size: 11)).foregroundStyle(.tertiary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(candidates, id: \.ref) { s in row(s) }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(minHeight: 120, maxHeight: 320)
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill").font(.system(size: 11)).foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Push \(picked.count)") { Task { await push() } }
+                    .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+                    .disabled(picked.isEmpty || busy)
+            }
+        }
+        .padding(16)
+        .frame(width: 460)
+        .task {
+            await store.refreshSecrets()
+            shares = try? await store.opShares()
+            // Preselect what it asked for.
+            let asked = Set((mine?.requests ?? []).map(\.ref))
+            picked = Set(candidates.compactMap(\.ref)).intersection(asked)
+        }
+    }
+
+    private func row(_ s: SecretInfo) -> some View {
+        let ref = s.ref ?? ""
+        let status: String? = {
+            if mine?.pushing?.contains(where: { $0.ref == ref }) == true { return "waiting for it to accept" }
+            if mine?.granted?.contains(where: { $0.ref == ref }) == true { return "already shared" }
+            if let w = mine?.requests.first(where: { $0.ref == ref }) {
+                return (w.services ?? []).isEmpty ? "it asked for this" : "asked for \((w.services ?? []).joined(separator: ", "))"
+            }
+            return nil
+        }()
+        return Toggle(isOn: Binding(get: { picked.contains(ref) }, set: { v in
+            if v { picked.insert(ref) } else { picked.remove(ref) }
+        })) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(s.name).font(.system(size: 12, design: .monospaced))
+                    if let status { Text(status).font(.system(size: 10)).foregroundStyle(.orange) }
+                }
+                Text(ref).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary).lineLimit(1)
+            }
+        }
+        .toggleStyle(.checkbox)
+    }
+
+    private func push() async {
+        busy = true
+        defer { busy = false }
+        do {
+            _ = try await store.opPush(peer: peer.id, items: Array(picked))
+            dismiss()
         } catch { self.error = error.localizedDescription }
     }
 }

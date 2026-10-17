@@ -70,7 +70,15 @@ All state lives in `~/.localstack` (override with `LSTACK_HOME`):
 
 ## Install
 
-Download `LStack-<version>-arm64.dmg` from **[Releases](https://github.com/jhicken/localstack/releases/latest)**.
+Install or update to the latest release with one line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jhicken/localstack/main/install.sh | bash
+```
+
+It downloads the latest `LStack-<version>-arm64.zip` from Releases, checks it against the release's SHA-256, quits the menu bar app, replaces `/Applications/LStack.app` (using `sudo` only if that folder isn't writable) and opens it. It does nothing if you're already up to date. Set `LSTACK_VERSION=0.7.1` to pick a release or `LSTACK_APP_DIR=~/Applications` to install elsewhere.
+
+Or download `LStack-<version>-arm64.dmg` from **[Releases](https://github.com/jhicken/localstack/releases/latest)**.
 
 LStack ships as **one app**. `LStack.app` contains the SwiftUI menu bar app and a single ~3 MB Rust binary (`Contents/Helpers/lstack`). That binary is the daemon, the CLI and the TUI.
 
@@ -81,7 +89,7 @@ LStack ships as **one app**. `LStack.app` contains the SwiftUI menu bar app and 
 
    You can reopen this window later from the ⚙ **Settings** button in the popover.
 
-**Updating.** Quit LStack, replace the app in Applications and open it again. The background service (daemon) keeps running across app restarts, so if it is older than the new app, LStack asks whether to restart it. Choose **Later** and a banner in the menu offers it again. Restarting stops scripts LStack started; autostart ones start again and containers keep running. From a terminal: `lstack daemon restart`. The CLI also warns when it talks to an out-of-date daemon.
+**Updating.** Run the install line above again, or quit LStack, replace the app in Applications and open it again. The background service (daemon) keeps running across app restarts, so if it is older than the new app, LStack asks whether to restart it. Choose **Later** and a banner in the menu offers it again. Restarting stops scripts LStack started; autostart ones start again and containers keep running. From a terminal: `lstack daemon restart`. The CLI also warns when it talks to an out-of-date daemon.
 
 You can do the same from a terminal:
 
@@ -257,18 +265,26 @@ secrets: { DATABASE_URL: DATABASE_URL }   # written by `secret import`: what you
   - `pushToPeers` and `pullFromPeers`: see below.
 - **Value changes in 1Password.** LStack can't see a value change in 1Password while the reference stays the same. Use **Refresh**; `secret ls` shows each value's source and when it was fetched.
 
-**Sharing with paired Macs.** A Mac that watches this one can receive 1Password values cached here, over the encrypted link. It never reads 1Password here, so it can't cause an approval prompt.
+**Sharing with paired Macs.** Paired Macs can receive 1Password values cached here, over the encrypted link. It works whichever way they're paired: with a Mac that watches this one or with one this Mac watches. When this Mac is the one watching, it delivers values over its own link, because the other Mac can't connect here. It never reads 1Password here, so it can't cause an approval prompt. Each transfer takes **one ask and one approval**, and either Mac can start it:
+
+- **The receiving Mac asks.** Turn on **Ask paired Macs for missing shared values** (`pullFromPeers`) on the Mac that needs the values. Every 15 seconds it asks its paired Macs for the 1Password references its services' env files wait for. You can also click **Pull Shared Values** (Settings → Secrets, or a service's **Review & Pull…**) or run `lstack secret sync`. Because it keeps asking, the request reaches the other Mac whenever that Mac is online. The Mac that has the value gets a notification naming the requesting Mac and the service, for example "studio asks for DB_PASSWORD for api". Approve or decline it right from the notification (its **Approve** covers every value listed), with **Approve All** per Mac, under Settings → Secrets → Shared with Macs, or with `lstack secret share` / `decline`. Requests are matched by 1Password reference, never by name, so different names on the two Macs don't matter. If the Mac being asked doesn't have that value yet, approving (the notification's **Approve**, or **Read & Approve** in Settings) reads it from 1Password there first. The 1Password app asks you to unlock, and the value is stored under a free name (the other Mac's key, or `KEY_2` if that name is taken, so an existing value is never replaced). Once approved, the value arrives on the next sync. It's stored encrypted, the same way as on the sending Mac, and goes straight to the services that asked. There's no second confirmation.
+- **The sending Mac pushes.** Click **Push Secrets…** on a paired Mac's row in Settings → Machines, either under the machines this Mac watches or under the Macs that can see this one. Or run `lstack secret push <machine> <NAME>…`. The button shows while **Share refreshed values with Macs you've shared them with** (`pushToPeers`) is on. The other Mac is notified and accepts or rejects the values on its Settings → Machines row, under Settings → Secrets, or with `lstack secret accept` / `reject`. Nothing is sent until it accepts. Accepted values go to its services whose env files reference them. Otherwise they're kept under the sender's name. A push waits until the other Mac comes online.
 
 ```sh
-lstack secret shares                       # what each paired Mac waits for that you have
-lstack secret share studio DATABASE_URL    # by stored name or exact op:// reference
-lstack secret unshare studio DATABASE_URL
-lstack secret sync [service]               # on the receiving Mac: take shared values now
+lstack secret shares                       # requests from paired Macs, what you share, pushes waiting here
+lstack secret share studio DATABASE_URL    # approve a request (by stored name or exact op:// reference)
+lstack secret share studio --all           # approve all of studio's requests at once
+lstack secret decline studio op://Dev/db/password
+lstack secret unshare studio DATABASE_URL  # stop sharing
+lstack secret push laptop DATABASE_URL     # offer a value; laptop accepts it
+lstack secret sync [service]               # on the receiving Mac: ask now, take approved values
+lstack secret accept|reject studio [op://…]   # on the receiving Mac: answer a push
 ```
 
-- **Sending.** It's off by default. Each grant is for one exact reference and one Mac, and you can revoke it. Only values read from 1Password on this Mac are sent: never typed-in ones, never ones received from another Mac, never `LSTACK_*`.
-- **Receiving.** The receiving Mac asks only for references its own env files wait for, and only when you import or sync (or with `pullFromPeers`). It stores each value as `from <machine>`, bound to that Mac's pinned key, and never overwrites a stored value that holds a different reference or came from elsewhere. A received value isn't given to any service until you confirm an import: the review and the app say **Value from paired Mac studio** with its age, and the confirm button names that Mac. That import needs no 1Password approval.
-- **What's automatic.** Newer values for references you already confirmed arrive by themselves after the sending Mac refreshes them (`pushToPeers`, on by default there), only from the same Mac key that sent them. Missing values arrive by themselves only with `pullFromPeers` on the receiving Mac (default off).
+- **Pull from 1Password** is separate. **Pull from 1Password** in the review always reads from 1Password on this Mac (the 1Password app asks for approval). **Pull Shared Values** only asks paired Macs.
+- **Sending.** Nothing is shared by default. Each grant is for one exact reference and one Mac, and you can revoke it. Only values read from 1Password on this Mac are sent: never typed-in ones, never ones received from another Mac, never `LSTACK_*`.
+- **Receiving.** A Mac takes a new value only for a reference it asked for (its own env files reference it) or a push someone accepted there. It stores each value as `from <machine>`, bound to that Mac's pinned key, and never overwrites a stored value that holds a different reference or came from elsewhere. A request tells the other Mac the reference and the service names, nothing else. Requests are only sent with `pullFromPeers` on, or when you click **Pull Shared Values** or run `lstack secret sync`. After a manual pull, Macs that watch this one can see the request for the next 10 minutes. When a Mac that watches this one pushes values, accepting them doesn't fetch anything right away; that Mac delivers them on its next round, within 15 seconds. If Touch ID approval is on for services, the changed service still needs it before it starts with the new value.
+- **What's automatic.** Newer values for references already received arrive by themselves after the sending Mac refreshes them (`pushToPeers`, on by default there), and only from the same Mac key that sent them. `restartOnChange` restarts the services that use them.
 - **Audit and revocation.** Both Macs audit transfers. Stopping sharing or unpairing stops updates; values already received stay on that Mac until you remove them.
 
 ## Service URLs

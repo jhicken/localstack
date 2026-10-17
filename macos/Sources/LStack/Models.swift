@@ -869,19 +869,34 @@ struct OPShares: Decodable {
         let have: Bool?
         let fetchedAt: Double?
     }
+    /// A request from a paired Mac: a reference its services' env files wait for.
     struct Want: Decodable, Hashable {
         let ref: String
         let name: String?
         let have: Bool?
         let granted: Bool?
         let fetchedAt: Double?
+        /// Its services that asked.
+        let services: [String]?
+        let declined: Bool?
+        /// The env key it uses there (a naming hint; values are matched by reference).
+        let key: String?
     }
     struct Peer: Decodable, Identifiable {
         let id: String
         let name: String
         let granted: [Granted]?
+        /// Pushed here and not accepted or rejected there yet.
+        let pushing: [Granted]?
         let wants: [Want]?
         let wantsAt: Double?
+        /// A Mac this one watches (values go over our link) rather than one that watches this Mac.
+        let watched: Bool?
+
+        /// Requests for values this Mac has and hasn't approved or declined.
+        var requests: [Want] { (wants ?? []).filter { $0.have == true && $0.granted != true && $0.declined != true } }
+        /// Requests for values not cached here: approving reads them from 1Password first.
+        var missing: [Want] { (wants ?? []).filter { $0.have != true && $0.granted != true && $0.declined != true } }
     }
     struct Received: Decodable, Hashable {
         let name: String
@@ -889,13 +904,19 @@ struct OPShares: Decodable {
         let from: String
         let fetchedAt: Double?
     }
-    struct Available: Decodable, Hashable {
+    /// A value a paired Mac pushed here, waiting for approval.
+    struct Incoming: Decodable, Hashable, Identifiable {
+        var id: String { machine + "\u{0}" + ref }
         let machine: String
         let ref: String
+        let name: String
+        let fetchedAt: Double?
+        /// Services here that reference it (accepting passes it to them).
+        let services: [String]?
     }
     let peers: [Peer]?
     let received: [Received]?
-    let available: [Available]?
+    let incoming: [Incoming]?
 }
 
 /// `POST /api/onepassword/peers/sync`.
@@ -904,14 +925,24 @@ struct OPPeerSync: Decodable {
         let machine: String
         let stored: [String]?
         let updated: [String]?
+        let services: [String]?
+    }
+    struct Asked: Decodable, Hashable {
+        let machine: String
+        let refs: [String]
     }
     let received: [Received]?
+    let asked: [Asked]?
     let errors: [String]?
 
     var summary: String {
-        let lines = (received ?? []).compactMap { r -> String? in
+        var lines = (received ?? []).compactMap { r -> String? in
             let n = (r.stored ?? []) + (r.updated ?? [])
-            return n.isEmpty ? nil : "From \(r.machine): \(n.joined(separator: ", "))"
+            let to = (r.services ?? []).isEmpty ? "" : " → \((r.services ?? []).joined(separator: ", "))"
+            return n.isEmpty ? nil : "From \(r.machine): \(n.joined(separator: ", "))\(to)"
+        }
+        for a in asked ?? [] {
+            lines.append("Asked \(a.machine) for \(a.refs.count) value\(a.refs.count == 1 ? "" : "s") — approve it there.")
         }
         return lines.isEmpty ? "Nothing new from paired Macs." : lines.joined(separator: "\n")
     }
@@ -957,9 +988,6 @@ struct OPPlan: Decodable, Identifiable {
     let removals: [Removal]
 
     var reads: [Item] { items.filter(\.needsRead) }
-    /// Values a paired Mac sent: always shown and confirmed before they're granted to a service.
-    var fromPeers: [Item] { items.filter { $0.cached && $0.from != nil } }
-    var peerNames: [String] { Array(Set(fromPeers.compactMap(\.from))).sorted() }
 }
 
 /// `POST /api/onepassword/import`.
@@ -970,6 +998,8 @@ struct OPImportResult: Decodable {
     let deleted: [String]?
     let skipped: [String]?
     let restarting: [String]?
+    /// The paired Mac it was read for (and is now shared with).
+    let sharedWith: String?
 }
 
 /// One line of `GET /api/onepassword/audit` (no values, ever).

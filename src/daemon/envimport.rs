@@ -1406,6 +1406,29 @@ pub fn approve_stored(sup: &Arc<Sup>, service: &str, keys: Option<&[String]>, ac
     Ok(preview_cfg(&cfg))
 }
 
+/// Pass values just received from a paired Mac to the services whose env files reference them
+/// (`grants`: service → key → stored name). The ask on this Mac (Pull Shared Values / pullFromPeers, or
+/// accepting a push) plus the other Mac's approval is the one approval; no import step follows.
+/// Returns the services updated.
+pub fn grant_received(sup: &Arc<Sup>, grants: &BTreeMap<String, BTreeMap<String, String>>, machine: &str) -> Vec<String> {
+    let mut done = vec![];
+    for (service, grant) in grants {
+        if grant.is_empty() {
+            continue;
+        }
+        if let Err(e) = update_mapping(sup, service, grant, &[], false) {
+            sup.with(service, None, |m| m.system(format!("[lstack] couldn't use values from {machine}: {}", e.1)));
+            continue;
+        }
+        let keys: Vec<String> = grant.keys().cloned().collect();
+        audit(&format!("peer:{machine}"), "peer-grant", json!({ "service": service, "granted": grant }));
+        sup.with(service, None, |m| m.system(format!("[lstack] using {} from {machine} (shared from its 1Password cache)", keys.join(", "))));
+        refresh_pending(sup, service, false);
+        done.push(service.clone());
+    }
+    done
+}
+
 /// Compare the plain env-file values with what the running process got; flag a restart (and say so
 /// once per change) when they differ. Also keeps the key list the menu bar shows.
 pub fn check_plain(sup: &Arc<Sup>, service: &str) {

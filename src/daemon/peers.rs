@@ -37,6 +37,13 @@ pub struct PeerCfg {
     /// Old bearer token: read so the entry loads, never written back.
     #[serde(skip_serializing)]
     pub token: String,
+    /// 1Password references whose cached values this Mac may deliver to it (it can't call here, so we
+    /// send them over our link when it asks or accepts).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// Of `secrets`: pushed to it and not accepted or declined there yet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub push: Vec<String>,
 }
 
 impl PeerCfg {
@@ -850,6 +857,39 @@ impl Peers {
     pub fn call_json(&self, name: &str, method: &str, path: &str, body: &Value) -> Result<Value, ApiErr> {
         let (mux, _) = self.live(name)?;
         self.request(&mux, method, path, Some(body)).map_err(|(c, m)| ApiErr::new(if c == 0 { 502 } else { c }, format!("{name}: {m}")))
+    }
+
+    /// A watched machine's saved settings.
+    pub fn machine(&self, name: &str) -> Option<PeerCfg> {
+        self.cfg(name)
+    }
+
+    /// Every watched machine's saved settings.
+    pub fn machines(&self) -> Vec<PeerCfg> {
+        self.inner.lock().unwrap().values().map(|p| p.cfg.clone()).collect()
+    }
+
+    /// Change which 1Password references are shared with (`secrets`) or pushed to (`push`) a watched
+    /// machine. Saved; the link isn't touched.
+    pub fn set_secret_lists(&self, name: &str, f: impl FnOnce(&mut PeerCfg)) -> Result<PeerCfg, ApiErr> {
+        let cfg = {
+            let mut g = self.inner.lock().unwrap();
+            let p = g.get_mut(name).ok_or_else(|| ApiErr::new(404, format!("no machine named {name:?}")))?;
+            f(&mut p.cfg);
+            p.cfg.secrets.sort();
+            p.cfg.secrets.dedup();
+            p.cfg.push.retain(|r| p.cfg.secrets.contains(r));
+            p.cfg.push.sort();
+            p.cfg.push.dedup();
+            p.cfg.clone()
+        };
+        let mut all = load();
+        for c in all.iter_mut().filter(|c| c.name == name) {
+            c.secrets = cfg.secrets.clone();
+            c.push = cfg.push.clone();
+        }
+        save(&all).map_err(|e| ApiErr::new(500, format!("cannot save peers.json: {e}")))?;
+        Ok(cfg)
     }
 
     /// The pinned link key (hex) of a paired Mac.

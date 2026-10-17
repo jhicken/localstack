@@ -98,11 +98,13 @@ pub struct Grants {
     pub tunnel: Vec<String>,
     /// 1Password references (exact `op://…`) whose cached values it may receive (Secrets › Share).
     pub secrets: Vec<String>,
+    /// Of `secrets`: values pushed to it (Machines › Push Secrets) that it hasn't accepted or declined yet.
+    pub push: Vec<String>,
 }
 
 impl Grants {
     pub fn new_pairing() -> Grants {
-        Grants { control: false, tunnel_all: true, tunnel: vec![], secrets: vec![] }
+        Grants { control: false, tunnel_all: true, tunnel: vec![], secrets: vec![], push: vec![] }
     }
     pub fn tunnel_allows(&self, service: &str) -> bool {
         self.tunnel_all || self.tunnel.iter().any(|s| s == service)
@@ -576,19 +578,46 @@ impl Remote {
     pub fn set_secret_grants(&self, id: &str, refs: &[String], allow: bool) -> Result<(String, Vec<String>), ApiErr> {
         let mut cfg = self.config();
         let i = Self::find_peer(&cfg, id)?;
-        let g = &mut cfg.peers[i].grants.secrets;
+        let g = &mut cfg.peers[i].grants;
         for r in refs {
-            g.retain(|x| x != r);
+            g.secrets.retain(|x| x != r);
             if allow {
-                g.push(r.clone());
+                g.secrets.push(r.clone());
+            } else {
+                g.push.retain(|x| x != r);
             }
         }
-        g.sort();
-        let list = g.clone();
+        g.secrets.sort();
+        let list = g.secrets.clone();
         let name = cfg.peers[i].name.clone();
         self.save(cfg)?;
         self.audit(json!({ "event": if allow { "secrets-shared" } else { "secrets-unshared" }, "peer": name, "refs": refs }));
         Ok((name, list))
+    }
+
+    /// Offer (`add`) these shared references to a paired Mac for it to accept, or forget the offer (it
+    /// accepted, declined, or already holds them). Unchanged lists aren't saved.
+    pub fn set_secret_push(&self, id: &str, refs: &[String], add: bool) -> Result<Vec<String>, ApiErr> {
+        let mut cfg = self.config();
+        let i = Self::find_peer(&cfg, id)?;
+        let g = &mut cfg.peers[i].grants;
+        let before = g.push.clone();
+        for r in refs {
+            g.push.retain(|x| x != r);
+            if add && g.secrets.contains(r) {
+                g.push.push(r.clone());
+            }
+        }
+        g.push.sort();
+        let list = g.push.clone();
+        if list != before {
+            let name = cfg.peers[i].name.clone();
+            self.save(cfg)?;
+            if add {
+                self.audit(json!({ "event": "secrets-pushed", "peer": name, "refs": refs }));
+            }
+        }
+        Ok(list)
     }
 
     /// Paired Mac by id or name.
@@ -1371,6 +1400,8 @@ pub(super) fn peer_router(app: AppState, remote: Arc<Remote>, peer_id: String, m
         .route("/peer/api/events", get(peer_events))
         .route("/peer/api/secrets/offer", post(peer_secrets_offer))
         .route("/peer/api/secrets/pull", post(peer_secrets_pull))
+        .route("/peer/api/secrets/needs", post(peer_secrets_needs))
+        .route("/peer/api/secrets/deliver", post(peer_secrets_deliver))
         .fallback(|| async { ApiErr::new(404, "not found") })
         .layer(middleware::from_fn_with_state(rs.clone(), require_link))
         .with_state(rs)
@@ -1509,7 +1540,8 @@ async fn peer_secrets_offer(State(rs): State<RState>, body: Bytes) -> Response {
     let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
     let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let Some(p) = rs.remote.peer(&lp.id) else { return ApiErr::new(403, "link only").into_response() };
-    let r = tokio::task::spawn_blocking(move || super::secretshare::offer(&p, &v)).await;
+    let (sup, remote, peers) = (rs.app.sup.clone(), rs.remote.clone(), rs.app.peers.clone());
+    let r = tokio::task::spawn_blocking(move || super::secretshare::offer(&sup, &remote, &peers, &p, &v)).await;
     match r {
         Ok(v) => Json(v).into_response(),
         Err(e) => ApiErr::new(500, e.to_string()).into_response(),
@@ -1522,9 +1554,36 @@ async fn peer_secrets_pull(State(rs): State<RState>, body: Bytes) -> Response {
     let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
     let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let Some(p) = rs.remote.peer(&lp.id) else { return ApiErr::new(403, "link only").into_response() };
-    let remote = rs.remote.clone();
-    let r = tokio::task::spawn_blocking(move || super::secretshare::serve(&remote, &p, &v)).await;
+    let (remote, peers) = (rs.remote.clone(), rs.app.peers.clone());
+    let r = tokio::task::spawn_blocking(move || super::secretshare::serve(&remote, &peers, &p, &v)).await;
     match r {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err((c, m))) => ApiErr::new(c, m).into_response(),
+        Err(e) => ApiErr::new(500, e.to_string()).into_response(),
+    }
+}
+
+/// The calling Mac watches this one, so it can't be asked from here: it tells us what it pushes and
+/// learns what we ask for and accepted (`{push}` → `{want, wantFor, have, declined, accepted}`).
+async fn peer_secrets_needs(State(rs): State<RState>, body: Bytes) -> Response {
+    let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let Some(p) = rs.remote.peer(&lp.id) else { return ApiErr::new(403, "link only").into_response() };
+    let sup = rs.app.sup.clone();
+    match tokio::task::spawn_blocking(move || super::secretshare::needs(&sup, &p, &v)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => ApiErr::new(500, e.to_string()).into_response(),
+    }
+}
+
+/// Values from a Mac that watches this one: `{values: [{ref, value, fetchedAt}]}`. Only what we asked for,
+/// accepted, or hold from it is stored.
+async fn peer_secrets_deliver(State(rs): State<RState>, body: Bytes) -> Response {
+    let Some(lp) = rs.peer.as_ref() else { return ApiErr::new(403, "link only").into_response() };
+    let Ok(v) = serde_json::from_slice::<Value>(&body) else { return ApiErr::new(400, "invalid JSON body").into_response() };
+    let Some(p) = rs.remote.peer(&lp.id) else { return ApiErr::new(403, "link only").into_response() };
+    let sup = rs.app.sup.clone();
+    match tokio::task::spawn_blocking(move || super::secretshare::deliver(&sup, &p, v)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err((c, m))) => ApiErr::new(c, m).into_response(),
         Err(e) => ApiErr::new(500, e.to_string()).into_response(),

@@ -162,12 +162,12 @@ async fn serve() -> i32 {
         signal(SignalKind::interrupt()).unwrap(),
         signal(SignalKind::hangup()).unwrap(),
     );
-    let (s2, p2) = (sup.clone(), peers.clone());
+    let (s2, p2, r2) = (sup.clone(), peers.clone(), state_remote_stop.clone());
     heartbeat::start(&sup);
     tokio::spawn(async move {
         s2.boot().await;
         envimport::spawn_watcher(s2.clone());
-        secretshare::spawn_sync(s2.clone(), p2);
+        secretshare::spawn_sync(s2.clone(), p2, r2);
         for e in s2.config_errors() {
             log(&format!("config error: {e}"));
         }

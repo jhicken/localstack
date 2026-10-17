@@ -58,9 +58,10 @@ struct SetupView: View {
         }
     }
 
-    /// Room for the scrolling part: the screen less the title bar, header, tabs, footer and padding.
+    /// Room for the scrolling part: at most 620 pt (longer tabs scroll), and never more than the screen
+    /// less the title bar, header, tabs, footer and padding.
     private var maxContentHeight: CGFloat {
-        max(300, (NSScreen.main?.visibleFrame.height ?? 900) - 240)
+        min(620, max(300, (NSScreen.main?.visibleFrame.height ?? 900) - 240))
     }
 
     private var content: some View {

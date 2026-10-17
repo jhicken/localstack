@@ -174,7 +174,11 @@ pub fn router(st: AppState) -> Router {
         .route("/api/onepassword/import", post(op_import))
         .route("/api/onepassword/audit", get(op_audit))
         .route("/api/onepassword/shares", get(op_shares).post(op_share))
+        .route("/api/onepassword/shares/decline", post(op_share_decline))
+        .route("/api/onepassword/push", post(op_push))
         .route("/api/onepassword/peers/sync", post(op_peer_sync))
+        .route("/api/onepassword/peers/accept", post(op_peer_accept))
+        .route("/api/onepassword/peers/decline", post(op_peer_decline))
         .route("/api/reload", post(|State(st): State<AppState>| async move { to_json(st.sup.reload()) }))
         .route("/api/shutdown", post(shutdown))
         .route("/api/open-dashboard", post(|q: Q| async move { open_terminal_with(&["top"], q.get("terminal").cloned()).await }))
@@ -560,20 +564,30 @@ struct PlanReq {
     key: Option<String>,
     path: Option<String>,
     content: Option<String>,
+    /// `link` answering a paired Mac's request (its id): shared with it once imported. Without `name`,
+    /// a free one is picked (from `hint`, its env key) so a clash never replaces another value.
+    #[serde(rename = "sharePeer")]
+    share_peer: Option<String>,
+    hint: Option<String>,
 }
 
 /// Start a review: what would be read from 1Password (or, for an Environment, what was read) and
 /// where it would go. Returns a plan id the client confirms with `/api/onepassword/import`.
 async fn op_plan(State(st): State<AppState>, Json(mut r): Json<PlanReq>) -> Res {
-    let (sup, peers) = (st.sup.clone(), st.peers.clone());
+    let (sup, remote, peers) = (st.sup.clone(), st.remote.clone(), st.peers.clone());
     let v = op_blocking(move || {
         use super::envimport as e;
-        if r.kind == "env" {
-            // A person asked to import: take values paired Macs share for it first (from their cache), so
-            // those need no 1Password read here.
-            if let Some(s) = r.service.as_deref() {
-                super::secretshare::sync(&sup, &peers, Some(s), true);
+        if let (Some(peer), "link") = (r.share_peer.clone(), r.kind.as_str()) {
+            let reference = r.reference.clone().ok_or((400, "ref required".to_string()))?;
+            let name = match r.name.clone() {
+                Some(n) => n,
+                None => super::secretshare::free_name(&sup, &reference, r.hint.as_deref()).ok_or((409, "no free secret name".to_string()))?,
+            };
+            let v = e::plan_link(&sup, &name, &reference, None, None)?;
+            if let Some(id) = v["id"].as_str() {
+                super::secretshare::fulfill_later(&remote, &peers, id, &peer, &reference)?;
             }
+            return Ok(v);
         }
         match r.kind.as_str() {
             "env" => e::plan_env(&sup, r.service.as_deref().ok_or((400, "service required".to_string()))?, r.keys.as_deref()),
@@ -622,34 +636,99 @@ async fn op_import(State(st): State<AppState>, Json(mut b): Json<ImportBody>) ->
         account: b.account.take(),
         actor: b.actor.take().filter(|a| matches!(a.as_str(), "cli" | "app")).unwrap_or_else(|| "api".into()),
     };
-    let sup = st.sup.clone();
-    Ok(Json(op_blocking(move || super::envimport::import(&sup, req)).await?.map_err(op_err)?))
+    let (sup, remote, peers) = (st.sup.clone(), st.remote.clone(), st.peers.clone());
+    let r = op_blocking(move || {
+        let (id, actor) = (req.plan.clone(), req.actor.clone());
+        let mut v = super::envimport::import(&sup, req)?;
+        // Read to answer a paired Mac's request: share it with that Mac now.
+        if let Some(m) = super::secretshare::fulfilled(&sup, &remote, &peers, &id, &actor) {
+            v["sharedWith"] = json!(m);
+        }
+        Ok(v)
+    });
+    Ok(Json(r.await?.map_err(op_err)?))
 }
 
 async fn op_shares(State(st): State<AppState>) -> Res {
-    Ok(Json(super::secretshare::shares(&st.remote)))
+    Ok(Json(super::secretshare::shares(&st.remote, &st.peers)))
 }
 
-/// `{peer, items: [name | ref], allow: bool, actor}`: share stored 1Password values with a paired Mac (or stop).
+fn items_of(v: &Value, key: &str) -> Vec<String> {
+    v[key].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default()
+}
+
+fn actor_of(v: &Value) -> String {
+    v["actor"].as_str().filter(|a| matches!(*a, "cli" | "app")).unwrap_or("api").to_string()
+}
+
+fn peer_of(v: &Value, key: &str) -> Result<String, ApiErr> {
+    v[key].as_str().map(String::from).ok_or_else(|| ApiErr(400, format!("{key} required")))
+}
+
+/// `{peer, items: [name | ref], allow: bool, actor}`: share stored 1Password values with a paired Mac (or
+/// stop). Approves its requests for them.
 async fn op_share(State(st): State<AppState>, Json(v): Json<Value>) -> Res {
-    let peer = v["peer"].as_str().ok_or_else(|| ApiErr(400, "peer required".into()))?.to_string();
-    let items: Vec<String> = v["items"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+    let (peer, items, actor) = (peer_of(&v, "peer")?, items_of(&v, "items"), actor_of(&v));
     let allow = v["allow"].as_bool().unwrap_or(true);
-    let actor = v["actor"].as_str().filter(|a| matches!(*a, "cli" | "app")).unwrap_or("api").to_string();
-    let remote = st.remote.clone();
-    Ok(Json(op_blocking(move || super::secretshare::set_share(&remote, &peer, &items, allow, &actor)).await?.map_err(op_err)?))
+    let (sup, remote, peers) = (st.sup.clone(), st.remote.clone(), st.peers.clone());
+    let r = op_blocking(move || {
+        super::secretshare::set_share(&remote, &peers, &peer, &items, allow, &actor)?;
+        // A Mac this one watches gets approved values now rather than on the next round.
+        super::secretshare::nudge(&sup, &remote, &peers, &peer);
+        Ok(super::secretshare::shares(&remote, &peers))
+    });
+    Ok(Json(r.await?.map_err(op_err)?))
 }
 
-/// `{service?}`: ask paired Macs now for values they share (for `service`, or newer values of ones held).
+/// `{peer, items: [ref], actor}`: decline (hide) a paired Mac's requests.
+async fn op_share_decline(State(st): State<AppState>, Json(v): Json<Value>) -> Res {
+    let (peer, items, actor) = (peer_of(&v, "peer")?, items_of(&v, "items"), actor_of(&v));
+    let (remote, peers) = (st.remote.clone(), st.peers.clone());
+    Ok(Json(op_blocking(move || super::secretshare::ignore(&remote, &peers, &peer, &items, &actor)).await?.map_err(op_err)?))
+}
+
+/// `{peer, items: [name | ref], actor}`: push stored 1Password values to a paired Mac; it must accept them.
+async fn op_push(State(st): State<AppState>, Json(v): Json<Value>) -> Res {
+    let (peer, items, actor) = (peer_of(&v, "peer")?, items_of(&v, "items"), actor_of(&v));
+    let (sup, remote, peers) = (st.sup.clone(), st.remote.clone(), st.peers.clone());
+    let r = op_blocking(move || {
+        super::secretshare::push(&remote, &peers, &peer, &items, &actor)?;
+        super::secretshare::nudge(&sup, &remote, &peers, &peer);
+        Ok(super::secretshare::shares(&remote, &peers))
+    });
+    Ok(Json(r.await?.map_err(op_err)?))
+}
+
+/// `{service?}`: sync with paired Macs now — ask for what our services wait for (or `service`'s), take
+/// what they approved, and newer values of ones held.
 async fn op_peer_sync(State(st): State<AppState>, body: axum::body::Bytes) -> Res {
     let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let service = v["service"].as_str().map(String::from);
-    let (sup, peers) = (st.sup.clone(), st.peers.clone());
+    let (sup, peers, remote) = (st.sup.clone(), st.peers.clone(), st.remote.clone());
     let r = op_blocking(move || {
-        super::secretshare::sync(&sup, &peers, service.as_deref(), true)
-    })
-    .await?;
-    Ok(Json(r))
+        let mut v = super::secretshare::sync(&sup, &peers, service.as_deref(), true);
+        let errs = super::secretshare::serve_watchers(&sup, &remote, &peers, None);
+        if let Some(a) = v["errors"].as_array_mut() {
+            a.extend(errs.into_iter().map(Value::String));
+        }
+        v
+    });
+    Ok(Json(r.await?))
+}
+
+/// `{machine, refs?}`: accept values a paired Mac pushed (all of them without `refs`).
+async fn op_peer_accept(State(st): State<AppState>, Json(v): Json<Value>) -> Res {
+    let machine = peer_of(&v, "machine")?;
+    let refs = v.get("refs").map(|_| items_of(&v, "refs"));
+    let (sup, peers) = (st.sup.clone(), st.peers.clone());
+    Ok(Json(op_blocking(move || super::secretshare::accept(&sup, &peers, &machine, refs.as_deref())).await?.map_err(op_err)?))
+}
+
+/// `{machine, refs?}`: decline values a paired Mac pushed.
+async fn op_peer_decline(Json(v): Json<Value>) -> Res {
+    let machine = peer_of(&v, "machine")?;
+    let refs = v.get("refs").map(|_| items_of(&v, "refs"));
+    Ok(Json(super::secretshare::decline(&machine, refs.as_deref()).map_err(op_err)?))
 }
 
 async fn op_audit(Query(q): Query<HashMap<String, String>>) -> Res {

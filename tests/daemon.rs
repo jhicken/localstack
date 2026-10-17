@@ -550,7 +550,8 @@ fn web_dashboard_redacts_local_machine_routes() {
     let _ = d.post("/api/services/api/stop", None);
 }
 
-/// A paired Mac receives a 1Password value only after it's shared with it, from the other Mac's store.
+/// A paired Mac receives a 1Password value only after one ask and one approval: it asks and the other Mac
+/// approves, or the other Mac pushes and it accepts. Served from the other Mac's store.
 #[test]
 fn onepassword_values_shared_with_paired_mac() {
     let base = std::env::temp_dir().join(format!("lstack-it-opshare-{}", std::process::id()));
@@ -581,34 +582,86 @@ fn onepassword_values_shared_with_paired_mac() {
         "envFiles": [".env"], "command": "echo db=${DB_PASSWORD:-unset}; sleep 60" }))).unwrap();
     wait_until("pending", 10, || b.svc("api")["secretsPending"]["new"] == json!(["DB_PASSWORD"]));
 
-    // Not shared yet: nothing arrives, but `a` sees what `b` waits for (references only).
+    // Asking (Pull Shared Values / pullFromPeers): nothing arrives until `a` approves, but `a` sees the
+    // request and which service wants it (references and service names only).
     let r = b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
     assert_eq!(r["received"], json!([]), "{r}");
+    assert_eq!(r["asked"][0]["machine"], "studio", "{r}");
     let shares = a.get("/api/onepassword/shares").unwrap();
     assert_eq!(shares["peers"][0]["wants"][0]["ref"], "op://Dev/db/password", "{shares}");
     assert_eq!(shares["peers"][0]["wants"][0]["have"], true);
+    assert_eq!(shares["peers"][0]["wants"][0]["services"], json!(["api"]));
     // Only values read from 1Password here can be shared.
     assert_eq!(a.post("/api/onepassword/shares", Some(json!({ "peer": peer_id, "items": ["TYPED_IN"] }))).unwrap_err().0, 400);
     assert_eq!(a.post("/api/onepassword/shares", Some(json!({ "peer": peer_id, "items": ["op://Dev/nope/x"] }))).unwrap_err().0, 404);
+    assert_eq!(a.post("/api/onepassword/push", Some(json!({ "peer": peer_id, "items": ["TYPED_IN"] }))).unwrap_err().0, 400);
 
-    // Shared: importing on `b` takes it from `a` — no 1Password read.
-    let (ok, out) = a.cli(&["secret", "share", &peer_id, "DB_PASSWORD"]);
+    // `a` approves: the next sync on `b` takes it and passes it to `api` — no second confirmation there.
+    let (ok, out) = a.cli(&["secret", "share", &peer_id, "--all"]);
     assert!(ok, "{out}");
-    let plan = b.post("/api/onepassword/plan", Some(json!({ "kind": "env", "service": "api" }))).unwrap();
-    assert_eq!(plan["items"][0]["cached"], true, "{plan}");
-    assert_eq!(plan["items"][0]["needsRead"], false);
-    assert_eq!(plan["items"][0]["from"], "studio", "the plan says the value came from the paired Mac");
-    // Received values aren't granted to anything until that plan is confirmed.
-    assert_eq!(b.svc("api")["config"]["secrets"], Value::Null);
-    b.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": {} }))).unwrap();
-    let entry = |d: &Daemon| d.get("/api/secrets").unwrap()["secrets"].as_array().unwrap().iter().find(|s| s["name"] == "DB_PASSWORD").cloned().unwrap_or(Value::Null);
-    assert_eq!(entry(&b)["source"], "peer:studio");
+    let r = b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    assert_eq!(r["received"][0]["services"], json!(["api"]), "{r}");
+    let entry = |d: &Daemon, n: &str| d.get("/api/secrets").unwrap()["secrets"].as_array().unwrap().iter().find(|s| s["name"] == n).cloned().unwrap_or(Value::Null);
+    assert_eq!(entry(&b, "DB_PASSWORD")["source"], "peer:studio");
     assert_eq!(b.svc("api")["config"]["secrets"], json!({ "DB_PASSWORD": "DB_PASSWORD" }));
+    wait_until("not pending", 10, || b.svc("api")["secretsPending"].is_null());
     b.post("/api/services/api/start", None).unwrap();
     wait_until("injected", 10, || b.logs("api").contains("db=••••[DB_PASSWORD]"));
     assert!(!b.logs("api").contains(value));
 
+    // Push: `a` offers a value; `b` sees it and must accept (or reject) before anything is sent.
+    let plan = a.post("/api/onepassword/plan", Some(json!({ "kind": "link", "name": "NPM_TOKEN", "ref": "op://Dev/npm/token" }))).unwrap();
+    a.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "NPM_TOKEN": "npm-tok-W4" } }))).unwrap();
+    a.post("/api/onepassword/push", Some(json!({ "peer": peer_id, "items": ["NPM_TOKEN"] }))).unwrap();
+    assert_eq!(a.get("/api/onepassword/shares").unwrap()["peers"][0]["pushing"][0]["ref"], "op://Dev/npm/token");
+    b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    let inc = b.get("/api/onepassword/shares").unwrap()["incoming"].clone();
+    assert_eq!(inc[0]["machine"], "studio", "{inc}");
+    assert_eq!(inc[0]["name"], "NPM_TOKEN");
+    assert_eq!(entry(&b, "NPM_TOKEN"), Value::Null, "nothing stored before it's accepted");
+    // Rejected: `a` stops offering it.
+    b.post("/api/onepassword/peers/decline", Some(json!({ "machine": "studio" }))).unwrap();
+    b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    assert_eq!(a.get("/api/onepassword/shares").unwrap()["peers"][0]["pushing"], json!([]));
+    assert_eq!(b.get("/api/onepassword/shares").unwrap()["incoming"], json!([]));
+    // Pushed again and accepted: stored under the sender's name.
+    let (ok, out) = a.cli(&["secret", "push", &peer_id, "NPM_TOKEN"]);
+    assert!(ok, "{out}");
+    b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    let (ok, out) = b.cli(&["secret", "accept", "studio"]);
+    assert!(ok, "{out}");
+    assert_eq!(entry(&b, "NPM_TOKEN")["source"], "peer:studio");
+    assert_eq!(a.get("/api/onepassword/shares").unwrap()["peers"][0]["pushing"], json!([]));
+
+    // A request for a value `a` doesn't hold — and `a` already has a different API_KEY. Approving reads
+    // it from 1Password under a free name (matched by reference; the existing one is untouched) and
+    // shares it in the same step.
+    let plan = a.post("/api/onepassword/plan", Some(json!({ "kind": "link", "name": "API_KEY", "ref": "op://Other/api/key" }))).unwrap();
+    a.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "API_KEY": "other-key" } }))).unwrap();
+    let wapp = base.join("b/worker");
+    std::fs::create_dir_all(&wapp).unwrap();
+    std::fs::write(wapp.join(".env"), "API_KEY=op://Dev/api/key\n").unwrap();
+    b.post("/api/services", Some(json!({ "name": "worker", "type": "process", "restart": "never", "cwd": wapp.to_string_lossy(),
+        "envFiles": [".env"], "command": "sleep 60" }))).unwrap();
+    wait_until("worker pending", 10, || b.svc("worker")["secretsPending"]["new"] == json!(["API_KEY"]));
+    b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    let wants = a.get("/api/onepassword/shares").unwrap()["peers"][0]["wants"].clone();
+    let w = wants.as_array().unwrap().iter().find(|w| w["ref"] == "op://Dev/api/key").cloned().unwrap_or(Value::Null);
+    assert_eq!(w["have"], false, "{wants}");
+    assert_eq!(w["key"], "API_KEY");
+    let plan = a.post("/api/onepassword/plan", Some(json!({ "kind": "link", "ref": "op://Dev/api/key", "hint": "API_KEY", "sharePeer": peer_id }))).unwrap();
+    let name = plan["items"][0]["name"].as_str().unwrap().to_string();
+    assert_eq!(name, "API_KEY_2", "{plan}");
+    let r = a.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { (name.clone()): "dev-key-V5" } }))).unwrap();
+    assert_eq!(r["sharedWith"], a.get("/api/remote/peers").unwrap()[0]["name"], "{r}");
+    assert_eq!(entry(&a, "API_KEY")["ref"], "op://Other/api/key");
+    let r = b.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    assert_eq!(r["received"][0]["services"], json!(["worker"]), "{r}");
+    assert_eq!(entry(&b, "API_KEY")["ref"], "op://Dev/api/key");
+    assert_eq!(entry(&b, "API_KEY")["source"], "peer:studio");
+
     // A refresh on `a` reaches `b` (pushToPeers), still from the store.
+    let entry = |d: &Daemon| entry(d, "DB_PASSWORD");
     let before = entry(&b)["fetchedAt"].clone();
     std::thread::sleep(Duration::from_millis(20));
     let plan = a.post("/api/onepassword/plan", Some(json!({ "kind": "refresh", "names": ["DB_PASSWORD"] }))).unwrap();
@@ -634,6 +687,80 @@ fn onepassword_values_shared_with_paired_mac() {
     }
     let activity = a.get("/api/remote/activity").map(|v| v.to_string()).unwrap_or_default();
     assert!(activity.is_empty() || activity.contains("secrets-sent"), "{activity}");
+}
+
+/// The Mac with the 1Password value watches the one that needs it (it can't be called from there): requests
+/// and pushes still work, delivered over the watcher's link.
+#[test]
+fn onepassword_values_shared_with_watched_mac() {
+    let base = std::env::temp_dir().join(format!("lstack-it-opwatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let h = Daemon::start(&base.join("h")); // shares its services; needs the value
+    let w = Daemon::start(&base.join("w")); // watches `h` ("box"); has the value from 1Password
+
+    let value = "watched-pw-H7";
+    let plan = w.post("/api/onepassword/plan", Some(json!({ "kind": "link", "name": "DB_PASSWORD", "ref": "op://Dev/db/password" }))).unwrap();
+    w.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "DB_PASSWORD": value } }))).unwrap();
+    let plan = w.post("/api/onepassword/plan", Some(json!({ "kind": "link", "name": "NPM_TOKEN", "ref": "op://Dev/npm/token" }))).unwrap();
+    w.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "NPM_TOKEN": "npm-tok-K8" } }))).unwrap();
+
+    let (rport, lport) = (free_port(), free_port());
+    h.call("PUT", "/api/remote", Some(json!({ "enabled": false, "sharing": true, "bind": "127.0.0.1", "port": rport, "linkPort": lport, "username": "me", "password": "correct horse" })))
+        .unwrap();
+    let addr = format!("127.0.0.1:{lport}");
+    wait_until("link listener", 10, || std::net::TcpStream::connect(&addr).is_ok());
+    let code = h.post("/api/remote/pair-code", None).unwrap()["code"].as_str().unwrap().to_string();
+    w.post("/api/machines", Some(json!({ "address": addr, "code": code, "name": "box" }))).unwrap();
+    wait_until("online", 30, || w.get("/api/machines/box").is_ok_and(|v| v["status"] == "online"));
+    let w_name = h.get("/api/remote/peers").unwrap()[0]["name"].as_str().unwrap().to_string();
+
+    let app = base.join("h/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join(".env"), "DB_PASSWORD=op://Dev/db/password\n").unwrap();
+    h.post("/api/services", Some(json!({ "name": "api", "type": "process", "restart": "never", "cwd": app.to_string_lossy(),
+        "envFiles": [".env"], "command": "echo db=${DB_PASSWORD:-unset}; sleep 60" }))).unwrap();
+    wait_until("pending", 10, || h.svc("api")["secretsPending"]["new"] == json!(["DB_PASSWORD"]));
+
+    // `h` asks (Pull Shared Values); `w` learns it on its next round, with the service that wants it.
+    h.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    w.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    let shares = w.get("/api/onepassword/shares").unwrap();
+    let boxp = shares["peers"].as_array().unwrap().iter().find(|p| p["name"] == "box").cloned().unwrap_or(Value::Null);
+    assert_eq!(boxp["watched"], true, "{shares}");
+    assert_eq!(boxp["wants"][0]["ref"], "op://Dev/db/password", "{shares}");
+    assert_eq!(boxp["wants"][0]["services"], json!(["api"]));
+    let entry = |d: &Daemon, n: &str| d.get("/api/secrets").unwrap()["secrets"].as_array().unwrap().iter().find(|s| s["name"] == n).cloned().unwrap_or(Value::Null);
+    assert_eq!(entry(&h, "DB_PASSWORD"), Value::Null, "nothing sent before it's approved");
+
+    // Approved on `w`: delivered right away and passed to `api`.
+    let (ok, out) = w.cli(&["secret", "share", "box", "DB_PASSWORD"]);
+    assert!(ok, "{out}");
+    assert_eq!(entry(&h, "DB_PASSWORD")["source"], json!(format!("peer:{w_name}")));
+    assert_eq!(h.svc("api")["config"]["secrets"], json!({ "DB_PASSWORD": "DB_PASSWORD" }));
+
+    // Push from `w`: `h` must accept before anything is sent.
+    let (ok, out) = w.cli(&["secret", "push", "box", "NPM_TOKEN"]);
+    assert!(ok, "{out}");
+    let inc = h.get("/api/onepassword/shares").unwrap()["incoming"].clone();
+    assert_eq!(inc[0]["machine"], json!(w_name), "{inc}");
+    assert_eq!(entry(&h, "NPM_TOKEN"), Value::Null);
+    let (ok, out) = h.cli(&["secret", "accept", &w_name]);
+    assert!(ok, "{out}");
+    w.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    assert_eq!(entry(&h, "NPM_TOKEN")["source"], json!(format!("peer:{w_name}")));
+    let boxp = w.get("/api/onepassword/shares").unwrap()["peers"].as_array().unwrap().iter().find(|p| p["name"] == "box").cloned().unwrap();
+    assert_eq!(boxp["pushing"], json!([]), "{boxp}");
+
+    // A refresh on `w` reaches `h`.
+    let before = entry(&h, "DB_PASSWORD")["fetchedAt"].clone();
+    std::thread::sleep(Duration::from_millis(20));
+    let plan = w.post("/api/onepassword/plan", Some(json!({ "kind": "refresh", "names": ["DB_PASSWORD"] }))).unwrap();
+    w.post("/api/onepassword/import", Some(json!({ "plan": plan["id"], "values": { "DB_PASSWORD": "rotated-pw-J3" } }))).unwrap();
+    w.post("/api/onepassword/peers/sync", Some(json!({}))).unwrap();
+    assert_ne!(entry(&h, "DB_PASSWORD")["fetchedAt"], before);
+
+    let audit = h.get("/api/onepassword/audit").unwrap().to_string();
+    assert!(audit.contains("peer-received") && !audit.contains(value), "{audit}");
 }
 
 #[test]

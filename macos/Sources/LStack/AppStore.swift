@@ -125,6 +125,7 @@ final class AppStore {
         if Bundle.main.bundleURL.pathExtension == "app", ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT"] == nil {
             notificationRouter.store = self
             UNUserNotificationCenter.current().delegate = notificationRouter
+            NotificationRouter.registerCategories()
         }
     }
 
@@ -175,7 +176,7 @@ final class AppStore {
     @ObservationIgnored private let notificationRouter = NotificationRouter()
 
     /// The daemon's notices (e.g. 1Password changes to review, values shared by a paired Mac).
-    private func notify(title: String, body: String, review: String? = nil) {
+    private func notify(title: String, body: String, review: String? = nil, category: String? = nil, info: [String: Any] = [:]) {
         // Notifications need a real app bundle (not `swift run`).
         guard Bundle.main.bundleIdentifier != nil, Bundle.main.bundleURL.pathExtension == "app" else {
             flash("\(title): \(body)")
@@ -187,7 +188,11 @@ final class AppStore {
             c.title = title
             c.body = body
             // Clicking opens that service's 1Password review (nothing is read until a button there is clicked).
-            if let review { c.userInfo = ["review": review] }
+            var userInfo = info
+            if let review { userInfo["review"] = review }
+            c.userInfo = userInfo
+            // Approve / Accept buttons right on the notification.
+            if let category { c.categoryIdentifier = category }
             center.add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
         }
         if notificationsAsked {
@@ -250,7 +255,10 @@ final class AppStore {
             guard let e = try? dec.decode(PeerEvent.self, from: data) else { return }
             handlePeer(e.machine, e.event, e.data.data)
         case "notice":
-            struct Notice: Decodable { let title: String; let body: String; let approval: Approval? }
+            struct Ask: Decodable { let peer: String; let machine: String; let items: [Item]?
+                struct Item: Decodable { let ref: String } }
+            struct Pushed: Decodable { let machine: String; let refs: [String]? }
+            struct Notice: Decodable { let title: String; let body: String; let approval: Approval?; let request: Ask?; let pushed: Pushed? }
             guard let n = try? dec.decode(Notice.self, from: data) else { return }
             if let a = n.approval {
                 if let client { Approver.shared.enqueue(a, client) }
@@ -261,7 +269,14 @@ final class AppStore {
             if n.title == "1Password changes to review", let colon = n.body.range(of: ": review ") {
                 review = String(n.body[..<colon.lowerBound])
             }
-            notify(title: n.title, body: n.body, review: review)
+            if let r = n.request {
+                notify(title: n.title, body: n.body, category: NotificationRouter.request,
+                       info: ["peer": r.peer, "machine": r.machine, "refs": (r.items ?? []).map(\.ref)])
+            } else if let p = n.pushed {
+                notify(title: n.title, body: n.body, category: NotificationRouter.pushed, info: ["machine": p.machine, "refs": p.refs ?? []])
+            } else {
+                notify(title: n.title, body: n.body, review: review)
+            }
             Task { await refreshRemote() }
         case "service":
             guard let s = try? dec.decode(ServiceState.self, from: data) else { return }
@@ -849,7 +864,101 @@ final class AppStore {
         return try JSONDecoder().decode(OPShares.self, from: await sendJSON("POST", "/api/onepassword/shares", body))
     }
 
-    /// Takes the values paired Macs share now (from their cache; never 1Password).
+    /// Declines a paired Mac's requests (refs).
+    func opDeclineRequest(peer: String, refs: [String]) async throws -> OPShares {
+        let body: [String: Any] = ["peer": peer, "items": refs, "actor": "app"]
+        return try JSONDecoder().decode(OPShares.self, from: await sendJSON("POST", "/api/onepassword/shares/decline", body))
+    }
+
+    /// Offers cached 1Password values to a paired Mac; it must accept them there.
+    func opPush(peer: String, items: [String]) async throws -> OPShares {
+        let body: [String: Any] = ["peer": peer, "items": items, "actor": "app"]
+        return try JSONDecoder().decode(OPShares.self, from: await sendJSON("POST", "/api/onepassword/push", body))
+    }
+
+    /// Approves a paired Mac's request (matched by reference). Values cached here are shared; ones that
+    /// aren't are read from 1Password first (it asks to unlock) under a free name — never replacing an
+    /// existing value — and shared once stored. Returns a summary for the user.
+    @discardableResult
+    func approveRequest(peer: String, refs: [String]) async -> String {
+        do {
+            let shares = try await opShares()
+            guard let p = shares.peers?.first(where: { $0.id == peer }) else { return "That Mac is no longer paired." }
+            let wanted = Set(refs)
+            let have = p.requests.filter { wanted.isEmpty || wanted.contains($0.ref) }
+            let missing = p.missing.filter { wanted.isEmpty || wanted.contains($0.ref) }
+            var done: [String] = [], errors: [String] = []
+            if !have.isEmpty {
+                _ = try await opShare(peer: peer, items: have.map(\.ref), allow: true)
+                done += have.map { $0.name ?? $0.ref }
+            }
+            // One plan per value (each gets its own free name), but one read — one approval in 1Password.
+            var runs: [(OPShares.Want, OnePasswordRun)] = []
+            for w in missing {
+                let run = OnePasswordRun(store: self)
+                var body: [String: Any] = ["kind": "link", "ref": w.ref, "sharePeer": peer]
+                if let k = w.key { body["hint"] = k }
+                if await run.prepare(body) { runs.append((w, run)) } else { errors.append("\(w.ref): \(run.error ?? "couldn't plan")") }
+            }
+            if !runs.isEmpty {
+                do {
+                    let cli = try await Task.detached(priority: .userInitiated) { try OnePasswordCLI.find() }.value
+                    let refs = runs.flatMap { $0.1.plan?.reads.map(\.ref) ?? [] }
+                    var (got, readErrors) = await Task.detached(priority: .userInitiated) { OnePasswordRun.readBatch(cli, refs) }.value
+                    await Task.detached(priority: .utility) { cli.signout() }.value
+                    for (w, run) in runs {
+                        await run.run(prefetched: got, account: cli.account)
+                        if run.phase == .done, run.result?.sharedWith != nil {
+                            done.append(run.plan?.items.first?.name ?? w.ref)
+                        } else {
+                            errors.append(readErrors[w.ref] ?? "\(w.ref): \(run.error ?? "not read from 1Password")")
+                        }
+                    }
+                    got.removeAll()
+                    readErrors.removeAll()
+                } catch {
+                    for (_, run) in runs { await run.cancel() }
+                    errors.append(error.localizedDescription)
+                }
+            }
+            await refreshSecrets()
+            if done.isEmpty && errors.isEmpty { return "Nothing left to approve for \(p.name)." }
+            var msg = done.isEmpty ? "" : "Shared \(done.joined(separator: ", ")) with \(p.name)."
+            if !errors.isEmpty { msg += (msg.isEmpty ? "" : " ") + "Failed: " + errors.joined(separator: "; ") }
+            return msg
+        } catch { return error.localizedDescription }
+    }
+
+    /// From a notification: approve a request / accept a push, then tell the user how it went.
+    func answerFromNotification(_ action: String, _ info: [AnyHashable: Any]) async {
+        let refs = info["refs"] as? [String] ?? []
+        switch action {
+        case NotificationRouter.approve:
+            guard let peer = info["peer"] as? String else { return }
+            let msg = await approveRequest(peer: peer, refs: refs)
+            notify(title: "1Password request", body: msg)
+        case NotificationRouter.decline:
+            guard let peer = info["peer"] as? String else { return }
+            _ = try? await opDeclineRequest(peer: peer, refs: refs)
+        case NotificationRouter.accept, NotificationRouter.reject:
+            guard let machine = info["machine"] as? String else { return }
+            do {
+                try await opAnswerPush(machine: machine, refs: refs.isEmpty ? nil : refs, accept: action == NotificationRouter.accept)
+            } catch { notify(title: "Couldn't answer \(machine)", body: error.localizedDescription) }
+        default: break
+        }
+    }
+
+    /// Accepts (or rejects) values a paired Mac pushed here; nil refs = all from that Mac.
+    func opAnswerPush(machine: String, refs: [String]?, accept: Bool) async throws {
+        var body: [String: Any] = ["machine": machine]
+        if let refs { body["refs"] = refs }
+        _ = try await sendJSON("POST", accept ? "/api/onepassword/peers/accept" : "/api/onepassword/peers/decline", body)
+        if accept { await refreshSecrets() }
+    }
+
+    /// Asks paired Macs for values our services wait for, and takes the ones they approved (from their
+    /// cache; never 1Password).
     func opPeerSync(service: String? = nil) async throws -> OPPeerSync {
         var body: [String: Any] = [:]
         if let service { body["service"] = service }
@@ -1064,11 +1173,39 @@ final class NotificationRouter: NSObject, UNUserNotificationCenterDelegate {
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        let service = response.notification.request.content.userInfo["review"] as? String
+        let info = response.notification.request.content.userInfo
+        let service = info["review"] as? String
+        let action = response.actionIdentifier
+        // Plain values only cross into the main actor.
+        let peer = info["peer"] as? String, machine = info["machine"] as? String, refs = info["refs"] as? [String]
         Task { @MainActor [weak self] in
-            if let service { self?.store?.openReview(service) }
+            if [Self.approve, Self.decline, Self.accept, Self.reject].contains(action) {
+                var i: [AnyHashable: Any] = ["refs": refs ?? []]
+                if let peer { i["peer"] = peer }
+                if let machine { i["machine"] = machine }
+                await self?.store?.answerFromNotification(action, i)
+            } else if let service {
+                self?.store?.openReview(service)
+            }
             completionHandler()
         }
+    }
+
+    static let request = "lstack.request", pushed = "lstack.pushed"
+    static let approve = "lstack.approve", decline = "lstack.decline", accept = "lstack.accept", reject = "lstack.reject"
+
+    /// Approve / Decline on a paired Mac's request; Accept / Reject on values it pushed. Approving may read
+    /// from 1Password (which prompts), so it brings the app forward.
+    static func registerCategories() {
+        let request = UNNotificationCategory(identifier: Self.request, actions: [
+            UNNotificationAction(identifier: approve, title: "Approve", options: [.foreground]),
+            UNNotificationAction(identifier: decline, title: "Decline", options: [.destructive]),
+        ], intentIdentifiers: [])
+        let pushed = UNNotificationCategory(identifier: Self.pushed, actions: [
+            UNNotificationAction(identifier: accept, title: "Accept", options: []),
+            UNNotificationAction(identifier: reject, title: "Reject", options: [.destructive]),
+        ], intentIdentifiers: [])
+        UNUserNotificationCenter.current().setNotificationCategories([request, pushed])
     }
 }
 
