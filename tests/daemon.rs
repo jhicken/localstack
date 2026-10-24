@@ -51,29 +51,44 @@ impl Daemon {
     fn start_with(home: &Path, env: &[(&str, String)]) -> Daemon {
         let port = free_port();
         std::fs::create_dir_all(home.join("services")).unwrap();
+        let out_path = home.join("daemon.out");
+        let out = std::fs::File::create(&out_path).unwrap();
         let child = Command::new(BIN)
             .args(["daemon", "run"])
             .env("LSTACK_HOME", home)
             .env("LSTACK_PORT", port.to_string())
             .env("LSTACK_KEYCHAIN", "file")
             .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(Stdio::from(out))
             .spawn()
             .unwrap();
         let info = home.join("daemon.json");
         let mut d = Daemon { home: home.to_path_buf(), child, port, token: String::new() };
-        wait_until("daemon.json", 10, || {
-            let Ok(t) = std::fs::read_to_string(&info) else { return false };
-            let Ok(v) = serde_json::from_str::<Value>(&t) else { return false };
-            if v["running"] == json!(false) {
-                return false;
+        // Generous: a cold debug build starting alongside the other tests' daemons can be slow.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
+        loop {
+            if let Some(v) = std::fs::read_to_string(&info).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+                if v["running"] != json!(false) {
+                    d.port = v["port"].as_u64().unwrap() as u16;
+                    d.token = v["token"].as_str().unwrap().to_string();
+                    if d.get("/api/health").is_ok() {
+                        return d;
+                    }
+                }
             }
-            d.port = v["port"].as_u64().unwrap() as u16;
-            d.token = v["token"].as_str().unwrap().to_string();
-            d.get("/api/health").is_ok()
-        });
-        d
+            let exited = d.child.try_wait().ok().flatten();
+            if exited.is_some() || Instant::now() > deadline {
+                let output = std::fs::read_to_string(&out_path).unwrap_or_default();
+                panic!(
+                    "daemon not ready after {:?} (exit: {exited:?}, daemon.json: {:?})\n--- daemon output ---\n{output}",
+                    started.elapsed(),
+                    std::fs::read_to_string(&info).ok()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, (u16, String)> {

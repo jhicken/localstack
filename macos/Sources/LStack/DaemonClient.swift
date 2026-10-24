@@ -71,30 +71,90 @@ struct DaemonClient: Sendable {
         return try await send("GET", "/api/services/\(name.urlPath)/metrics?range=\(range)&points=\(points)", as: R.self).samples
     }
 
+    private static let streams = EventStreams()
+    private static let streamSession: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForResource = .infinity
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        return URLSession(configuration: cfg, delegate: streams, delegateQueue: queue)
+    }()
+
     /// Stream server-sent events. Each event is delivered as (name, raw JSON data).
+    ///
+    /// Uses a delegate-driven data task rather than `URLSession.bytes(for:)`: an `AsyncBytes` that isn't
+    /// read to the end (an error status, or cancellation before the first read) keeps its task, request,
+    /// response and metrics alive inside the session forever, and the reconnect loops leaked one per retry.
     func events(_ path: String) -> AsyncThrowingStream<(String, Data), Error> {
         let req = request("GET", path, timeout: .infinity)
         return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let (bytes, resp) = try await Self.session.bytes(for: req)
-                    if let code = (resp as? HTTPURLResponse)?.statusCode, code >= 400 { throw DaemonError.http(code, "") }
-                    var event = "message"
-                    for try await line in bytes.lines {
-                        if line.hasPrefix("event: ") {
-                            event = String(line.dropFirst(7))
-                        } else if line.hasPrefix("data: ") {
-                            continuation.yield((event, Data(line.dropFirst(6).utf8)))
-                            event = "message"
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
+            let task = Self.streamSession.dataTask(with: req)
+            Self.streams.register(task, continuation)
             continuation.onTermination = { _ in task.cancel() }
+            task.resume()
         }
+    }
+}
+
+/// Routes the stream session's delegate callbacks to each stream's continuation and parses SSE lines.
+private final class EventStreams: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    typealias Continuation = AsyncThrowingStream<(String, Data), Error>.Continuation
+
+    private final class Stream {
+        let continuation: Continuation
+        var buffer = Data()
+        var event = "message"
+        var failed = false
+        init(_ continuation: Continuation) { self.continuation = continuation }
+    }
+
+    private let lock = NSLock()
+    private var streams: [Int: Stream] = [:]
+
+    func register(_ task: URLSessionTask, _ continuation: Continuation) {
+        lock.withLock { streams[task.taskIdentifier] = Stream(continuation) }
+    }
+
+    private func stream(_ task: URLSessionTask) -> Stream? {
+        lock.withLock { streams[task.taskIdentifier] }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if let code = (response as? HTTPURLResponse)?.statusCode, code >= 400, let s = stream(dataTask) {
+            s.failed = true
+            s.continuation.finish(throwing: DaemonError.http(code, ""))
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let s = stream(dataTask), !s.failed else { return }
+        s.buffer.append(data)
+        while let nl = s.buffer.firstIndex(of: UInt8(ascii: "\n")) {
+            var line = s.buffer[s.buffer.startIndex..<nl]
+            s.buffer.removeSubrange(s.buffer.startIndex...nl)
+            if line.last == UInt8(ascii: "\r") { line = line.dropLast() }
+            handle(Data(line), s)
+        }
+    }
+
+    private func handle(_ line: Data, _ s: Stream) {
+        let event = Data("event: ".utf8), data = Data("data: ".utf8)
+        if line.starts(with: event) {
+            s.event = String(decoding: line.dropFirst(event.count), as: UTF8.self)
+        } else if line.starts(with: data) {
+            s.continuation.yield((s.event, Data(line.dropFirst(data.count))))
+            s.event = "message"
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let s = lock.withLock({ streams.removeValue(forKey: task.taskIdentifier) }), !s.failed else { return }
+        if let error { s.continuation.finish(throwing: error) } else { s.continuation.finish() }
     }
 }
 
