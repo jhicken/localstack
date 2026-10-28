@@ -219,12 +219,24 @@ struct LogView: View {
         }
     }
 
+    /// Red only for errors. Many programs write INFO lines to stderr, so a level tag wins over the stream.
+    private func color(for l: IndexedLine) -> AnyShapeStyle {
+        if l.line.stream == "system" { return AnyShapeStyle(.cyan) }
+        let text = l.text
+        let head = text.prefix(80).uppercased()
+        if ["ERROR", "FATAL", "CRITICAL", "PANIC"].contains(where: head.contains) { return AnyShapeStyle(.red) }
+        if head.contains("WARN") { return AnyShapeStyle(.orange) }
+        if ["INFO", "DEBUG", "TRACE", "NOTICE"].contains(where: head.contains) { return AnyShapeStyle(.primary) }
+        if l.line.stream == "stderr", ["ERROR", "EXCEPTION", "TRACEBACK", "FATAL", "FAILED", "PANIC"].contains(where: text.uppercased().contains) { return AnyShapeStyle(.red) }
+        return AnyShapeStyle(.primary)
+    }
+
     private func row(_ l: IndexedLine) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(Date(timeIntervalSince1970: l.line.ts / 1000), format: .dateTime.hour().minute().second())
                 .foregroundStyle(.tertiary)
             Text(l.text)
-                .foregroundStyle(l.line.stream == "stderr" ? AnyShapeStyle(.red) : l.line.stream == "system" ? AnyShapeStyle(.cyan) : AnyShapeStyle(.primary))
+                .foregroundStyle(color(for: l))
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .font(.system(size: 11.5, design: .monospaced))
