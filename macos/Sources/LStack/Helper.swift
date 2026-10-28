@@ -78,6 +78,12 @@ enum Helper {
         return nil
     }
 
+    /// Setting: quitting the app also stops the daemon (and with it scripts, forwards and the link).
+    static let stopOnQuitKey = "stopDaemonOnQuit"
+    static var stopOnQuit: Bool { UserDefaults.standard.bool(forKey: stopOnQuitKey) }
+    /// Set when the app quits only to be relaunched, so the daemon must keep running.
+    @MainActor static var relaunching = false
+
     /// Copy this app into /Applications, launch the copy, and quit.
     @MainActor
     static func moveToApplications() -> String? {
@@ -92,7 +98,10 @@ enum Helper {
         let cfg = NSWorkspace.OpenConfiguration()
         cfg.createsNewApplicationInstance = true
         NSWorkspace.shared.openApplication(at: dest, configuration: cfg) { _, _ in
-            Task { @MainActor in NSApp.terminate(nil) }
+            Task { @MainActor in
+                relaunching = true
+                NSApp.terminate(nil)
+            }
         }
         return nil
     }

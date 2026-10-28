@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Which service the editor window shows and which tab it opens on.
 struct EditorTarget: Codable, Hashable {
@@ -97,6 +98,70 @@ private struct EditorError: LocalizedError {
     init(_ s: String) { errorDescription = s }
 }
 
+/// What a file dropped on "Add Service" says about the service it should become.
+struct DroppedService: Equatable {
+    var type = "process"
+    var name = ""
+    var command: String?
+    var cwd: String?
+    var composeFile: String?
+
+    private static func quote(_ s: String) -> String {
+        s.range(of: "^[A-Za-z0-9_./+:@%=-]+$", options: .regularExpression) != nil ? s : "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func slug(_ s: String) -> String {
+        let t = s.lowercased().replacingOccurrences(of: "[^a-z0-9._-]+", with: "-", options: .regularExpression).trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+        return t
+    }
+
+    private static let interpreters = ["py": "python3", "js": "node", "mjs": "node", "cjs": "node", "ts": "npx tsx", "rb": "ruby", "pl": "perl", "php": "php", "sh": "bash", "bash": "bash", "zsh": "zsh", "command": "bash"]
+
+    static func from(_ url: URL, fm: FileManager = .default) -> DroppedService? {
+        let path = url.path
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir) else { return nil }
+        let base = url.deletingPathExtension().lastPathComponent
+        let ext = url.pathExtension.lowercased()
+        let parent = url.deletingLastPathComponent().path
+
+        if isDir.boolValue && ext == "app" {
+            let exec = Bundle(url: url)?.executableURL?.path
+            let cmd = exec.map(quote) ?? "open -W " + quote(path)
+            return DroppedService(name: slug(base), command: cmd, cwd: parent)
+        }
+        if isDir.boolValue {
+            for f in ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"] where fm.fileExists(atPath: path + "/" + f) {
+                return DroppedService(type: "compose", name: slug(url.lastPathComponent), composeFile: path + "/" + f)
+            }
+            var d = DroppedService(name: slug(url.lastPathComponent), cwd: path)
+            if let data = fm.contents(atPath: path + "/package.json"),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let scripts = json["scripts"] as? [String: Any] {
+                d.command = scripts["dev"] != nil ? "npm run dev" : scripts["start"] != nil ? "npm start" : nil
+            } else if fm.fileExists(atPath: path + "/Cargo.toml") {
+                d.command = "cargo run"
+            } else if fm.fileExists(atPath: path + "/Makefile") {
+                d.command = "make"
+            }
+            return d
+        }
+        let file = url.lastPathComponent.lowercased()
+        if file.hasPrefix("compose") || file.hasPrefix("docker-compose"), ext == "yml" || ext == "yaml" {
+            let folder = url.deletingLastPathComponent().lastPathComponent
+            return DroppedService(type: "compose", name: slug(folder), composeFile: path)
+        }
+        var d = DroppedService(name: slug(base), cwd: parent)
+        if fm.isExecutableFile(atPath: path) {
+            d.command = quote(path)
+        } else if let i = interpreters[ext] {
+            d.command = i + " " + quote(path)
+        } else {
+            return nil
+        }
+        return d
+    }
+}
+
 /// The folder's own env file, picked by default (also by `lstack add`).
 let defaultEnvFile = ".env.lstack"
 
@@ -152,6 +217,7 @@ struct ServiceEditorView: View {
 
     @State private var error: String?
     @State private var saving = false
+    @State private var dropTargeted = false
 
     init(editing: String? = nil, tab: Tab = .general, command: String = "") {
         self.editing = editing
@@ -186,6 +252,20 @@ struct ServiceEditorView: View {
             }
         }
         .frame(width: 560)
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 10).strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8]))
+                    .background(Color.accentColor.opacity(0.08)).padding(6).allowsHitTesting(false)
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: isNew ? $dropTargeted : .constant(false)) { providers in
+            guard isNew, let p = providers.first else { return false }
+            _ = p.loadObject(ofClass: URL.self) { url, _ in
+                guard let url else { return }
+                Task { @MainActor in applyDrop(url) }
+            }
+            return true
+        }
         .navigationTitle(isNew ? "Add Service" : "Edit \(editing ?? "")")
         .task { await loadOnce() }
         .task(id: detectDir) {
@@ -275,6 +355,24 @@ struct ServiceEditorView: View {
             vars.append(EnvVarRow(key: p.key, secret: true, storedAs: p.name, linked: true))
         }
         original?.secrets = cur
+    }
+
+    /// Fills the form from a dropped script, app, folder or compose file; keeps a name you've already typed.
+    private func applyDrop(_ url: URL) {
+        guard let d = DroppedService.from(url) else {
+            error = "Don't know how to run \(url.lastPathComponent). Drop a script, an app, a folder or a compose file."
+            return
+        }
+        error = nil
+        tab = .general
+        type = d.type
+        if name.isEmpty { name = d.name }
+        if d.type == "compose" {
+            composeFile = d.composeFile ?? ""
+        } else {
+            command = d.command ?? ""
+            if let c = d.cwd { cwd = c }
+        }
     }
 
     // MARK: general tab
@@ -905,7 +1003,12 @@ struct ServiceEditorView: View {
     }
 
     private func close() {
-        if isNew { dismissWindow(id: "add") } else { dismiss() }
+        if isNew {
+            store.addFormGeneration += 1
+            dismissWindow(id: "add")
+        } else {
+            dismiss()
+        }
     }
 
     private static func validKey(_ k: String) -> Bool {
@@ -1045,6 +1148,7 @@ struct ServiceEditorView: View {
                 }
                 if startNow { store.perform(cfg.name, "start") }
                 await store.refreshSecrets()
+                store.addFormGeneration += 1
                 dismissWindow(id: "add")
                 if cfg.envFiles != nil, (detected?.files ?? []).contains(where: { (cfg.envFiles ?? []).contains($0.name) && !($0.refs ?? []).isEmpty }) {
                     offerReview(cfg.name)

@@ -6,6 +6,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Menu bar only — no Dock icon (also set via LSUIElement in the bundle's Info.plist).
         NSApp.setActivationPolicy(.accessory)
     }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard Helper.stopOnQuit, !Helper.relaunching else { return .terminateNow }
+        Task {
+            _ = await Helper.run(["daemon", "stop"])
+            await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
+    }
 }
 
 @main
@@ -32,6 +41,7 @@ struct LStackApp: App {
         Window("Add Service", id: "add") {
             ServiceEditorView()
                 .environment(store)
+                .id(store.addFormGeneration)
         }
         .windowResizability(.contentSize)
 

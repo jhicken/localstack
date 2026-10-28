@@ -351,6 +351,7 @@ lstack remote grant laptop control --tunnel web,api   # or no-control, --tunnel 
 lstack remote revoke laptop       # unpair now: its link and tunnels drop, and laptop forgets this Mac too
 lstack remote address             # ways to reach this Mac (DNS name, Bonjour, IPs), each checked
 lstack remote address mini.lan    # the address to show other Macs (`auto` = IP address)
+lstack remote allow 192.168.1.0/24   # also accept Macs from this network; `allow` lists, `allow rm <net>` / `allow clear` remove
 lstack remote activity            # links, pairings, tunnels and refusals
 ```
 
@@ -359,6 +360,7 @@ lstack remote activity            # links, pairings, tunnels and refusals
 - **Unpairing is mutual.** Removing a machine on either Mac (`machine rm`, `remote revoke`, or the Remove/Revoke buttons) tells the other Mac over the link, and it forgets the pairing too. If the other Mac is offline, it's told the next time either side can reach the other.
 - **Addresses.** Pair with an IP address or a name: router DNS names such as `studio.lan` and Bonjour `studio.local` keep working when the IP changes. **Settings → Machines → Share this Mac → Show this Mac as** (or `lstack remote address`) lists the names that lead to this Mac and lets you choose the one shown with the pairing code. Tailscale addresses (100.x and `.ts.net` names) are listed too. The address you choose becomes **the only way in** (see below).
 - **Forwards are the only way in.** A paired Mac's services are never offered at its network address: the app, web dashboard, CLI and TUI only open them through their local forward. A service you're not allowed to tunnel to has no link (the CLI marks it `no tunnel`).
+- **Allowed networks.** By default a LAN address (or Automatic) accepts only Macs on this Mac's own subnets, which Settings shows as always allowed. If your Macs sit on different routed subnets (say 192.168.1.x reaching a DMZ at 192.168.2.x), add the watching Mac's network on the watched Mac under **Allowed networks** (`lstack remote allow 192.168.1.149`). Use a single host or the narrowest range you can; anything wider than /16 (IPv6: /48) is refused. Public and Tailscale ranges stay refused unless you list them. The Noise keys and the pairing code still authorize every link. This trusts the source address, so across subnets or a DMZ prefer a VPN (Tailscale, NetBird): choose its address under **Show this Mac as**.
 - **One way in.** Paired Macs connect directly, LStack daemon to LStack daemon, through the address chosen in **Show this Mac as**. That can be a LAN name or IP, or a Tailscale address. With **Automatic**, only the local network is accepted. There's no relay or helper process in the path. Changing the address drops existing links; Macs that only know the old address must pair again.
 - **Secrets stay put unless you share them.** Secret values are never sent, except 1Password-sourced values you explicitly share with a specific Mac (see [1Password](#1password)). Env values and ping URLs are redacted, and logs are scrubbed on the watched Mac before they're sent.
 - **Upgrading from an older LStack.** Old pairings used bearer tokens over plain HTTP and are no longer accepted. They show as **pair again**: get a new code on the other Mac and pair again; the name is kept.
@@ -464,6 +466,7 @@ autostart: true
 
 - Scripts run in their own process group under `$SHELL -l` (see Shell environment). Stopping sends SIGTERM, then SIGKILL after 8 s.
 - When the daemon exits, it stops scripts but **leaves containers running**. On restart it re-adopts them, and it reaps orphaned script process groups if the daemon was killed.
+- Quitting the menu bar app leaves the daemon running by default. Turn on **Settings → Stop everything when I quit** to run `lstack daemon stop` on quit, which also ends forwards and the link to other Macs. Containers keep running.
 - At login, the daemon waits up to 10 minutes for Docker Desktop before it starts container services.
 - **Machine load.** The top of the menu bar panel shows whole-Mac CPU and memory with ~15 minutes of sparkline history. Each is split into **LStack** (your services) and **Other** (every other app), so you can tell when the machine itself is overloaded. The same data is at `GET /api/system`. Machine CPU is a share of all cores, while per-service CPU is a share of one core, as in Activity Monitor.
 - **Crash loops.** Crashed scripts restart with exponential backoff (1 s → 30 s, up to `maxRestarts`). While a script waits to restart, the menu bar shows **RESTART IN Ns** with a red stop button. `lstack ls` and `lstack top` show `restarting Ns`. Stopping it cancels the pending restart, and stop waits for a start that's already in progress.

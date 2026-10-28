@@ -613,6 +613,10 @@ struct RemoteStatus: Codable, Equatable {
     var shareUrls: [String]?
     /// The address chosen to show for this Mac (nil = automatic).
     var shareAddress: String?
+    /// Extra networks (CIDR) allowed to connect, besides this Mac's own subnets.
+    var allowedNetworks: [String]?
+    /// This Mac's own subnets: always allowed.
+    var ownNetworks: [String]?
     var linkPort: Int?
     var pairedMachines: Int?
 }
@@ -648,6 +652,7 @@ struct RemotePatch: Encodable {
     var linkPort: Int?
     /// "" = automatic.
     var shareAddress: String?
+    var allowedNetworks: [String]?
 }
 
 struct TotpSetup: Decodable {

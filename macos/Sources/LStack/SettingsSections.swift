@@ -353,6 +353,8 @@ struct MachinesSettings: View {
     @State private var error: String?
     @State private var paired: PairResult?
     @State private var pair: PairCode?
+    @State private var newNetwork = ""
+    @State private var copiedCode = false
     @State private var peers: [SharedPeer] = []
     @State private var identity: LinkIdentity?
     @State private var forwards: [ForwardInfo] = []
@@ -460,6 +462,14 @@ struct MachinesSettings: View {
                     Divider().padding(.leading, 52)
                     HStack(spacing: 10) {
                         Text(pair.code).font(.system(size: 22, weight: .bold, design: .monospaced)).textSelection(.enabled)
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(pair.link ?? pair.code, forType: .string)
+                            copiedCode = true
+                            Task { try? await Task.sleep(for: .seconds(2)); copiedCode = false }
+                        } label: { Image(systemName: copiedCode ? "checkmark" : "doc.on.doc") }
+                            .buttonStyle(.borderless)
+                            .help(pair.link != nil ? "Copy the Quick Connect link (address + code)" : "Copy the pairing code")
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Expires ") + Text(Date(timeIntervalSince1970: pair.expiresAt / 1000), style: .relative)
                             if let u = store.remote?.shareUrls?.first ?? pair.urls.first { Text("Address: \(u)").textSelection(.enabled) }
@@ -532,6 +542,43 @@ struct MachinesSettings: View {
         return "\(a.address)  —  \(kind)\(a.pointsHere ? "" : " ⚠︎ doesn't reach this Mac")"
     }
 
+    private func allowedNetworks(_ r: RemoteStatus) -> some View {
+        let extra = r.allowedNetworks ?? []
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("Allowed networks").font(.system(size: 11, weight: .medium))
+            Text("Also allowed: this Mac's own subnet")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+            ForEach(extra, id: \.self) { n in
+                HStack(spacing: 6) {
+                    Text(n).font(.system(size: 11, design: .monospaced))
+                    Button {
+                        Task { error = await store.updateRemote(RemotePatch(allowedNetworks: extra.filter { $0 != n })) }
+                    } label: { Image(systemName: "minus.circle") }
+                        .buttonStyle(.borderless).help("Stop allowing \(n)")
+                }
+            }
+            HStack(spacing: 6) {
+                TextField("e.g. 192.168.1.0/24 or 192.168.1.149", text: $newNetwork)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11)).frame(width: 240)
+                    .onSubmit { addNetwork(extra) }
+                Button("Add") { addNetwork(extra) }.controlSize(.small).disabled(newNetwork.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if !extra.isEmpty {
+                Text("⚠︎ Trusts the source address. Across subnets, a VPN (Tailscale, NetBird) is safer.")
+                    .font(.system(size: 10)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func addNetwork(_ extra: [String]) {
+        let n = newNetwork.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return }
+        Task {
+            error = await store.updateRemote(RemotePatch(allowedNetworks: extra + [n]))
+            if error == nil { newNetwork = "" }
+        }
+    }
+
     private func addressPicker(_ r: RemoteStatus) -> some View {
         let chosen = addresses.first { $0.address == r.shareAddress }
         return VStack(alignment: .leading, spacing: 3) {
@@ -540,7 +587,7 @@ struct MachinesSettings: View {
                     pair = nil
                     Task { error = await store.updateRemote(RemotePatch(shareAddress: v)); await lookUpAddresses() }
                 })) {
-                    Text("Automatic (local network only)").tag("")
+                    Text("Automatic").tag("")
                     ForEach(addressOptions(r)) { a in Text(addressLabel(a)).tag(a.address) }
                 }
                 .font(.system(size: 11)).controlSize(.small).fixedSize()
@@ -552,6 +599,7 @@ struct MachinesSettings: View {
                 .buttonStyle(.borderless).disabled(findingAddresses)
                 .help("Look up this Mac's names again (DNS host name, Bonjour, reverse DNS, search domains)")
             }
+            if chosen?.kind != "tailscale" { allowedNetworks(r) }
             if let c = chosen, !c.pointsHere {
                 Text("\(c.address) doesn't resolve to this Mac right now — other Macs may not reach it.")
                     .font(.system(size: 10)).foregroundStyle(.orange)
@@ -559,7 +607,7 @@ struct MachinesSettings: View {
                 Text("Paired Macs can connect only through \(c.address)\(c.kind == "tailscale" ? " — from anywhere on your tailnet" : ""). Macs paired through another address reconnect through this one (or pair again).")
                     .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Automatic accepts paired Macs on this local network only. Pick an address (a .lan or .local name, or Tailscale) to make it the one way in; a name keeps working when the IP changes.")
+                Text("Automatic: local subnet only. Pick an address (a .lan or .local name, or Tailscale) to make it the one way in; a name keeps working when the IP changes.")
                     .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
         }

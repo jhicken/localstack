@@ -13,6 +13,8 @@ final class AppStore {
     var everConnected = false
     var configErrors: [String] = []
     var toast: String?
+    /// Bumped to give the Add Service window a blank form next time it opens.
+    var addFormGeneration = 0
     var startingDaemon = false
     var expanded: String?
     var system: SystemInfo?
