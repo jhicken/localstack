@@ -6,6 +6,7 @@ struct SetupView: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismissWindow) private var dismissWindow
     @State private var wantLogin = true
+    @AppStorage(Helper.stopOnQuitKey) private var stopOnQuit = false
     @State private var wantCLI = true
     @State private var error: String?
     @State private var onboarding = !UserDefaults.standard.bool(forKey: AppStore.onboardedKey)
@@ -74,6 +75,8 @@ struct SetupView: View {
                     cliRow
                     Divider().padding(.leading, 52)
                     daemonRow
+                    Divider().padding(.leading, 52)
+                    stopOnQuitRow
                 }
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(.background.secondary))
                 .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.separator.opacity(0.6)))
@@ -164,6 +167,13 @@ struct SetupView: View {
                     .help("Symlink lstack into /usr/local/bin (asks for your password)")
                 }
             }
+        }
+    }
+
+    private var stopOnQuitRow: some View {
+        SetupRow(icon: "xmark.circle.fill", tint: .red, title: "Stop everything when I quit",
+                 detail: "Quitting LStack also stops the daemon: scripts, forwards to other Macs and the dashboard stop. Containers keep running. Off by default, so services outlive the app.") {
+            Toggle("", isOn: $stopOnQuit).toggleStyle(.switch).labelsHidden()
         }
     }
 
