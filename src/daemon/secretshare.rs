@@ -625,7 +625,7 @@ fn store(sup: &Arc<Sup>, machine: &str, key: &str, mut resp: Value, refs: &[Stri
             Some(Value::String(s)) => s,
             _ => continue,
         };
-        if !refs.contains(&r) || value.is_empty() || value.len() > MAX_VALUE || value.contains('\0') {
+        if !refs.contains(&r) || value.len() > MAX_VALUE || value.contains('\0') {
             value.zeroize();
             continue;
         }

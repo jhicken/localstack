@@ -884,8 +884,8 @@ pub fn import(sup: &Arc<Sup>, mut req: ImportReq) -> Res<Value> {
             if !p.items.iter().any(|i| i.name == *n && i.source == "op") {
                 return bad(format!("{n} isn't in this plan"));
             }
-            if v.is_empty() || v.len() > MAX_VALUE || v.contains('\0') {
-                return bad(format!("{n}: empty, too large or binary value"));
+            if v.len() > MAX_VALUE || v.contains('\0') {
+                return bad(format!("{n}: too large or binary value"));
             }
         }
         Ok(m.remove(&req.plan).unwrap())

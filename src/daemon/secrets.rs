@@ -76,6 +76,9 @@ pub struct Meta {
     /// For `peer:<machine>` values: that Mac's pinned link key (hex). Only it may update the value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_key: Option<String>,
+    /// The stored value is an empty string (1Password returned an empty field). Set by `set_many`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub empty: bool,
 }
 
 impl Meta {
@@ -384,9 +387,6 @@ impl Vault {
         if !valid_name(name) {
             return Err(format!("invalid secret name {name:?} (letters, digits and _, not starting with a digit)"));
         }
-        if value.is_empty() {
-            return Err(format!("{name}: secret value is empty"));
-        }
         if value.len() > MAX_VALUE {
             return Err(format!("{name}: secret value is too large (64 KB max)"));
         }
@@ -403,7 +403,8 @@ impl Vault {
             Self::check(n, v)?;
         }
         let mut prev = Vec::new();
-        for (name, mut value, meta) in items {
+        for (name, mut value, mut meta) in items {
+            meta.empty = value.is_empty();
             let h = Held::seal(&self.mem, &name, &value, paths::now_ms(), meta);
             value.zeroize();
             let p = self.values.insert(name.clone(), h?);
@@ -599,7 +600,7 @@ pub fn status(services: &[crate::types::ServiceConfig]) -> Value {
                 json!({
                     "name": name, "setAt": set_at, "usedBy": used_by, "internal": name.starts_with(INTERNAL_PREFIX),
                     "source": m.source.as_deref().unwrap_or("local"), "ref": m.reference, "template": m.template,
-                    "account": m.account, "origin": m.origin, "fetchedAt": m.fetched_at,
+                    "account": m.account, "origin": m.origin, "fetchedAt": m.fetched_at, "empty": m.empty,
                 })
             })
             .collect();
@@ -665,6 +666,18 @@ mod tests {
         assert!(v3.remove("API_TOKEN").unwrap());
         assert!(!v3.remove("API_TOKEN").unwrap());
         assert!(Vault::open(dir.clone(), false).get("API_TOKEN").is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn empty_value_from_1password_is_stored_and_flagged() {
+        let dir = tmp();
+        let mut v = Vault::open(dir.clone(), false);
+        let meta = Meta { source: Some("op".into()), reference: Some("op://V/i/f".into()), ..Default::default() };
+        v.set_many(vec![("EMAIL_FROM".into(), String::new(), meta)]).unwrap();
+        assert_eq!(v.get("EMAIL_FROM").as_deref().map(String::as_str), Some(""));
+        assert!(v.meta("EMAIL_FROM").unwrap().empty);
+        assert!(Vault::open(dir.clone(), false).meta("EMAIL_FROM").unwrap().empty, "flag survives a reload");
         std::fs::remove_dir_all(dir).ok();
     }
 

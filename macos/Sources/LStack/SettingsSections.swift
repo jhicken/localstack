@@ -151,15 +151,17 @@ struct SecretsSettings: View {
 
     private func row(_ s: SecretInfo) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: s.isSet ? "checkmark.seal.fill" : "exclamationmark.circle.fill")
-                .foregroundStyle(s.isSet ? .green : .orange)
+            Image(systemName: !s.isSet ? "exclamationmark.circle.fill" : s.isEmpty ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                .foregroundStyle(s.isSet && !s.isEmpty ? .green : .orange)
+                .help(s.isEmpty ? "This value is an empty string" : "")
             VStack(alignment: .leading, spacing: 2) {
                 Text(s.name).font(.system(size: 12, weight: .medium, design: .monospaced))
                 Group {
                     if !s.isSet {
                         Text("Not set — needed by \(s.usedBy.joined(separator: ", "))")
                     } else if let at = s.fetchedAt ?? s.setAt {
-                        Text(s.sourceLabel.map { "\($0) · " } ?? "") +
+                        Text(s.isEmpty ? "Empty value · " : "") +
+                            Text(s.sourceLabel.map { "\($0) · " } ?? "") +
                             Text("\(s.fetchedAt != nil ? "fetched" : "set") \(Date(timeIntervalSince1970: at / 1000), format: .relative(presentation: .named))") +
                             Text(s.usedBy.isEmpty ? " · not used yet" : " · used by \(s.usedBy.joined(separator: ", "))")
                     }

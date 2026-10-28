@@ -120,7 +120,6 @@ struct OnePasswordCLI: Sendable {
             throw Self.explain(String(decoding: box.err, as: UTF8.self), reference: reference)
         }
         guard let s = String(data: box.out, encoding: .utf8) else { throw OnePasswordError(message: "\(reference): value isn't UTF-8 text") }
-        guard !s.isEmpty else { throw OnePasswordError(message: "\(reference): empty value") }
         return s
     }
 
@@ -159,8 +158,8 @@ struct OnePasswordCLI: Sendable {
         guard parts.count == refs.count + 1 else { throw OnePasswordError(message: "\(what): unexpected output from op run") }
         var values: [String: String] = [:]
         for (i, r) in refs.enumerated() {
-            guard let v = String(data: Data(parts[i]), encoding: .utf8), !v.isEmpty, !v.hasPrefix("op://") else {
-                throw OnePasswordError(message: "\(r): empty or unreadable value")
+            guard let v = String(data: Data(parts[i]), encoding: .utf8), !v.hasPrefix("op://") else {
+                throw OnePasswordError(message: "\(r): unreadable value")
             }
             values[r] = v
         }

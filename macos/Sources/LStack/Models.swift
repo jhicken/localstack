@@ -329,13 +329,16 @@ struct SecretInfo: Decodable, Identifiable, Hashable {
     let origin: String?
     /// When the value was last read from 1Password (ms).
     let fetchedAt: Double?
+    /// The stored value is an empty string.
+    let empty: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case name, setAt, usedBy, missing, source, ref, template, account, origin, fetchedAt
+        case name, setAt, usedBy, missing, source, ref, template, account, origin, fetchedAt, empty
         case isInternal = "internal"
     }
 
     var isSet: Bool { !(missing ?? false) }
+    var isEmpty: Bool { empty ?? false }
     var fromOnePassword: Bool { source == "op" }
     var peer: String? { source?.hasPrefix("peer:") == true ? String(source!.dropFirst(5)) : nil }
 
