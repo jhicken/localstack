@@ -32,6 +32,7 @@ struct LStackApp: App {
         Window("Add Service", id: "add") {
             ServiceEditorView()
                 .environment(store)
+                .id(store.addFormGeneration)
         }
         .windowResizability(.contentSize)
 
