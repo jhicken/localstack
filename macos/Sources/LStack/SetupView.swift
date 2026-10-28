@@ -150,21 +150,28 @@ struct SetupView: View {
         if !onboarding, let st, st.installed, let p = st.path {
             detail = "Installed at \(p)."
             if let sh = st.shadowedBy { detail += " Shadowed by \(sh) earlier on your PATH." }
-            else if !st.onPath { detail += " Open a new terminal window to use it." }
+            else if !st.onPath { detail += " Not on your PATH: add `~/.local/bin` to it in ~/.zshrc." }
         }
+        let warn = !onboarding && st?.installed == true && (st?.onPath == false || st?.shadowedBy != nil)
         return SetupRow(icon: "terminal.fill", tint: .indigo, title: "Command-line tool", detail: detail) {
             VStack(alignment: .trailing, spacing: 6) {
-                Toggle("", isOn: Binding(get: { on }, set: { v in
-                    if onboarding { wantCLI = v } else { apply(v ? ["--cli"] : ["uninstall", "--cli"]) }
-                }))
-                .toggleStyle(.switch).labelsHidden().disabled(store.setupBusy)
-                if !onboarding {
-                    Button("Install in /usr/local/bin…") {
-                        error = Helper.installCLIWithAdmin()
-                        Task { await store.refreshSetup() }
+                HStack(spacing: 6) {
+                    if warn {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            .help("`lstack` isn't runnable from your shell as installed")
                     }
-                    .buttonStyle(.link).font(.system(size: 10))
-                    .help("Symlink lstack into /usr/local/bin (asks for your password)")
+                    Toggle("", isOn: Binding(get: { on }, set: { v in
+                        if onboarding { wantCLI = v } else if v { apply(["--cli"]) } else { uninstallCLI() }
+                    }))
+                    .toggleStyle(.switch).labelsHidden().disabled(store.setupBusy)
+                }
+                if !onboarding {
+                    let system = st?.path?.hasPrefix("/usr/local/bin") == true
+                    Button(system ? "Use ~/.local/bin instead…" : "Use /usr/local/bin instead…") { moveCLI(toSystem: !system) }
+                        .buttonStyle(.link).font(.system(size: 10))
+                        .disabled(store.setupBusy)
+                        .help(system ? "Default location; needs no password but must be on your PATH"
+                                     : "Already on your PATH; asks for your password")
                 }
             }
         }
@@ -425,6 +432,32 @@ struct SetupView: View {
         Task {
             error = await store.runSetup(args)
             if restartDaemon { store.startDaemon() }
+        }
+    }
+
+    private func moveCLI(toSystem: Bool) {
+        error = nil
+        Task {
+            if let p = store.setup?.cli.path, !toSystem {
+                error = await Task.detached { Helper.removeCLIWithAdmin(p) }.value
+                if error == nil { error = await store.runSetup(["--cli"]) }
+            } else {
+                error = await store.runSetup(["uninstall", "--cli"])
+                if error == nil { error = await Task.detached { Helper.installCLIWithAdmin() }.value }
+            }
+            await store.refreshSetup()
+        }
+    }
+
+    private func uninstallCLI() {
+        error = nil
+        Task {
+            error = await store.runSetup(["uninstall", "--cli"])
+            await store.refreshSetup()
+            if error == nil, let cli = store.setup?.cli, cli.installed, let p = cli.path {
+                error = await Task.detached { Helper.removeCLIWithAdmin(p) }.value
+                await store.refreshSetup()
+            }
         }
     }
 
