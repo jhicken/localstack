@@ -41,8 +41,10 @@ pub async fn serve(listener: TcpListener, app: AppState, remote: Arc<Remote>) {
 /// With a chosen "Show this Mac as" address (`via`), only connections to the IPs it leads to; a local network
 /// address also still needs a local network source, so a VPN routed into the LAN doesn't count. Automatic:
 /// only from this Mac's own local network (see `remote::is_local_source`), never through a VPN or overlay.
-pub fn link_refusal(ip: IpAddr, local: IpAddr, via: Option<&super::remote::Via>) -> Option<String> {
-    use super::remote::{hostname, is_local_source, unmap};
+/// `allowed` lists extra networks (CIDR) that also count as the local network (see `remote::is_allowed_source`).
+pub fn link_refusal(ip: IpAddr, local: IpAddr, via: Option<&super::remote::Via>, allowed: &[String]) -> Option<String> {
+    use super::remote::{hostname, is_allowed_source, unmap};
+    let is_local_source = |ip| is_allowed_source(ip, allowed);
     let (ip, local) = (unmap(ip), unmap(local));
     match via {
         Some(_) if ip.is_loopback() => None,
@@ -50,10 +52,10 @@ pub fn link_refusal(ip: IpAddr, local: IpAddr, via: Option<&super::remote::Via>)
             Some(format!("{} only accepts paired Macs through {} (this one connected to {local}) — pair using {}", hostname(), v.address, v.address))
         }
         Some(v) if v.lan && !is_local_source(ip) => {
-            Some(format!("{} only accepts paired Macs through {} on its local network (this one connected from {ip})", hostname(), v.address))
+            Some(format!("{} only accepts paired Macs through {} on its local network (this one connected from {ip}) — add its network under Allowed networks (lstack remote allow)", hostname(), v.address))
         }
         Some(_) => None,
-        None => (!is_local_source(ip)).then(|| format!("{} only accepts paired Macs on its local network (this one connected from {ip}) — choose “Show this Mac as” there to allow another way in", hostname())),
+        None => (!is_local_source(ip)).then(|| format!("{} only accepts paired Macs on its local network (this one connected from {ip}) — add its network under Allowed networks (lstack remote allow), or choose “Show this Mac as” there to allow another way in", hostname())),
     }
 }
 
@@ -64,7 +66,7 @@ async fn connection(mut tcp: TcpStream, addr: SocketAddr, app: AppState, remote:
         return;
     }
     let local = tcp.local_addr().map_or(ip, |a| a.ip());
-    let off_lan = link_refusal(ip, local, remote.via().await.as_ref());
+    let off_lan = link_refusal(ip, local, remote.via().await.as_ref(), &remote.config().allowed_networks);
     if let (Some(why), true) = (&off_lan, &magic == link::MAGIC_PAIR) {
         remote.audit(json!({ "event": "pair-refused", "address": ip.to_string(), "reason": why.clone() }));
         link::pair_refuse(tcp, why).await;

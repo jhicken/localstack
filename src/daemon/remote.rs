@@ -68,6 +68,9 @@ pub struct RemoteConfig {
     /// Address shown first for reaching this Mac (pairing code, Settings) — e.g. a router DNS name that
     /// survives DHCP changes. None = automatic (LAN IPs, then the host name).
     pub share_address: Option<String>,
+    /// Extra networks (CIDR, e.g. `192.168.1.0/24`) paired Macs may connect from, besides this Mac's own subnets.
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
 }
 
 /// A Mac allowed to connect to this one over the link.
@@ -135,6 +138,7 @@ impl Default for RemoteConfig {
             peers: vec![],
             revoked: vec![],
             share_address: None,
+            allowed_networks: vec![],
         }
     }
 }
@@ -309,6 +313,8 @@ pub struct RemotePatch {
     pub allow_control: Option<bool>,
     /// Preferred address to show for this Mac; "" = automatic.
     pub share_address: Option<String>,
+    /// Replaces the extra allowed networks (CIDR list).
+    pub allowed_networks: Option<Vec<String>>,
 }
 
 impl Remote {
@@ -742,6 +748,8 @@ impl Remote {
             "sharing": cfg.sharing(),
             "shareUrls": share_urls,
             "shareAddress": cfg.share_address,
+            "allowedNetworks": cfg.allowed_networks,
+            "ownNetworks": own_networks(),
             "linkPort": cfg.link_port,
             "pairedMachines": cfg.peers.len(),
             "running": running.is_some(),
@@ -805,6 +813,15 @@ impl Remote {
                 return Err(ApiErr::new(400, format!("{a:?} is not a host name or IP address (no port)")));
             };
         }
+        if let Some(list) = patch.allowed_networks {
+            let mut nets = vec![];
+            for n in list.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+                nets.push(parse_cidr(n).map_err(|e| ApiErr::new(400, e))?.to_string());
+            }
+            nets.sort();
+            nets.dedup();
+            cfg.allowed_networks = nets;
+        }
         if let Some(e) = patch.enabled {
             cfg.enabled = e;
         }
@@ -822,7 +839,7 @@ impl Remote {
         }
         save_config(&cfg).map_err(|e| ApiErr::new(500, format!("cannot save remote.json: {e}")))?;
         let creds_changed = cfg.username != old.username || cfg.password_hash != old.password_hash;
-        let via_changed = cfg.share_address != old.share_address;
+        let via_changed = cfg.share_address != old.share_address || cfg.allowed_networks != old.allowed_networks;
         *self.cfg.lock().unwrap() = cfg;
         if via_changed {
             // Links that came in another way reconnect through the new address (or are refused).
@@ -1115,6 +1132,81 @@ pub fn is_tailscale_host(hp: &str) -> bool {
 /// a VPN hands those out too, and its whole network mustn't count as the LAN. Tailscale ranges never count.
 pub fn is_local_source(ip: IpAddr) -> bool {
     local_source_in(ip, &interface_nets())
+}
+
+/// A network in CIDR form: the address with host bits cleared, and the prefix length.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cidr(IpAddr, u8);
+
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.0, self.1)
+    }
+}
+
+impl Cidr {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.0, unmap(ip)) {
+            (IpAddr::V4(n), IpAddr::V4(i)) => u32::from(n) == u32::from(i) & prefix_mask_v4(self.1),
+            (IpAddr::V6(n), IpAddr::V6(i)) => u128::from(n) == u128::from(i) & prefix_mask_v6(self.1),
+            _ => false,
+        }
+    }
+}
+
+fn prefix_mask_v4(p: u8) -> u32 {
+    if p == 0 { 0 } else { u32::MAX << (32 - p as u32) }
+}
+
+fn prefix_mask_v6(p: u8) -> u128 {
+    if p == 0 { 0 } else { u128::MAX << (128 - p as u32) }
+}
+
+/// Parses `192.168.1.0/24` (or a bare address = a single host). Refuses anything wider than /16 (IPv4) or /48
+/// (IPv6): an allowed network is a lock-down, not a way to open the door to a whole range.
+pub fn parse_cidr(s: &str) -> Result<Cidr, String> {
+    let (addr, prefix) = s.split_once('/').map_or((s, None), |(a, p)| (a, Some(p)));
+    let ip = unmap(addr.trim().parse::<IpAddr>().map_err(|_| format!("{s:?} is not a network like 192.168.1.0/24"))?);
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix {
+        Some(p) => p.trim().parse::<u8>().ok().filter(|p| *p <= max).ok_or_else(|| format!("{s:?} has an invalid prefix length"))?,
+        None => max,
+    };
+    let min = if ip.is_ipv4() { 16 } else { 48 };
+    if prefix < min {
+        return Err(format!("{s:?} is too wide: use /{min} or narrower"));
+    }
+    let net = match ip {
+        IpAddr::V4(v) => IpAddr::V4((u32::from(v) & prefix_mask_v4(prefix)).into()),
+        IpAddr::V6(v) => IpAddr::V6((u128::from(v) & prefix_mask_v6(prefix)).into()),
+    };
+    Ok(Cidr(net, prefix))
+}
+
+/// May a TCP link connection from `ip` count as "the local network": this Mac's own subnets (see
+/// `is_local_source`) or one of the extra `allowed` networks the user listed? Tailscale and public
+/// addresses only count if explicitly listed.
+pub fn is_allowed_source(ip: IpAddr, allowed: &[String]) -> bool {
+    is_local_source(ip) || allowed.iter().filter_map(|n| parse_cidr(n).ok()).any(|c| c.contains(ip))
+}
+
+/// This Mac's own subnets on physical interfaces (e.g. `192.168.2.0/24`): always allowed, shown as the default.
+pub fn own_networks() -> Vec<String> {
+    let mut out: Vec<String> = interface_nets()
+        .into_iter()
+        .filter_map(|(name, addr, mask)| {
+            if !name.starts_with("en") || addr.is_loopback() || is_tailscale_ip(addr) {
+                return None;
+            }
+            match (addr, mask) {
+                (IpAddr::V4(a), IpAddr::V4(m)) => Some(format!("{}/{}", std::net::Ipv4Addr::from(u32::from(a) & u32::from(m)), u32::from(m).count_ones())),
+                _ => None,
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn local_source_in(ip: IpAddr, nets: &[(String, IpAddr, IpAddr)]) -> bool {
@@ -1779,11 +1871,11 @@ mod tests {
     fn link_is_local_network_only() {
         use super::super::share::link_refusal;
         let any: IpAddr = "0.0.0.0".parse().unwrap();
-        assert!(link_refusal("127.0.0.1".parse().unwrap(), any, None).is_none());
-        assert!(link_refusal("fe80::1".parse().unwrap(), any, None).is_none());
+        assert!(link_refusal("127.0.0.1".parse().unwrap(), any, None, &[]).is_none());
+        assert!(link_refusal("fe80::1".parse().unwrap(), any, None, &[]).is_none());
         // Automatic: overlay VPNs (Tailscale's ranges) and public addresses are never the local network.
         for far in ["100.100.1.1", "fd7a:115c:a1e0::1", "8.8.8.8"] {
-            assert!(link_refusal(far.parse().unwrap(), any, None).is_some(), "{far}");
+            assert!(link_refusal(far.parse().unwrap(), any, None, &[]).is_some(), "{far}");
         }
         // Configs written by versions with a Tailscale transport still load.
         let old: SharedPeer = serde_json::from_str(r#"{"id":"a","name":"x","publicKey":"00","phrase":"","createdAt":1,"transport":"tailscale","tailnetId":{"tailnet":"t"}}"#).unwrap();
@@ -1798,15 +1890,36 @@ mod tests {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         // Tailscale chosen: only connections to this Mac's Tailscale address, from anywhere.
         let ts = Via { address: "automain.tail1.ts.net".into(), ips: vec![ip("100.117.1.2")], lan: false };
-        assert!(link_refusal(ip("100.117.232.223"), ip("100.117.1.2"), Some(&ts)).is_none());
-        assert!(link_refusal(ip("::ffff:100.117.232.223"), ip("::ffff:100.117.1.2"), Some(&ts)).is_none());
-        let why = link_refusal(ip("192.168.1.30"), ip("192.168.1.20"), Some(&ts)).unwrap();
+        assert!(link_refusal(ip("100.117.232.223"), ip("100.117.1.2"), Some(&ts), &[]).is_none());
+        assert!(link_refusal(ip("::ffff:100.117.232.223"), ip("::ffff:100.117.1.2"), Some(&ts), &[]).is_none());
+        let why = link_refusal(ip("192.168.1.30"), ip("192.168.1.20"), Some(&ts), &[]).unwrap();
         assert!(why.contains("automain.tail1.ts.net"), "{why}");
         // A LAN name chosen: only to that address, and still only from the local network (not a VPN into it).
         let lan = Via { address: "automain.lan".into(), ips: vec![ip("192.168.1.20")], lan: true };
-        assert!(link_refusal(ip("100.117.232.223"), ip("100.117.1.2"), Some(&lan)).is_some());
-        assert!(link_refusal(ip("10.8.0.9"), ip("192.168.1.20"), Some(&lan)).is_some());
-        assert!(link_refusal(ip("127.0.0.1"), ip("127.0.0.1"), Some(&lan)).is_none());
+        assert!(link_refusal(ip("100.117.232.223"), ip("100.117.1.2"), Some(&lan), &[]).is_some());
+        assert!(link_refusal(ip("10.8.0.9"), ip("192.168.1.20"), Some(&lan), &[]).is_some());
+        assert!(link_refusal(ip("127.0.0.1"), ip("127.0.0.1"), Some(&lan), &[]).is_none());
+        // Allowed networks: only what's listed, on top of this Mac's own subnets (addresses here avoid any real LAN).
+        let nets = vec!["10.77.8.9/32".to_string()];
+        let dmz = Via { address: "dmz.lan".into(), ips: vec![ip("192.168.2.30")], lan: true };
+        assert!(link_refusal(ip("10.77.8.9"), ip("192.168.2.30"), Some(&dmz), &[]).is_some());
+        assert!(link_refusal(ip("10.77.8.9"), ip("192.168.2.30"), Some(&dmz), &nets).is_none());
+        assert!(link_refusal(ip("10.77.8.10"), ip("192.168.2.30"), Some(&dmz), &nets).is_some());
+        assert!(link_refusal(ip("10.77.8.9"), ip("192.168.2.30"), None, &nets).is_none());
+        assert!(link_refusal(ip("100.100.1.1"), ip("192.168.2.30"), None, &nets).is_some());
+    }
+
+    #[test]
+    fn cidr_parsing() {
+        assert_eq!(parse_cidr("192.168.1.77/24").unwrap().to_string(), "192.168.1.0/24");
+        assert_eq!(parse_cidr("10.0.0.5").unwrap().to_string(), "10.0.0.5/32");
+        assert_eq!(parse_cidr("fd00:1:2:3::9/64").unwrap().to_string(), "fd00:1:2:3::/64");
+        for bad in ["0.0.0.0/0", "10.0.0.0/8", "::/0", "fd00::/32", "192.168.1.0/33", "nope", "192.168.1.0/x"] {
+            assert!(parse_cidr(bad).is_err(), "{bad}");
+        }
+        let c = parse_cidr("192.168.1.0/24").unwrap();
+        assert!(c.contains("192.168.1.9".parse().unwrap()) && c.contains("::ffff:192.168.1.9".parse().unwrap()));
+        assert!(!c.contains("192.168.2.9".parse().unwrap()));
     }
 
     #[test]

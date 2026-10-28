@@ -87,6 +87,7 @@ fn help() -> String {
   lstack remote passwd [--user <name>] [--password-stdin]
   lstack remote share on|off [--link-port 7381]
   lstack remote address [<name>|auto]   ways to reach this Mac (DNS, Bonjour, IPs, checked) / pick the one shown
+  lstack remote allow [<network>|rm <network>|clear]   extra networks (CIDR) allowed to pair, besides this Mac's own subnets
   lstack remote pair             one-time code another Mac uses to pair with this one (needs sharing)
   lstack remote peers            Macs paired with this one, their access and link state
   lstack remote grant <mac> [control|no-control] [--tunnel all|none|svc,svc]   what a paired Mac may do
@@ -1148,6 +1149,33 @@ fn cmd_remote(args: &[String]) -> R {
                 patch.insert("shareAddress".into(), json!(addr));
             }
         },
+        "allow" => {
+            let list = |k: &str| -> Vec<String> { current[k].as_array().into_iter().flatten().filter_map(|n| n.as_str()).map(str::to_string).collect() };
+            let mut extra = list("allowedNetworks");
+            match (arg, a.pos.get(2).map(String::as_str)) {
+                (None, _) => {
+                    for n in list("ownNetworks") {
+                        println!("{} {:<22} {}", c::green("●"), n, c::dim("this Mac's own subnet (always allowed)"));
+                    }
+                    for n in &extra {
+                        println!("{} {:<22} {}", c::green("●"), n, c::dim("allowed"));
+                    }
+                    println!("{}", c::dim("  Add a network: lstack remote allow 192.168.1.0/24   Remove: lstack remote allow rm <network>|clear"));
+                    return Ok(());
+                }
+                (Some("clear"), _) => extra.clear(),
+                (Some("rm" | "remove"), Some(n)) => {
+                    let n = crate::daemon::remote::parse_cidr(n)?.to_string();
+                    extra.retain(|e| *e != n);
+                }
+                (Some(n), None) => extra.push(n.to_string()),
+                _ => return Err("usage: lstack remote allow [<network>|rm <network>|clear]   (network like 192.168.1.0/24 or a single host 192.168.1.149)".into()),
+            }
+            if !extra.is_empty() {
+                eprintln!("{}", c::yellow("warning: this trusts the source address. Across subnets, a VPN (Tailscale, NetBird) is safer."));
+            }
+            patch.insert("allowedNetworks".into(), json!(extra));
+        }
         "share" | "sharing" => match arg {
             Some("on") => {
                 patch.insert("sharing".into(), json!(true));
@@ -1157,7 +1185,7 @@ fn cmd_remote(args: &[String]) -> R {
             }
             _ => return Err("usage: lstack remote share on|off".into()),
         },
-        other => return Err(format!("unknown remote command {other:?} (on, off, web, share, address, passwd, status)")),
+        other => return Err(format!("unknown remote command {other:?} (on, off, web, share, address, allow, passwd, status)")),
     }
     let v: serde_json::Value = cl.req("PUT", "/api/remote", Some(serde_json::Value::Object(patch)))?;
     print_remote(&v);
