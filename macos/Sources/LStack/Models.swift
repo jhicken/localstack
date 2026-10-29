@@ -942,12 +942,16 @@ struct OPPeerSync: Decodable {
     let received: [Received]?
     let asked: [Asked]?
     let errors: [String]?
+    let attached: [String]?
 
     var summary: String {
         var lines = (received ?? []).compactMap { r -> String? in
             let n = (r.stored ?? []) + (r.updated ?? [])
             let to = (r.services ?? []).isEmpty ? "" : " → \((r.services ?? []).joined(separator: ", "))"
             return n.isEmpty ? nil : "From \(r.machine): \(n.joined(separator: ", "))\(to)"
+        }
+        if let a = attached, !a.isEmpty {
+            lines.append("Already had the values from a paired Mac; attached them to \(a.joined(separator: ", ")).")
         }
         for a in asked ?? [] {
             lines.append("Asked \(a.machine) for \(a.refs.count) value\(a.refs.count == 1 ? "" : "s") — approve it there.")

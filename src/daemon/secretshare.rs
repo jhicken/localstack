@@ -697,6 +697,32 @@ fn store(sup: &Arc<Sup>, machine: &str, key: &str, mut resp: Value, refs: &[Stri
     Ok(out)
 }
 
+/// A value received from a paired Mac that a service still lists as new (a receive that stored it but
+/// never attached it): attach it, so the service stops waiting and nothing asks for it again.
+fn heal(sup: &Arc<Sup>) -> Vec<String> {
+    let metas = secrets::all_meta();
+    let op = super::terminal::load().onepassword;
+    let mut by_machine: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>> = BTreeMap::new();
+    for cfg in sup.effective_configs() {
+        if cfg.env_files.as_ref().is_none_or(|f| f.is_empty()) {
+            continue;
+        }
+        for x in envimport::review(&cfg, &metas, &op).refs.into_iter().filter(|x| matches!(x.status, "new" | "missing")) {
+            let held = metas.iter().find(|(n, m)| m.is_from_peer() && m.reference.as_deref() == Some(x.reference.as_str()) && !n.starts_with(INTERNAL_PREFIX));
+            let Some((name, m)) = held else { continue };
+            let Some(machine) = m.source.as_deref().and_then(|s| s.strip_prefix("peer:")) else { continue };
+            by_machine.entry(machine.to_string()).or_default().entry(cfg.name.clone()).or_default().insert(x.key, name.clone());
+        }
+    }
+    let mut attached = vec![];
+    for (machine, grants) in by_machine {
+        attached.extend(envimport::grant_received(sup, &grants, &machine));
+    }
+    attached.sort();
+    attached.dedup();
+    attached
+}
+
 /// Sync with online paired Macs: always newer values of ones we hold from them and their pending pushes;
 /// with `ask` (pullFromPeers, or Pull Shared Values), also request what our services wait for (`only`:
 /// one service) and take what they approved. Blocking.
@@ -704,6 +730,7 @@ pub fn sync(sup: &Arc<Sup>, peers: &Peers, only: Option<&str>, ask: bool) -> Val
     if secrets::is_locked() {
         return json!({ "received": [], "asked": [], "errors": [] });
     }
+    let attached = heal(sup);
     let mut received = vec![];
     let mut asked = vec![];
     let mut errors = vec![];
@@ -804,7 +831,7 @@ pub fn sync(sup: &Arc<Sup>, peers: &Peers, only: Option<&str>, ask: bool) -> Val
             }
         }
     }
-    json!({ "received": received, "asked": asked, "errors": errors })
+    json!({ "received": received, "asked": asked, "errors": errors, "attached": attached })
 }
 
 /// The inbox holding `machine`'s pushes: a Mac we watch first, else one that watches us.

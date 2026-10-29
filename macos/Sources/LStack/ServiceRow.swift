@@ -186,8 +186,9 @@ struct ServiceRow: View {
             return "Crashed\(service.exitCode.map { " (exit \($0))" } ?? "") · retry \(service.restarts)/\(max)"
         }
         if service.isFailed, let e = service.lastError { return e }
-        if let u = service.uptime { return "up \(Fmt.duration(u)) · \(service.summary)" }
-        return service.description ?? service.summary
+        // The command is shown in the expanded detail; don't repeat it in the header.
+        if let u = service.uptime { return expanded ? "up \(Fmt.duration(u))" : "up \(Fmt.duration(u)) · \(service.summary)" }
+        return service.description ?? (expanded ? "" : service.summary)
     }
 
     private var controls: some View {
@@ -199,6 +200,33 @@ struct ServiceRow: View {
             IconButton(icon: "text.alignleft", help: "Logs") {
                 openWindow(id: "logs", value: service.id)
                 bringToFront()
+            }
+            if !service.isRemote {
+                IconButton(icon: "apple.terminal", help: service.type == "process" ? "Attach" : "Shell") {
+                    store.openTerminal(service.name)
+                }
+                .disabled(!service.isRunning)
+                Menu {
+                    Button("Edit…") { openEditor(.general) }
+                    Button("Environment Variables…") { openEditor(.environment) }
+                    if !(service.config.envFiles ?? []).isEmpty {
+                        if service.isRunning, !(service.envStale ?? []).isEmpty {
+                            Button("Restart to Apply Env Changes") { store.perform(service, "restart") }
+                        }
+                        Button("Review 1Password References…") {
+                            openWindow(id: "op-review", value: service.name)
+                            bringToFront()
+                        }
+                    }
+                    Button("Open YAML Definition") { store.revealConfig(service.name) }
+                    Divider()
+                    Button("Remove…", role: .destructive) { confirmRemove = true }
+                } label: {
+                    Image(systemName: "ellipsis").frame(width: 22, height: 22)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
             }
         }
     }
@@ -312,42 +340,6 @@ struct ServiceRow: View {
 
     @ViewBuilder private var localActions: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Toggle(isOn: Binding(get: { service.autostart }, set: { store.setAutostart(service.name, $0) })) {
-                    Text("Start at login").font(.system(size: 11))
-                }
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                Spacer()
-                Button {
-                    store.openTerminal(service.name)
-                } label: {
-                    Label(service.type == "process" ? "Attach" : "Shell", systemImage: "apple.terminal")
-                }
-                .disabled(!service.isRunning)
-                Menu {
-                    Button("Edit…") { openEditor(.general) }
-                    Button("Environment Variables…") { openEditor(.environment) }
-                    if !(service.config.envFiles ?? []).isEmpty {
-                        if service.isRunning, !(service.envStale ?? []).isEmpty {
-                            Button("Restart to Apply Env Changes") { store.perform(service, "restart") }
-                        }
-                        Button("Review 1Password References…") {
-                            openWindow(id: "op-review", value: service.name)
-                            bringToFront()
-                        }
-                    }
-                    Button("Open YAML Definition") { store.revealConfig(service.name) }
-                    Divider()
-                    Button("Remove…", role: .destructive) { confirmRemove = true }
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            }
-            .controlSize(.small)
             // Inline confirmation: a dialog/sheet would take key focus and close the menu bar panel.
             if confirmRemove {
                 HStack(spacing: 6) {

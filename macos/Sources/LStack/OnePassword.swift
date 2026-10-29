@@ -330,6 +330,18 @@ final class OnePasswordRun {
     /// Reads `refs` with one approval in 1Password. If the batch fails for a reason that isn't about
     /// 1Password itself (declined, locked…), falls back to one read each to tell which failed. Blocking.
     nonisolated static func readBatch(_ cli: OnePasswordCLI, _ refs: [String]) -> (values: [String: String], errors: [String: String]) {
+        var r = readBatchOnce(cli, refs)
+        // 1Password sometimes reports the first approval as expired right after you unlock it; one retry fixes it.
+        let retry = r.errors.filter { $0.value.lowercased().contains("expired") }.map(\.key)
+        if !retry.isEmpty {
+            let again = readBatchOnce(cli, retry)
+            for (k, v) in again.values { r.values[k] = v; r.errors[k] = nil }
+            for (k, v) in again.errors { r.errors[k] = v }
+        }
+        return r
+    }
+
+    nonisolated private static func readBatchOnce(_ cli: OnePasswordCLI, _ refs: [String]) -> (values: [String: String], errors: [String: String]) {
         let refs = Array(Set(refs)).sorted()
         do {
             return (try cli.readMany(refs), [:])
