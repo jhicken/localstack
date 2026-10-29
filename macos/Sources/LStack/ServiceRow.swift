@@ -222,7 +222,14 @@ struct ServiceRow: View {
                     }
                     Button("Open YAML Definition") { store.revealConfig(service.name) }
                     Divider()
-                    Button("Remove…", role: .destructive) { confirmRemove = true }
+                    Button("Remove…", role: .destructive) {
+                        // The confirmation lives in the expanded detail, so open the card if it's collapsed.
+                        confirmRemove = true
+                        if !expanded {
+                            withAnimation(.snappy(duration: 0.25)) { store.expanded = service.id }
+                            Task { await store.loadHistory(service) }
+                        }
+                    }
                 } label: {
                     Image(systemName: "ellipsis").frame(width: 22, height: 22)
                 }
