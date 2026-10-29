@@ -291,9 +291,14 @@ struct ServiceRow: View {
     private var links: some View {
         HStack(alignment: .top, spacing: 6) {
             if service.canForward {
-                Toggle("", isOn: Binding(get: { service.forwardOn }, set: { store.setForward(service, $0) }))
-                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                    .help("Forward to this Mac: reach it on localhost over the encrypted link")
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.left.arrow.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(service.forwardOn ? Color.teal : .secondary)
+                    Toggle("Forward to this Mac", isOn: Binding(get: { service.forwardOn }, set: { store.setForward(service, $0) }))
+                        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                }
+                .help("Forward to this Mac\nReach this service on localhost over the encrypted link. Off by default.")
             }
             FlowLinks(urls: service.links) { store.open($0) }
         }

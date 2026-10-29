@@ -88,6 +88,9 @@ struct PopoverView: View {
         // content to the top so that frame only shows spare space at the bottom instead of the whole
         // menu (header included) jumping down and back.
         .frame(maxHeight: .infinity, alignment: .top)
+        // The menu's translucent material washes out text over light wallpapers; a mostly opaque layer
+        // keeps some of the blur while giving the content enough contrast.
+        .background(Color(nsColor: .windowBackgroundColor).opacity(0.72))
         .background(MenuWindowSizer(height: contentHeight))
         .background(LiveWindowReporter(store: store))
         .animation(.snappy(duration: 0.25), value: store.toast)
