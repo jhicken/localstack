@@ -83,7 +83,8 @@ struct ServiceRow: View {
                 }
             } else if service.isRunning {
                 if let u = service.links.first {
-                    IconButton(icon: "globe", help: u.blocked == "paused" ? "Resume forwarding and open" : "Open \(u.url)") { store.open(u, in: service) }
+                    IconButton(icon: "globe", help: u.blocked == "off" ? "Forwarding is off" : "Open \(u.url)") { store.open(u) }
+                        .disabled(u.blocked == "off")
                 }
                 VStack(alignment: .trailing, spacing: 1) {
                     Text(Fmt.pct(service.metrics?.cpu)).font(.system(size: 11, weight: .medium)).monospacedDigit()
@@ -194,7 +195,8 @@ struct ServiceRow: View {
     private var controls: some View {
         HStack(spacing: 0) {
             if let u = service.links.first {
-                IconButton(icon: "globe", help: u.blocked == "paused" ? "Resume forwarding and open" : "Open \(u.url)") { store.open(u, in: service) }
+                IconButton(icon: "globe", help: u.blocked == "off" ? "Forwarding is off" : "Open \(u.url)") { store.open(u) }
+                    .disabled(u.blocked == "off")
             }
             controlButtons.disabled(!canControl)
             IconButton(icon: "text.alignleft", help: "Logs") {
@@ -287,7 +289,14 @@ struct ServiceRow: View {
     }
 
     private var links: some View {
-        FlowLinks(urls: service.links) { store.open($0, in: service) }
+        HStack(alignment: .top, spacing: 6) {
+            if service.canForward {
+                Toggle("", isOn: Binding(get: { service.forwardOn }, set: { store.setForward(service, $0) }))
+                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                    .help("Forward to this Mac: reach it on localhost over the encrypted link")
+            }
+            FlowLinks(urls: service.links) { store.open($0) }
+        }
     }
 
     private var secretKeys: [String] { (service.config.secrets?.pairs ?? []).map(\.key) }
@@ -388,27 +397,28 @@ struct FlowLinks: View {
             HStack(spacing: 3) {
                 Image(systemName: icon(u))
                     .font(.system(size: 9))
-                    .foregroundStyle(paused(u) ? Color.secondary : warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
+                    .foregroundStyle(off(u) ? Color.secondary : warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
                 Text(u.display).font(.system(size: 10, weight: .medium)).lineLimit(1).truncationMode(.middle)
             }
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(Capsule().fill(Color.accentColor.opacity(0.12)))
         }
         .buttonStyle(.plain)
+        .disabled(off(u))
         .help(help(u))
     }
 
     private func warn(_ u: ServiceURL) -> Bool { u.via == nil && u.localOnly == true }
-    private func paused(_ u: ServiceURL) -> Bool { u.blocked == "paused" }
+    private func off(_ u: ServiceURL) -> Bool { u.blocked == "off" }
 
     private func icon(_ u: ServiceURL) -> String {
-        if paused(u) { return "pause.circle.fill" }
+        if off(u) { return "lock.slash" }
         if u.via != nil { return "lock.fill" }
         return u.localOnly == true ? "exclamationmark.triangle.fill" : "link"
     }
 
     private func help(_ u: ServiceURL) -> String {
-        if paused(u) { return "Forwarding is paused — click to resume it and open \(u.port.map { "port \($0)" } ?? "it") on this Mac" }
+        if off(u) { return "\(u.url): turn on forwarding to open it on this Mac" }
         if let m = u.via { return "\(u.url) — forwarded from \(m) over the encrypted link" }
         return u.localOnly == true ? "\(u.url) — bound to localhost on that Mac, so it may not be reachable from here" : u.url
     }

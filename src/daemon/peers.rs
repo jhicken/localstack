@@ -547,8 +547,8 @@ impl Peers {
                 _ => {}
             }
             if u.via.is_none() {
-                if u.port.is_some_and(|port| u.listening && self.forwards.paused(name, &s.name, port)) {
-                    u.blocked = Some("paused".into());
+                if u.port.is_some_and(|port| u.listening && self.forwards.off(name, &s.name, port)) {
+                    u.blocked = Some("off".into());
                 } else if url_host(&u.url) == host {
                     u.blocked = Some("untunneled".into());
                 }
@@ -793,11 +793,11 @@ impl Peers {
         self.get(to)
     }
 
-    /// Pause or resume local forwards to `machine`'s `service`, and re-point its URLs right away.
-    pub fn set_forward_paused(&self, machine: &str, service: &str, paused: bool) -> Result<(), ApiErr> {
+    /// Turn local forwards to `machine`'s `service` on or off, and re-point its URLs right away.
+    pub fn set_forward_enabled(&self, machine: &str, service: &str, on: bool) -> Result<(), ApiErr> {
         let host = host_of(&self.cfg(machine).ok_or_else(|| ApiErr::new(404, format!("no machine named {machine:?}")))?.address());
         let fw = self.forwards.clone();
-        if !fw.set_paused(machine, service, paused) {
+        if !fw.set_enabled(machine, service, on) {
             return Ok(());
         }
         let snap = {

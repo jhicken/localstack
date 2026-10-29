@@ -369,19 +369,20 @@ pub fn cmd_remote_peers(cl: &client::Client, sub: &str, rest: &[String], tunnel:
 
 // ------------------------------------------------------------------ forwards
 
-/// `lstack forwards [pause|resume svc@machine]`: paired Macs' services on localhost.
+/// `lstack forwards [enable|disable svc@machine]`: paired Macs' services on localhost (opt-in per service).
 pub fn cmd_forwards(args: &[String]) -> R {
     let a = Args::parse(args, &[("json", "", false)])?;
     let cl = client::connect(true)?;
     match a.pos.first().map(String::as_str) {
-        Some(verb @ ("pause" | "resume")) => {
+        Some(verb @ ("enable" | "disable")) => {
             let target = a.pos.get(1).ok_or(format!("usage: lstack forwards {verb} <service>@<machine>"))?;
             let (svc, m) = target.split_once('@').ok_or("give the service as service@machine")?;
             let _: Value = cl.req("POST", &format!("/api/forwards/{verb}"), Some(json!({ "machine": m, "service": svc })))?;
             println!("{} {verb}d forwarding {target}", c::green("✓"));
             Ok(())
         }
-        Some(other) if other != "ls" && other != "list" => Err(format!("unknown forwards command {other:?} (ls, pause, resume)")),
+        Some(old @ ("pause" | "resume")) => Err(format!("`forwards {old}` is now `forwards {}`", if old == "pause" { "disable" } else { "enable" })),
+        Some(other) if other != "ls" && other != "list" => Err(format!("unknown forwards command {other:?} (ls, enable, disable)")),
         _ => {
             let v: Value = cl.req("GET", "/api/forwards", None)?;
             if a.has("json") {
@@ -393,8 +394,8 @@ pub fn cmd_forwards(args: &[String]) -> R {
                 .into_iter()
                 .flatten()
                 .map(|f| {
-                    let state = if f["paused"].as_bool().unwrap_or(false) {
-                        c::dim("paused")
+                    let state = if !f["enabled"].as_bool().unwrap_or(false) {
+                        c::dim("off")
                     } else if let Some(e) = f["error"].as_str() {
                         c::red(e)
                     } else if f["online"].as_bool().unwrap_or(false) {
@@ -412,10 +413,10 @@ pub fn cmd_forwards(args: &[String]) -> R {
                 })
                 .collect();
             if rows.is_empty() {
-                println!("{}", c::dim("Nothing forwarded. Services a paired Mac lets you tunnel to appear here while they listen on a port."));
+                println!("{}", c::dim("Nothing to forward. Services a paired Mac lets you tunnel to appear here while they listen on a port."));
             } else {
                 println!("{}", c::table(&rows, &["SERVICE", "REMOTE PORT", "LOCAL URL", "STATE", "CONNS"]));
-                println!("{}", c::dim("  Only reachable from this Mac, by your user; traffic rides the encrypted link."));
+                println!("{}", c::dim("  Off until enabled (lstack forwards enable <service>@<machine>). Only reachable from this Mac, by your user; traffic rides the encrypted link."));
             }
             Ok(())
         }

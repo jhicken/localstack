@@ -139,8 +139,9 @@ struct ServiceURL: Codable, Hashable {
     let localOnly: Bool?
     /// Forwarded from this paired Mac over the encrypted link: the URL is on this Mac.
     var via: String? = nil
-    /// "paused": its forward is paused (opening resumes it). "untunneled": on another Mac that doesn't let this one
-    /// tunnel to it (services on paired Macs are only reached through the encrypted link, never directly).
+    /// "off": forwarding is off for the service (it's opt-in; turn it on to open it here). "untunneled": on another
+    /// Mac that doesn't let this one tunnel to it (services on paired Macs are only reached through the encrypted
+    /// link, never directly).
     var blocked: String? = nil
 
     var display: String {
@@ -421,7 +422,7 @@ struct ForwardInfo: Decodable, Identifiable, Hashable {
     let port: Int
     let localPort: Int?
     let url: String?
-    let paused: Bool
+    let enabled: Bool
     let online: Bool
     let connections: Int
     let error: String?
@@ -499,6 +500,10 @@ struct ServiceState: Codable, Identifiable, Hashable {
     /// Addresses that can be opened from here: a paired Mac's services only through their encrypted forwards.
     var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "untunneled" } }
     var isRemote: Bool { machine != nil }
+    /// Forwarding to this Mac is on for this (remote) service.
+    var forwardOn: Bool { (urls ?? []).contains { $0.via != nil } }
+    /// A paired Mac's service with something to forward: on now, or off but listening.
+    var canForward: Bool { isRemote && (forwardOn || (urls ?? []).contains { $0.blocked == "off" }) }
 
     var isRunning: Bool { status == "running" }
     var isTransitioning: Bool { status == "starting" || status == "stopping" }

@@ -858,13 +858,18 @@ fn machines_pair_and_proxy() {
     let saved = std::fs::read_to_string(base.join("host/peers.json")).unwrap();
     assert!(saved.contains("publicKey") && !saved.contains("token") && !saved.contains("correct horse"), "{saved}");
 
-    // The client's 127.0.0.1-only web server is forwarded to a local port on the host, automatically.
+    // Forwarding is opt-in: the client's 127.0.0.1-only web server is offered but not forwarded until enabled.
     let forwarded = || -> Option<String> {
         let v = host.get("/api/machines/studio").ok()?;
         let s = v["services"].as_array()?.iter().find(|s| s["name"] == "web" && s["machine"] == "studio")?.clone();
         (v["status"] == "online" && s["urls"][0]["via"] == "studio").then(|| s["urls"][0]["url"].as_str().unwrap().to_string())
     };
-    wait_until("automatic forward", 30, || forwarded().is_some());
+    wait_until("forward offered but off", 30, || {
+        host.get("/api/forwards").unwrap().as_array().is_some_and(|f| f.len() == 1 && f[0]["enabled"] == false && f[0]["url"].is_null())
+    });
+    assert!(forwarded().is_none());
+    host.post("/api/forwards/enable", Some(json!({ "machine": "studio", "service": "web" }))).unwrap();
+    wait_until("forward after enabling", 30, || forwarded().is_some());
     let local_url = forwarded().unwrap();
     assert!(local_url.starts_with("http://localhost:") && local_url != want_url, "{local_url} (same port is taken here, so another is used)");
     let fw = host.get("/api/forwards").unwrap();
