@@ -227,7 +227,7 @@ pub struct ServiceUrl {
     /// Reached through the encrypted link to this machine (a local forward); the URL is on this Mac.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub via: Option<String>,
-    /// Why it can't be opened from here as is: "paused" (its local forward is paused; resume it) or
+    /// Why it can't be opened from here as is: "off" (forwarding is off for the service; turn it on) or
     /// "untunneled" (it's on another Mac that doesn't let this one tunnel to it; services on other Macs
     /// are only reached through the encrypted link, never directly over the network).
     #[serde(skip_serializing_if = "Option::is_none", default)]

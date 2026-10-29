@@ -78,6 +78,19 @@ enum Helper {
         return nil
     }
 
+    /// Remove a CLI symlink the normal uninstall couldn't (e.g. one in /usr/local/bin made with an admin prompt).
+    static func removeCLIWithAdmin(_ path: String) -> String? {
+        let quoted = path.replacingOccurrences(of: "'", with: "'\\''")
+        let cmd = "rm -f '\(quoted)'"
+        let script = "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
+        var err: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&err)
+        if let err, (err[NSAppleScript.errorNumber] as? Int) != -128 {
+            return err[NSAppleScript.errorMessage] as? String ?? "remove failed"
+        }
+        return nil
+    }
+
     /// Setting: quitting the app also stops the daemon (and with it scripts, forwards and the link).
     static let stopOnQuitKey = "stopDaemonOnQuit"
     static var stopOnQuit: Bool { UserDefaults.standard.bool(forKey: stopOnQuitKey) }

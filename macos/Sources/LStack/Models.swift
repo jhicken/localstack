@@ -139,8 +139,9 @@ struct ServiceURL: Codable, Hashable {
     let localOnly: Bool?
     /// Forwarded from this paired Mac over the encrypted link: the URL is on this Mac.
     var via: String? = nil
-    /// "paused": its forward is paused (opening resumes it). "untunneled": on another Mac that doesn't let this one
-    /// tunnel to it (services on paired Macs are only reached through the encrypted link, never directly).
+    /// "off": forwarding is off for the service (it's opt-in; turn it on to open it here). "untunneled": on another
+    /// Mac that doesn't let this one tunnel to it (services on paired Macs are only reached through the encrypted
+    /// link, never directly).
     var blocked: String? = nil
 
     var display: String {
@@ -329,13 +330,16 @@ struct SecretInfo: Decodable, Identifiable, Hashable {
     let origin: String?
     /// When the value was last read from 1Password (ms).
     let fetchedAt: Double?
+    /// The stored value is an empty string.
+    let empty: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case name, setAt, usedBy, missing, source, ref, template, account, origin, fetchedAt
+        case name, setAt, usedBy, missing, source, ref, template, account, origin, fetchedAt, empty
         case isInternal = "internal"
     }
 
     var isSet: Bool { !(missing ?? false) }
+    var isEmpty: Bool { empty ?? false }
     var fromOnePassword: Bool { source == "op" }
     var peer: String? { source?.hasPrefix("peer:") == true ? String(source!.dropFirst(5)) : nil }
 
@@ -418,7 +422,7 @@ struct ForwardInfo: Decodable, Identifiable, Hashable {
     let port: Int
     let localPort: Int?
     let url: String?
-    let paused: Bool
+    let enabled: Bool
     let online: Bool
     let connections: Int
     let error: String?
@@ -496,6 +500,10 @@ struct ServiceState: Codable, Identifiable, Hashable {
     /// Addresses that can be opened from here: a paired Mac's services only through their encrypted forwards.
     var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "untunneled" } }
     var isRemote: Bool { machine != nil }
+    /// Forwarding to this Mac is on for this (remote) service.
+    var forwardOn: Bool { (urls ?? []).contains { $0.via != nil } }
+    /// A paired Mac's service with something to forward: on now, or off but listening.
+    var canForward: Bool { isRemote && (forwardOn || (urls ?? []).contains { $0.blocked == "off" }) }
 
     var isRunning: Bool { status == "running" }
     var isTransitioning: Bool { status == "starting" || status == "stopping" }
@@ -939,12 +947,16 @@ struct OPPeerSync: Decodable {
     let received: [Received]?
     let asked: [Asked]?
     let errors: [String]?
+    let attached: [String]?
 
     var summary: String {
         var lines = (received ?? []).compactMap { r -> String? in
             let n = (r.stored ?? []) + (r.updated ?? [])
             let to = (r.services ?? []).isEmpty ? "" : " → \((r.services ?? []).joined(separator: ", "))"
             return n.isEmpty ? nil : "From \(r.machine): \(n.joined(separator: ", "))\(to)"
+        }
+        if let a = attached, !a.isEmpty {
+            lines.append("Already had the values from a paired Mac; attached them to \(a.joined(separator: ", ")).")
         }
         for a in asked ?? [] {
             lines.append("Asked \(a.machine) for \(a.refs.count) value\(a.refs.count == 1 ? "" : "s") — approve it there.")

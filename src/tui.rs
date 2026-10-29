@@ -914,6 +914,8 @@ fn details(s: &ServiceState, hist: &[MetricSample], w: usize) -> Vec<Line<'stati
         }
         if let Some(m) = &u.via {
             v.push(dim(format!("  🔒 via {m}")));
+        } else if u.blocked.as_deref() == Some("off") {
+            v.push(dim("  (not forwarded)"));
         } else if u.blocked.as_deref() == Some("untunneled") {
             v.push(dim("  (no tunnel: not reachable from here)"));
         } else if u.local_only {

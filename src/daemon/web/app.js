@@ -406,7 +406,9 @@
       const mark = via ? '<span class="lvia">🔒</span>' : warn ? `<span class="lwarn" title="${esc(LOCAL_ONLY_TIP)}">⚠</span>` : "";
       const inner = `${mark}${esc(text)}`;
       const cls = `link${warn ? " warn" : ""}${via ? " via" : ""}`;
-      const tip = via ? `${u.url}\nforwarded from ${via} (port ${u.port ?? "?"} there) over the encrypted link — works on this Mac` : u.url;
+      const off = u.blocked === "off";
+      const tip = via ? `${u.url}\nforwarded from ${via} (port ${u.port ?? "?"} there) over the encrypted link — works on this Mac` : off ? `${u.url}\nnot forwarded to this Mac — turn it on in the LStack app or with: lstack forwards enable ${s.name}@${s._m}` : u.url;
+      if (off) return `<span class="${cls} off" title="${esc(tip)}" style="opacity:.5;cursor:not-allowed">${inner}</span>`;
       if (!/^https?:\/\//i.test(u.url || "")) return `<span class="${cls}" title="${esc(tip)}">${inner}</span>`;
       return `<a class="${cls}" href="${esc(u.url)}" target="_blank" rel="noopener noreferrer" title="${esc(tip)}">${inner}</a>`;
     }).join("") + (more > 0 ? `<span class="link more" title="${esc(urls.slice(max).map((u) => u.url).join("\n"))}">+${more}</span>` : "");

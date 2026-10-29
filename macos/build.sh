@@ -13,8 +13,14 @@ VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
 SIGN="${SIGN_IDENTITY:--}"
 ARCH="$(uname -m)"
 
+# --install is for local use: a faster Rust profile, and no zip/dmg.
+LOCAL=0; [[ "${1:-}" == "--install" ]] && LOCAL=1
 echo "▸ building lstack $VERSION (rust)"
-cargo build --release --quiet
+if [[ $LOCAL == 1 ]]; then
+  cargo build --profile local --quiet; RUST_BIN=target/local/lstack
+else
+  cargo build --release --quiet; RUST_BIN=target/release/lstack
+fi
 echo "▸ building menu bar app (swift)"
 (cd macos && swift build -c release 2>&1 | grep -E "error|warning: " || true)
 SWIFT_BIN="$(cd macos && swift build -c release --show-bin-path)/LStack"
@@ -24,7 +30,7 @@ rm -rf "$APP"
 # Helpers/ rather than MacOS/: `LStack` and `lstack` would collide on a case-insensitive volume.
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/LStack"
-cp target/release/lstack "$APP/Contents/Helpers/lstack"
+cp "$RUST_BIN" "$APP/Contents/Helpers/lstack"
 cp macos/Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -58,6 +64,8 @@ codesign --force --sign "$SIGN" "${RUNTIME[@]+"${RUNTIME[@]}"}" --identifier dev
 codesign --force --sign "$SIGN" "${RUNTIME[@]+"${RUNTIME[@]}"}" "$APP"
 codesign --verify --strict "$APP"
 
+echo "✓ $APP  ($(du -sh "$APP" | cut -f1))"
+if [[ $LOCAL == 0 ]]; then
 ZIP="dist/LStack-$VERSION-$ARCH.zip"
 DMG="dist/LStack-$VERSION-$ARCH.dmg"
 rm -f "$ZIP" "$DMG"
@@ -73,9 +81,9 @@ for attempt in 1 2 3 4; do
 done
 rm -rf "$STAGE"
 
-echo "✓ $APP  ($(du -sh "$APP" | cut -f1))"
 echo "✓ $ZIP"
 echo "✓ $DMG"
+fi
 
 if [[ "${1:-}" == "--install" ]]; then
   osascript -e 'tell application id "dev.lstack.menubar" to quit' >/dev/null 2>&1 || true

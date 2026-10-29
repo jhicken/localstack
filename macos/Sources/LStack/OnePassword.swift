@@ -120,7 +120,6 @@ struct OnePasswordCLI: Sendable {
             throw Self.explain(String(decoding: box.err, as: UTF8.self), reference: reference)
         }
         guard let s = String(data: box.out, encoding: .utf8) else { throw OnePasswordError(message: "\(reference): value isn't UTF-8 text") }
-        guard !s.isEmpty else { throw OnePasswordError(message: "\(reference): empty value") }
         return s
     }
 
@@ -159,8 +158,8 @@ struct OnePasswordCLI: Sendable {
         guard parts.count == refs.count + 1 else { throw OnePasswordError(message: "\(what): unexpected output from op run") }
         var values: [String: String] = [:]
         for (i, r) in refs.enumerated() {
-            guard let v = String(data: Data(parts[i]), encoding: .utf8), !v.isEmpty, !v.hasPrefix("op://") else {
-                throw OnePasswordError(message: "\(r): empty or unreadable value")
+            guard let v = String(data: Data(parts[i]), encoding: .utf8), !v.hasPrefix("op://") else {
+                throw OnePasswordError(message: "\(r): unreadable value")
             }
             values[r] = v
         }
@@ -331,6 +330,18 @@ final class OnePasswordRun {
     /// Reads `refs` with one approval in 1Password. If the batch fails for a reason that isn't about
     /// 1Password itself (declined, locked…), falls back to one read each to tell which failed. Blocking.
     nonisolated static func readBatch(_ cli: OnePasswordCLI, _ refs: [String]) -> (values: [String: String], errors: [String: String]) {
+        var r = readBatchOnce(cli, refs)
+        // 1Password sometimes reports the first approval as expired right after you unlock it; one retry fixes it.
+        let retry = r.errors.filter { $0.value.lowercased().contains("expired") }.map(\.key)
+        if !retry.isEmpty {
+            let again = readBatchOnce(cli, retry)
+            for (k, v) in again.values { r.values[k] = v; r.errors[k] = nil }
+            for (k, v) in again.errors { r.errors[k] = v }
+        }
+        return r
+    }
+
+    nonisolated private static func readBatchOnce(_ cli: OnePasswordCLI, _ refs: [String]) -> (values: [String: String], errors: [String: String]) {
         let refs = Array(Set(refs)).sorted()
         do {
             return (try cli.readMany(refs), [:])

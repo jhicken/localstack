@@ -472,7 +472,9 @@ fn run_plan(cl: &Client, a: &Args, plan: Value) -> R {
             let (name, r) = (i["name"].as_str().unwrap_or(""), i["ref"].as_str().unwrap_or(""));
             match o.read(r) {
                 Ok(v) => {
-                    if v.len() < crate::scrub::MIN_LEN {
+                    if v.is_empty() {
+                        eprintln!("{}", c::yellow(&format!("  warning: {name} is empty in 1Password")));
+                    } else if v.len() < crate::scrub::MIN_LEN {
                         eprintln!("{}", c::yellow(&format!("  warning: {name} is shorter than {} characters, so it isn't scrubbed from logs", crate::scrub::MIN_LEN)));
                     }
                     values.insert(name.to_string(), v);

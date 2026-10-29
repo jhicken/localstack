@@ -151,8 +151,8 @@ pub fn router(st: AppState) -> Router {
         .route("/api/identity", get(identity))
         .route("/api/identity/rekey", post(identity_rekey))
         .route("/api/forwards", get(|State(st): State<AppState>| async move { Json(st.peers.forwards.list()) }))
-        .route("/api/forwards/pause", post(|st: State<AppState>, body: Bytes| async move { forwards_pause(st, body, true) }))
-        .route("/api/forwards/resume", post(|st: State<AppState>, body: Bytes| async move { forwards_pause(st, body, false) }))
+        .route("/api/forwards/enable", post(|st: State<AppState>, body: Bytes| async move { forwards_set(st, body, true) }))
+        .route("/api/forwards/disable", post(|st: State<AppState>, body: Bytes| async move { forwards_set(st, body, false) }))
         .route("/api/settings", get(|| async { to_json(super::terminal::status()) }).put(settings_update))
         .route("/api/split-command", post(split_command))
         .route("/api/secrets", get(secrets_list))
@@ -941,12 +941,12 @@ async fn identity_rekey(State(st): State<AppState>) -> Res {
     Ok(Json(json!({ "name": super::peers::local_name(), "fingerprint": super::link::fingerprint(&id.public), "publicKey": super::link::key_hex(&id.public) })))
 }
 
-fn forwards_pause(State(st): State<AppState>, body: Bytes, paused: bool) -> Res {
+fn forwards_set(State(st): State<AppState>, body: Bytes, on: bool) -> Res {
     let v = parse_body(&body)?;
     let (Some(m), Some(svc)) = (v["machine"].as_str(), v["service"].as_str()) else {
         return Err(ApiErr(400, "machine and service required".into()));
     };
-    st.peers.set_forward_paused(m, svc, paused)?;
+    st.peers.set_forward_enabled(m, svc, on)?;
     Ok(Json(st.peers.forwards.list()))
 }
 

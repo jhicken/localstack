@@ -151,15 +151,17 @@ struct SecretsSettings: View {
 
     private func row(_ s: SecretInfo) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: s.isSet ? "checkmark.seal.fill" : "exclamationmark.circle.fill")
-                .foregroundStyle(s.isSet ? .green : .orange)
+            Image(systemName: !s.isSet ? "exclamationmark.circle.fill" : s.isEmpty ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                .foregroundStyle(s.isSet && !s.isEmpty ? .green : .orange)
+                .help(s.isEmpty ? "This value is an empty string" : "")
             VStack(alignment: .leading, spacing: 2) {
                 Text(s.name).font(.system(size: 12, weight: .medium, design: .monospaced))
                 Group {
                     if !s.isSet {
                         Text("Not set — needed by \(s.usedBy.joined(separator: ", "))")
                     } else if let at = s.fetchedAt ?? s.setAt {
-                        Text(s.sourceLabel.map { "\($0) · " } ?? "") +
+                        Text(s.isEmpty ? "Empty value · " : "") +
+                            Text(s.sourceLabel.map { "\($0) · " } ?? "") +
                             Text("\(s.fetchedAt != nil ? "fetched" : "set") \(Date(timeIntervalSince1970: at / 1000), format: .relative(presentation: .named))") +
                             Text(s.usedBy.isEmpty ? " · not used yet" : " · used by \(s.usedBy.joined(separator: ", "))")
                     }
@@ -755,7 +757,7 @@ struct MachinesSettings: View {
 
     private func forwardsGroup(_ machine: String, _ fw: [ForwardInfo]) -> some View {
         let open = openForwards.contains(machine)
-        let live = fw.filter { $0.online && !$0.paused }.count
+        let live = fw.filter { $0.online && $0.enabled }.count
         return VStack(alignment: .leading, spacing: 4) {
             Button {
                 withAnimation(.easeInOut(duration: 0.15)) {
@@ -780,23 +782,24 @@ struct MachinesSettings: View {
 
     private func forwardRow(_ f: ForwardInfo, showMachine: Bool) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: f.paused ? "pause.circle" : (f.online ? "lock.fill" : "lock.slash"))
-                .font(.system(size: 10)).foregroundStyle(f.online && !f.paused ? Color.teal : .secondary)
+            Image(systemName: !f.enabled ? "lock.slash" : (f.online ? "lock.fill" : "lock.slash"))
+                .font(.system(size: 10)).foregroundStyle(f.online && f.enabled ? Color.teal : .secondary)
             Text(showMachine ? "\(f.service)@\(f.machine)" : f.service).font(.system(size: 12))
             Text(":\(f.port)").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
             Image(systemName: "arrow.right").font(.system(size: 9)).foregroundStyle(.tertiary)
-            if let u = f.url, !f.paused {
+            if let u = f.url, f.enabled {
                 Button(u) { if let url = URL(string: u) { NSWorkspace.shared.open(url) } }
                     .buttonStyle(.link).font(.system(size: 11, design: .monospaced))
             } else {
-                Text(f.paused ? "paused" : (f.error ?? "—")).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(f.enabled ? (f.error ?? "—") : "—").font(.system(size: 10)).foregroundStyle(.secondary)
             }
             if f.connections > 0 { Text("\(f.connections) open").font(.system(size: 10)).foregroundStyle(.tertiary) }
             Spacer()
-            Button(f.paused ? "Resume" : "Pause") {
-                Task { error = await store.setForwardPaused(f, !f.paused); forwards = await store.forwards() }
-            }
-            .controlSize(.small)
+            Toggle("", isOn: Binding(get: { f.enabled }, set: { on in
+                Task { error = await store.setForwardEnabled(f, on); forwards = await store.forwards() }
+            }))
+            .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            .help("Forward to this Mac")
         }
     }
 

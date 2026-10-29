@@ -83,7 +83,8 @@ struct ServiceRow: View {
                 }
             } else if service.isRunning {
                 if let u = service.links.first {
-                    IconButton(icon: "globe", help: u.blocked == "paused" ? "Resume forwarding and open" : "Open \(u.url)") { store.open(u, in: service) }
+                    IconButton(icon: "globe", help: u.blocked == "off" ? "Forwarding is off" : "Open \(u.url)") { store.open(u) }
+                        .disabled(u.blocked == "off")
                 }
                 VStack(alignment: .trailing, spacing: 1) {
                     Text(Fmt.pct(service.metrics?.cpu)).font(.system(size: 11, weight: .medium)).monospacedDigit()
@@ -186,19 +187,48 @@ struct ServiceRow: View {
             return "Crashed\(service.exitCode.map { " (exit \($0))" } ?? "") · retry \(service.restarts)/\(max)"
         }
         if service.isFailed, let e = service.lastError { return e }
-        if let u = service.uptime { return "up \(Fmt.duration(u)) · \(service.summary)" }
-        return service.description ?? service.summary
+        // The command is shown in the expanded detail; don't repeat it in the header.
+        if let u = service.uptime { return expanded ? "up \(Fmt.duration(u))" : "up \(Fmt.duration(u)) · \(service.summary)" }
+        return service.description ?? (expanded ? "" : service.summary)
     }
 
     private var controls: some View {
         HStack(spacing: 0) {
             if let u = service.links.first {
-                IconButton(icon: "globe", help: u.blocked == "paused" ? "Resume forwarding and open" : "Open \(u.url)") { store.open(u, in: service) }
+                IconButton(icon: "globe", help: u.blocked == "off" ? "Forwarding is off" : "Open \(u.url)") { store.open(u) }
+                    .disabled(u.blocked == "off")
             }
             controlButtons.disabled(!canControl)
             IconButton(icon: "text.alignleft", help: "Logs") {
                 openWindow(id: "logs", value: service.id)
                 bringToFront()
+            }
+            if !service.isRemote {
+                IconButton(icon: "apple.terminal", help: service.type == "process" ? "Attach" : "Shell") {
+                    store.openTerminal(service.name)
+                }
+                .disabled(!service.isRunning)
+                Menu {
+                    Button("Edit…") { openEditor(.general) }
+                    Button("Environment Variables…") { openEditor(.environment) }
+                    if !(service.config.envFiles ?? []).isEmpty {
+                        if service.isRunning, !(service.envStale ?? []).isEmpty {
+                            Button("Restart to Apply Env Changes") { store.perform(service, "restart") }
+                        }
+                        Button("Review 1Password References…") {
+                            openWindow(id: "op-review", value: service.name)
+                            bringToFront()
+                        }
+                    }
+                    Button("Open YAML Definition") { store.revealConfig(service.name) }
+                    Divider()
+                    Button("Remove…", role: .destructive) { confirmRemove = true }
+                } label: {
+                    Image(systemName: "ellipsis").frame(width: 22, height: 22)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
             }
         }
     }
@@ -259,7 +289,19 @@ struct ServiceRow: View {
     }
 
     private var links: some View {
-        FlowLinks(urls: service.links) { store.open($0, in: service) }
+        HStack(alignment: .top, spacing: 6) {
+            if service.canForward {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.left.arrow.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(service.forwardOn ? Color.teal : .secondary)
+                    Toggle("Forward to this Mac", isOn: Binding(get: { service.forwardOn }, set: { store.setForward(service, $0) }))
+                        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                }
+                .help("Forward to this Mac\nReach this service on localhost over the encrypted link. Off by default.")
+            }
+            FlowLinks(urls: service.links) { store.open($0) }
+        }
     }
 
     private var secretKeys: [String] { (service.config.secrets?.pairs ?? []).map(\.key) }
@@ -312,42 +354,6 @@ struct ServiceRow: View {
 
     @ViewBuilder private var localActions: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Toggle(isOn: Binding(get: { service.autostart }, set: { store.setAutostart(service.name, $0) })) {
-                    Text("Start at login").font(.system(size: 11))
-                }
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                Spacer()
-                Button {
-                    store.openTerminal(service.name)
-                } label: {
-                    Label(service.type == "process" ? "Attach" : "Shell", systemImage: "apple.terminal")
-                }
-                .disabled(!service.isRunning)
-                Menu {
-                    Button("Edit…") { openEditor(.general) }
-                    Button("Environment Variables…") { openEditor(.environment) }
-                    if !(service.config.envFiles ?? []).isEmpty {
-                        if service.isRunning, !(service.envStale ?? []).isEmpty {
-                            Button("Restart to Apply Env Changes") { store.perform(service, "restart") }
-                        }
-                        Button("Review 1Password References…") {
-                            openWindow(id: "op-review", value: service.name)
-                            bringToFront()
-                        }
-                    }
-                    Button("Open YAML Definition") { store.revealConfig(service.name) }
-                    Divider()
-                    Button("Remove…", role: .destructive) { confirmRemove = true }
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            }
-            .controlSize(.small)
             // Inline confirmation: a dialog/sheet would take key focus and close the menu bar panel.
             if confirmRemove {
                 HStack(spacing: 6) {
@@ -396,27 +402,28 @@ struct FlowLinks: View {
             HStack(spacing: 3) {
                 Image(systemName: icon(u))
                     .font(.system(size: 9))
-                    .foregroundStyle(paused(u) ? Color.secondary : warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
+                    .foregroundStyle(off(u) ? Color.secondary : warn(u) ? .orange : (u.via != nil ? .teal : .accentColor))
                 Text(u.display).font(.system(size: 10, weight: .medium)).lineLimit(1).truncationMode(.middle)
             }
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(Capsule().fill(Color.accentColor.opacity(0.12)))
         }
         .buttonStyle(.plain)
+        .disabled(off(u))
         .help(help(u))
     }
 
     private func warn(_ u: ServiceURL) -> Bool { u.via == nil && u.localOnly == true }
-    private func paused(_ u: ServiceURL) -> Bool { u.blocked == "paused" }
+    private func off(_ u: ServiceURL) -> Bool { u.blocked == "off" }
 
     private func icon(_ u: ServiceURL) -> String {
-        if paused(u) { return "pause.circle.fill" }
+        if off(u) { return "lock.slash" }
         if u.via != nil { return "lock.fill" }
         return u.localOnly == true ? "exclamationmark.triangle.fill" : "link"
     }
 
     private func help(_ u: ServiceURL) -> String {
-        if paused(u) { return "Forwarding is paused — click to resume it and open \(u.port.map { "port \($0)" } ?? "it") on this Mac" }
+        if off(u) { return "\(u.url): turn on forwarding to open it on this Mac" }
         if let m = u.via { return "\(u.url) — forwarded from \(m) over the encrypted link" }
         return u.localOnly == true ? "\(u.url) — bound to localhost on that Mac, so it may not be reachable from here" : u.url
     }

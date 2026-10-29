@@ -418,22 +418,18 @@ final class AppStore {
         }
     }
 
-    /// Open a service URL in the default browser. A paused forward is resumed first and its local URL opened.
-    func open(_ u: ServiceURL, in s: ServiceState? = nil) {
-        guard u.blocked == "paused", let s, let machine = s.machine else {
-            if let url = URL(string: u.url) { NSWorkspace.shared.open(url) }
-            return
-        }
+    /// Open a service URL in the default browser. Addresses with forwarding off are never opened.
+    func open(_ u: ServiceURL) {
+        guard u.blocked != "off", let url = URL(string: u.url) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Turn forwarding to this Mac on or off for a paired Mac's service.
+    func setForward(_ s: ServiceState, _ on: Bool) {
+        guard let machine = s.machine else { return }
         Task {
-            guard let client else { return }
             do {
-                let list = try await client.send("POST", "/api/forwards/resume", body: ["machine": machine, "service": s.name], as: [ForwardInfo].self)
-                let f = list.first { $0.machine == machine && $0.service == s.name && $0.port == u.port }
-                if let str = f?.url, let url = URL(string: str) {
-                    NSWorkspace.shared.open(url)
-                } else {
-                    flash(f?.error ?? "Resumed forwarding \(s.name), but it isn't listening on this Mac yet")
-                }
+                _ = try await client?.send("POST", "/api/forwards/\(on ? "enable" : "disable")", body: ["machine": machine, "service": s.name], as: [ForwardInfo].self)
             } catch { flash(error.localizedDescription) }
         }
     }
@@ -1097,10 +1093,10 @@ final class AppStore {
         (try? await client?.send("GET", "/api/forwards", as: [ForwardInfo].self)) ?? []
     }
 
-    func setForwardPaused(_ f: ForwardInfo, _ paused: Bool) async -> String? {
+    func setForwardEnabled(_ f: ForwardInfo, _ on: Bool) async -> String? {
         guard let client else { return DaemonError.notRunning.localizedDescription }
         do {
-            _ = try await client.send("POST", "/api/forwards/\(paused ? "pause" : "resume")", body: ["machine": f.machine, "service": f.service], as: [ForwardInfo].self)
+            _ = try await client.send("POST", "/api/forwards/\(on ? "enable" : "disable")", body: ["machine": f.machine, "service": f.service], as: [ForwardInfo].self)
             return nil
         } catch { return error.localizedDescription }
     }

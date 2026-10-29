@@ -115,9 +115,6 @@ impl Op {
             return Err(format!("{reference}: {}", explain(&err)));
         }
         let s = String::from_utf8(buf.to_vec()).map_err(|_| format!("{reference}: value isn't UTF-8 text"))?;
-        if s.is_empty() {
-            return Err(format!("{reference}: empty value"));
-        }
         Ok(Zeroizing::new(s))
     }
 

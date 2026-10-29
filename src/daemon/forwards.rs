@@ -7,7 +7,7 @@
 //! - Local port: the one used last time (remembered in `forwards.json`), else the same number as on the
 //!   other Mac if free, else any free port.
 //! - Only processes of the macOS user running LStack may use a forward (checked per connection).
-//! - Forwards can be paused per service.
+//! - Forwarding is opt-in per service (`enabled`); services default to off.
 use crate::paths::{self, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -32,8 +32,35 @@ type Key = (String, String, u16);
 struct Saved {
     /// "machine/service/port" → local port.
     ports: BTreeMap<String, u16>,
-    /// "machine/service" with forwarding paused.
+    /// "machine/service" with forwarding turned on.
+    enabled: BTreeSet<String>,
+    /// Pre-opt-in files only: services whose forwarding was paused. Read for the migration, never written.
+    #[serde(skip_serializing)]
     paused: BTreeSet<String>,
+}
+
+impl Saved {
+    /// Files from before forwarding became opt-in have no `enabled` list: keep every service that was
+    /// forwarded (it has a remembered port) and wasn't paused, so existing setups carry on unchanged.
+    fn load() -> Saved {
+        let Some(raw) = std::fs::read(file()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return Saved::default() };
+        let migrate = raw.get("enabled").is_none();
+        let saved = Saved::from_json(raw);
+        if migrate {
+            Forwards::save(&saved);
+        }
+        saved
+    }
+
+    fn from_json(raw: Value) -> Saved {
+        let has_enabled = raw.get("enabled").is_some();
+        let mut saved: Saved = serde_json::from_value(raw).unwrap_or_default();
+        if !has_enabled {
+            let paused = std::mem::take(&mut saved.paused);
+            saved.enabled = saved.ports.keys().filter_map(|k| k.rsplit_once('/').map(|(svc, _)| svc.to_string())).filter(|svc| !paused.contains(svc)).collect();
+        }
+        saved
+    }
 }
 
 struct Fwd {
@@ -88,7 +115,7 @@ fn bind(port: u16) -> Option<(std::net::TcpListener, Option<std::net::TcpListene
 
 impl Forwards {
     pub fn new(rt: Handle) -> Arc<Self> {
-        let saved = std::fs::read(file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let saved = Saved::load();
         Arc::new(Forwards {
             rt,
             inner: Mutex::new(Inner { saved, ..Default::default() }),
@@ -120,8 +147,8 @@ impl Forwards {
     pub fn sync(self: &Arc<Self>, machine: &str, want: Vec<(String, u16)>) -> bool {
         let mut g = self.inner.lock().unwrap();
         g.wanted.insert(machine.to_string(), want.clone());
-        let paused = g.saved.paused.clone();
-        let want: BTreeSet<Key> = want.into_iter().filter(|(s, _)| !paused.contains(&format!("{machine}/{s}"))).map(|(s, p)| (machine.to_string(), s, p)).collect();
+        let enabled = g.saved.enabled.clone();
+        let want: BTreeSet<Key> = want.into_iter().filter(|(s, _)| enabled.contains(&format!("{machine}/{s}"))).map(|(s, p)| (machine.to_string(), s, p)).collect();
         let stale: Vec<Key> = g.active.keys().filter(|k| k.0 == machine && !want.contains(*k)).cloned().collect();
         let mut changed = !stale.is_empty();
         for k in stale {
@@ -212,10 +239,10 @@ impl Forwards {
         self.inner.lock().unwrap().active.get(&(machine.to_string(), service.to_string(), port)).map(|f| f.local)
     }
 
-    /// Whether `machine`'s `service:port` would be forwarded but is paused.
-    pub fn paused(&self, machine: &str, service: &str, port: u16) -> bool {
+    /// Whether `machine`'s `service:port` could be forwarded but forwarding is off for the service.
+    pub fn off(&self, machine: &str, service: &str, port: u16) -> bool {
         let g = self.inner.lock().unwrap();
-        g.saved.paused.contains(&format!("{machine}/{service}")) && g.wanted.get(machine).is_some_and(|w| w.iter().any(|(s, p)| s == service && *p == port))
+        !g.saved.enabled.contains(&format!("{machine}/{service}")) && g.wanted.get(machine).is_some_and(|w| w.iter().any(|(s, p)| s == service && *p == port))
     }
 
     pub fn remove_machine(&self, machine: &str) {
@@ -231,12 +258,12 @@ impl Forwards {
         g.errors.retain(|k, _| k.0 != machine);
     }
 
-    /// Pause or resume forwarding `machine`'s `service`. Returns true if it changed.
-    pub fn set_paused(self: &Arc<Self>, machine: &str, service: &str, paused: bool) -> bool {
+    /// Turn forwarding of `machine`'s `service` on or off. Returns true if it changed.
+    pub fn set_enabled(self: &Arc<Self>, machine: &str, service: &str, on: bool) -> bool {
         let want = {
             let mut g = self.inner.lock().unwrap();
             let k = format!("{machine}/{service}");
-            let changed = if paused { g.saved.paused.insert(k) } else { g.saved.paused.remove(&k) };
+            let changed = if on { g.saved.enabled.insert(k) } else { g.saved.enabled.remove(&k) };
             if !changed {
                 return false;
             }
@@ -254,7 +281,7 @@ impl Forwards {
             let online = g.links.get(machine).is_some_and(|m| !m.is_closed());
             for (service, port) in want {
                 let k = (machine.clone(), service.clone(), *port);
-                let paused = g.saved.paused.contains(&format!("{machine}/{service}"));
+                let enabled = g.saved.enabled.contains(&format!("{machine}/{service}"));
                 let f = g.active.get(&k);
                 out.push(json!({
                     "machine": machine,
@@ -262,7 +289,7 @@ impl Forwards {
                     "port": port,
                     "localPort": f.map(|f| f.local),
                     "url": f.map(|f| format!("http://localhost:{}", f.local)),
-                    "paused": paused,
+                    "enabled": enabled,
                     "online": online,
                     "connections": f.map_or(0, |f| f.conns.load(Ordering::Relaxed)),
                     "error": g.errors.get(&k),
@@ -297,6 +324,17 @@ mod tests {
         assert_eq!(to_local("http://localhost:3000/x?y=1", 4100), "http://localhost:4100/x?y=1");
         assert_eq!(to_local("https://studio.local:8443", 9443), "https://localhost:9443");
         assert_eq!(to_local("http://[::1]:5173#a", 5174), "http://localhost:5174#a");
+    }
+
+    #[test]
+    fn old_files_keep_forwarded_services_unless_paused() {
+        let old = json!({ "ports": { "studio/web/3000": 3000, "studio/web/3001": 3001, "studio/db/5432": 5432, "mini/api/80": 8080 }, "paused": ["studio/db"] });
+        let saved = Saved::from_json(old);
+        assert_eq!(saved.enabled.iter().map(String::as_str).collect::<Vec<_>>(), ["mini/api", "studio/web"]);
+        assert!(saved.paused.is_empty());
+        // Already-migrated files are taken as they are.
+        let new = Saved::from_json(json!({ "ports": { "studio/web/3000": 3000 }, "enabled": [] }));
+        assert!(new.enabled.is_empty());
     }
 
     #[test]

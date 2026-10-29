@@ -103,8 +103,8 @@ fn help() -> String {
   lstack machine id              this install's key fingerprint     lstack machine rekey
   lstack ls                      services grouped by machine; address them as name@machine
   lstack logs api@studio -f      lstack restart worker@studio
-  lstack forwards                services of paired Macs forwarded to localhost (the only way to reach them)
-  lstack forwards pause|resume web@studio
+  lstack forwards                paired Macs' services and whether each is forwarded to localhost (off by default)
+  lstack forwards enable|disable web@studio
   lstack machine reconnect       redial machines that are offline now
 
 {}
@@ -281,6 +281,7 @@ fn url_cell(s: &ServiceState) -> String {
             let more = if s.urls.len() > 1 { c::dim(&format!(" +{}", s.urls.len() - 1)) } else { String::new() };
             let warn = match &u.via {
                 Some(m) => c::dim(&format!(" (via {m})")),
+                None if u.blocked.as_deref() == Some("off") => c::dim(" (not forwarded)"),
                 None if u.blocked.as_deref() == Some("untunneled") => c::yellow(" (no tunnel)"),
                 None if u.local_only && s.machine.is_some() => c::yellow(" (local only)"),
                 None => String::new(),
@@ -416,6 +417,7 @@ fn cmd_show(args: &[String]) -> R {
         let label = u.label.as_deref().map(|l| format!(" {}", c::dim(l))).unwrap_or_default();
         let note = match &u.via {
             Some(m) => c::dim(&format!(" (forwarded from {m} over the encrypted link; port {})", u.port.map(|p| p.to_string()).unwrap_or_default())),
+            None if u.blocked.as_deref() == Some("off") => c::dim(&format!(" (not forwarded: lstack forwards enable {}@{})", s.name, s.machine.as_deref().unwrap_or("?"))),
             None if u.blocked.as_deref() == Some("untunneled") => c::dim(" (no tunnel permission from that Mac: only reachable through the encrypted link)"),
             None if u.local_only => c::dim(if s.machine.is_some() { " (bound to localhost there: not reachable from here)" } else { " (localhost only)" }),
             None => String::new(),
