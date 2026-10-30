@@ -773,6 +773,7 @@ struct OPSharesList: View {
     @State private var busy = false
     @State private var message: String?
     @State private var error: String?
+    @State private var expanded: Set<String> = []
 
     private var peers: [OPShares.Peer] { shares?.peers ?? [] }
     private var received: [OPShares.Received] { shares?.received ?? [] }
@@ -797,14 +798,8 @@ struct OPSharesList: View {
             }
             ForEach(incoming) { i in IncomingPushRow(item: i, busy: $busy) { await load() } }
             ForEach(peers) { p in peerRows(p) }
-            ForEach(received, id: \.self) { r in
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.down.circle").foregroundStyle(.blue)
-                    Text(r.name).font(.system(size: 11, weight: .medium, design: .monospaced))
-                    Text(ageText("from \(r.from)", r.fetchedAt)).font(.system(size: 10)).foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .help(r.ref ?? "")
+            ForEach(Array(Set(received.map(\.from))).sorted(), id: \.self) { from in
+                receivedRows(from)
             }
             if let message {
                 Text(message).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -871,18 +866,95 @@ struct OPSharesList: View {
                 .padding(.leading, 18)
                 .help(w.ref)
             }
-            ForEach(granted, id: \.self) { g in
-                HStack(spacing: 6) {
-                    Text(g.name ?? shortRef(g.ref)).font(.system(size: 11, design: .monospaced))
-                    Text(pushing.contains(g.ref) ? "pushed · waiting for \(p.name) to accept" : (g.have == false ? "shared · not cached here" : "shared"))
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                    Spacer()
-                    Button(pushing.contains(g.ref) ? "Cancel" : "Stop Sharing") { Task { await share(p, g.ref, allow: false) } }.disabled(busy)
-                        .help(g.ref)
+            let wanted = Dictionary((p.wants ?? []).map { ($0.ref, $0.services ?? []) }, uniquingKeysWith: { a, _ in a })
+            ForEach(Self.byService("to:\(p.id)", granted) { wanted[$0.ref] ?? [] }) { grp in
+                let waiting = grp.items.filter { pushing.contains($0.ref) }.count
+                groupHeader(grp.id, grp.service ?? "No service named", grp.items.count,
+                            note: waiting > 0 ? "\(waiting) waiting for \(p.name) to accept" : nil)
+                    .padding(.leading, 18)
+                    .help(grp.service.map { "Values shared with \(p.name) for its \($0) service" } ?? "Values shared with \(p.name) that no service there has asked for by name")
+                if expanded.contains(grp.id) {
+                    ForEach(grp.items, id: \.self) { g in
+                        HStack(spacing: 6) {
+                            Text(g.name ?? shortRef(g.ref)).font(.system(size: 11, design: .monospaced))
+                            Text(pushing.contains(g.ref) ? "pushed · waiting for \(p.name) to accept" : (g.have == false ? "shared · not cached here" : "shared"))
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                            Spacer()
+                            Button(pushing.contains(g.ref) ? "Cancel" : "Stop Sharing") { Task { await share(p, g.ref, allow: false) } }.disabled(busy)
+                                .help(g.ref)
+                        }
+                        .padding(.leading, 36)
+                    }
                 }
-                .padding(.leading, 18)
             }
         }
+    }
+
+    /// Values received here from one paired Mac, grouped by the services here that use them.
+    @ViewBuilder private func receivedRows(_ from: String) -> some View {
+        let items = received.filter { $0.from == from }
+        let used = Dictionary((store.secrets?.secrets ?? []).map { ($0.name, $0.usedBy) }, uniquingKeysWith: { a, _ in a })
+        HStack(spacing: 5) {
+            Image(systemName: "arrow.down.circle").foregroundStyle(.blue)
+            Text("From \(from)").font(.system(size: 11, weight: .semibold))
+            Text("\(items.count) value\(items.count == 1 ? "" : "s")").font(.system(size: 10)).foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.top, 2)
+        ForEach(Self.byService("from:\(from)", items) { used[$0.name] ?? [] }) { grp in
+            groupHeader(grp.id, grp.service ?? "Not used yet", grp.items.count)
+                .padding(.leading, 18)
+            if expanded.contains(grp.id) {
+                ForEach(grp.items, id: \.self) { r in
+                    HStack(spacing: 6) {
+                        Text(r.name).font(.system(size: 11, design: .monospaced))
+                        Text(ageText("received", r.fetchedAt)).font(.system(size: 10)).foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.leading, 36)
+                    .help(r.ref ?? "")
+                }
+            }
+        }
+    }
+
+    /// Collapsible "service · N secrets" row.
+    private func groupHeader(_ id: String, _ title: String, _ count: Int, note: String? = nil) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold))
+                    .rotationEffect(.degrees(expanded.contains(id) ? 90 : 0)).frame(width: 10)
+                Image(systemName: "shippingbox").foregroundStyle(.secondary)
+                Text(title).font(.system(size: 11, weight: .medium))
+                Text("\(count) secret\(count == 1 ? "" : "s")").font(.system(size: 10)).foregroundStyle(.secondary)
+                if let note { Text("· \(note)").font(.system(size: 10)).foregroundStyle(.orange) }
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    struct ServiceGroup<T: Hashable>: Identifiable {
+        let id: String
+        let service: String?
+        let items: [T]
+    }
+
+    /// Groups items by service (an item used by several appears under each); items with none go last.
+    static func byService<T: Hashable>(_ prefix: String, _ items: [T], services: (T) -> [String]) -> [ServiceGroup<T>] {
+        var map: [String: [T]] = [:]
+        for i in items {
+            let s = services(i)
+            for k in s.isEmpty ? [""] : s { map[k, default: []].append(i) }
+        }
+        return map.keys
+            .sorted { ($0.isEmpty ? 1 : 0, $0) < ($1.isEmpty ? 1 : 0, $1) }
+            .map { ServiceGroup(id: "\(prefix)|\($0)", service: $0.isEmpty ? nil : $0, items: map[$0] ?? []) }
     }
 
     private func load() async {

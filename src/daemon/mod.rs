@@ -1,6 +1,7 @@
 //! The long-running daemon (`lstack daemon run`), normally started by launchd at login.
 pub mod approvals;
 pub mod docker_api;
+pub mod docker_import;
 pub mod envimport;
 mod drivers;
 pub mod exec;

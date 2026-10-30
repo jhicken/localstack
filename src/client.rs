@@ -124,8 +124,8 @@ impl Client {
     pub fn update(&self, name: &str, patch: Value) -> Res<ServiceState> {
         self.req("PATCH", &format!("/api/services/{}", enc(name)), Some(patch))
     }
-    pub fn remove(&self, name: &str) -> Res<Value> {
-        self.req("DELETE", &format!("/api/services/{}", enc(name)), None)
+    pub fn remove(&self, name: &str, keep: bool) -> Res<Value> {
+        self.req("DELETE", &format!("/api/services/{}{}", enc(name), if keep { "?keep=1" } else { "" }), None)
     }
     pub fn action(&self, name: &str, action: &str) -> Res<ServiceState> {
         self.req("POST", &format!("{}/{action}", svc_path(name)), None)

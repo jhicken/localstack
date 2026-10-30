@@ -108,6 +108,9 @@ On every launch the app runs `setup repair --quiet`, so moving or replacing `LSt
 lstack add api -a -c ~/code/api -- npm run dev                         # script, start at login
 lstack add db -t docker --image postgres:16 -p 5432:5432 -e POSTGRES_PASSWORD=dev -a
 lstack add stack -t compose --file ~/code/app/docker-compose.yml -a
+lstack docker ls                 # every container in Docker Desktop, and whether LStack manages it
+lstack docker import --all       # adopt them all (compose containers become one service per project)
+lstack docker import db cache    # or pick by container name / compose project
 lstack add web --health-url http://localhost:3000/health -- npm start
 lstack add app -a -- 'cd ~/code/app && PORT=3000 bun run dev'        # cd/env are split out automatically
 

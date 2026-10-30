@@ -117,6 +117,8 @@ pub fn router(st: AppState) -> Router {
         .route("/api/services/:name/logs", get(logs).delete(clear_logs))
         .route("/api/services/:name/logs/stream", get(log_stream))
         .route("/api/services/:name/metrics", get(metrics))
+        .route("/api/docker/containers", get(docker_containers))
+        .route("/api/docker/import", post(docker_import))
         .route("/api/system", get(system))
         .route("/api/processes", get(processes))
         .route("/api/services/:name/open-terminal", post(open_term))
@@ -202,6 +204,24 @@ async fn list(State(st): State<AppState>) -> Res {
     to_json(json!({ "services": st.sup.list(), "configErrors": st.sup.config_errors() }))
 }
 
+/// Containers/compose projects in the Docker engine, with whether LStack already manages them.
+async fn docker_containers(State(st): State<AppState>) -> Res {
+    let l = super::docker_import::list(&st.sup).await.map_err(|e| ApiErr(503, e))?;
+    to_json(l.iter().map(|c| c.to_json()).collect::<Vec<_>>())
+}
+
+/// Body: `{"names": [...], "all": bool, "runningOnly": bool}`.
+async fn docker_import(State(st): State<AppState>, body: Bytes) -> Res {
+    let v = parse_body(&body)?;
+    let names: Vec<String> = v["names"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect();
+    let all = v["all"].as_bool().unwrap_or(false);
+    if names.is_empty() && !all {
+        return Err(ApiErr(400, "give \"names\" or \"all\": true".into()));
+    }
+    let (imported, skipped) = super::docker_import::import(&st.sup, &names, all, v["runningOnly"].as_bool().unwrap_or(false)).await.map_err(|e| ApiErr(503, e))?;
+    to_json(json!({ "imported": imported, "skipped": skipped }))
+}
+
 async fn create(State(st): State<AppState>, q: Q, body: Bytes) -> Res {
     let v = parse_body(&body)?;
     let cfg: ServiceConfig = serde_json::from_value(v).map_err(|e| ApiErr(400, e.to_string()))?;
@@ -234,8 +254,8 @@ async fn patch(State(st): State<AppState>, Path(name): Path<String>, body: Bytes
     to_json(st.sup.update(&name, &v)?)
 }
 
-async fn destroy(State(st): State<AppState>, Path(name): Path<String>) -> Res {
-    st.sup.destroy(&name).await?;
+async fn destroy(State(st): State<AppState>, Path(name): Path<String>, q: Q) -> Res {
+    st.sup.destroy(&name, q.get("keep").map(String::as_str) == Some("1")).await?;
     ok()
 }
 

@@ -457,7 +457,7 @@ impl Sup {
         }
         for name in res.removed.clone() {
             let sup = self.clone();
-            tokio::spawn(async move { sup.remove(&name).await });
+            tokio::spawn(async move { sup.remove(&name, false).await });
         }
         res
     }
@@ -481,6 +481,21 @@ impl Sup {
         self.get_state(&cfg.name)
     }
 
+    /// Attach to a workload that is already running (as at daemon boot) without starting anything.
+    pub async fn attach(self: &Arc<Self>, name: &str) -> bool {
+        let Some(gen) = self.with(name, None, |m| m.gen) else { return false };
+        self.with(name, Some(gen), |m| m.rt.log_since = m.logs.last_ts());
+        let ok = self.adopt(name, gen).await;
+        if ok {
+            self.with(name, Some(gen), |m| {
+                m.want_running = true;
+                m.sys("re-attached to running workload");
+            });
+            self.schedule_health(name, Some(1_000));
+        }
+        ok
+    }
+
     pub fn update(self: &Arc<Self>, name: &str, patch: &serde_json::Value) -> R<ServiceState> {
         let mut g = self.lock();
         let m = g.services.get_mut(name).ok_or_else(|| SupErr::new(404, format!("no such service \"{name}\"")))?;
@@ -491,9 +506,10 @@ impl Sup {
         Ok(m.state())
     }
 
-    pub async fn destroy(self: &Arc<Self>, name: &str) -> R<()> {
+    /// Remove a service; with `keep`, leave its container(s) running (docker/compose only).
+    pub async fn destroy(self: &Arc<Self>, name: &str, keep: bool) -> R<()> {
         self.get(name, |_| ())?;
-        self.remove(name).await;
+        self.remove(name, keep).await;
         config::delete_service(name);
         self.store.forget(name);
         Ok(())
@@ -657,7 +673,7 @@ impl Sup {
         self.changed(m);
     }
 
-    async fn remove(self: &Arc<Self>, name: &str) {
+    async fn remove(self: &Arc<Self>, name: &str, keep: bool) {
         if self.with(name, None, |m| {
             m.want_running = false;
             m.abort_tasks();
@@ -666,7 +682,10 @@ impl Sup {
         {
             return;
         }
-        self.driver_stop(name).await;
+        let kind = self.with(name, None, |m| m.cfg.kind.clone()).unwrap_or_default();
+        if !(keep && matches!(kind.as_str(), "docker" | "compose")) {
+            self.driver_stop(name).await;
+        }
         let mut g = self.lock();
         if let Some(mut m) = g.services.remove(name) {
             m.abort_tasks();

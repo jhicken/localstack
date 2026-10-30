@@ -19,13 +19,15 @@ fn help() -> String {
   lstack add <name> [options] -- <command…>
   lstack add -f <service.yaml>   add a service from a YAML definition
   lstack edit <name>             edit a service definition in $EDITOR
-  lstack rm <name> [-y]          stop and remove a service
+  lstack rm <name> [-y] [--keep] stop and remove a service (--keep: leave its container running)
   lstack start|stop|restart <name…|all>
   lstack enable|disable <name…>  toggle start-at-login (autostart)
   lstack logs <name> [-f] [-n 200]
   lstack attach <name>           follow logs and type into the process's stdin
   lstack exec <name> [cmd…]      shell into a docker/compose service (docker exec -it)
   lstack metrics <name> [--range 1h|24h|7d]
+  lstack docker ls               containers in Docker Desktop and whether LStack manages them
+  lstack docker import [<name…>|--all] [--running]   manage existing containers / compose projects
   lstack setup [--cli] [--login] [--app <path>]   install the CLI + start at login
   lstack setup status|repair [--keep-daemon]|uninstall
   lstack remote [on|off|passwd|share|status]   web dashboard for other machines (see below)
@@ -159,6 +161,7 @@ pub fn main(argv: Vec<String>) -> i32 {
         "attach" => cmd_attach(&rest),
         "exec" | "shell" => cmd_exec(&rest),
         "metrics" => cmd_metrics(&rest),
+        "docker" => cmd_docker(&rest),
         "setup" => setup::run(&rest),
         "remote" => cmd_remote(&rest),
         "security" => cmd_security(&rest),
@@ -745,12 +748,14 @@ pub(crate) fn confirm(q: &str) -> bool {
 }
 
 fn cmd_remove(args: &[String]) -> R {
-    let a = Args::parse(args, &[("yes", "y", false)])?;
+    let a = Args::parse(args, &[("yes", "y", false), ("keep", "k", false)])?;
     let name = need(a.pos.first())?;
-    if !a.has("yes") && std::io::stdin().is_terminal() && !confirm(&format!("Stop and remove {}?", c::bold(&name))) {
+    let keep = a.has("keep");
+    let q = if keep { format!("Stop managing {} (container keeps running)?", c::bold(&name)) } else { format!("Stop and remove {}?", c::bold(&name)) };
+    if !a.has("yes") && std::io::stdin().is_terminal() && !confirm(&q) {
         return Ok(());
     }
-    client::connect(true)?.remove(&name)?;
+    client::connect(true)?.remove(&name, keep)?;
     println!("{} removed {name}", c::green("✓"));
     Ok(())
 }
@@ -926,6 +931,44 @@ fn cmd_exec(args: &[String]) -> R {
     match r? {
         0 => Ok(()),
         code => std::process::exit(code),
+    }
+}
+
+fn cmd_docker(args: &[String]) -> R {
+    let (sub, rest) = args.split_first().map(|(s, r)| (s.as_str(), r)).unwrap_or(("ls", &[]));
+    let cl = client::connect(true)?;
+    match sub {
+        "ls" | "list" => {
+            Args::parse(rest, &[])?;
+            let v: serde_json::Value = cl.req("GET", "/api/docker/containers", None)?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                println!("{}", c::dim("no containers"));
+            }
+            for r in rows {
+                let s = |k: &str| r[k].as_str().unwrap_or("").to_string();
+                let dot = if s("state") == "running" { c::green("●") } else { c::dim("○") };
+                let mark = if r["managed"].as_bool() == Some(true) { c::cyan("managed") } else { String::new() };
+                println!("{dot} {:<28} {:<8} {:<28} {:<22} {}", s("name"), s("kind"), s("image"), s("status"), mark);
+            }
+            Ok(())
+        }
+        "import" | "adopt" => {
+            let a = Args::parse(rest, &[("all", "", false), ("running", "", false)])?;
+            if a.pos.is_empty() && !a.has("all") {
+                return Err("name containers/projects to import, or pass --all (see `lstack docker ls`)".into());
+            }
+            let body = serde_json::json!({ "names": a.pos, "all": a.has("all"), "runningOnly": a.has("running") });
+            let v: serde_json::Value = cl.req("POST", "/api/docker/import", Some(body))?;
+            for n in v["imported"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
+                println!("{} imported {}", c::green("✓"), c::bold(n));
+            }
+            for n in v["skipped"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
+                println!("{} {n}", c::dim("–"));
+            }
+            Ok(())
+        }
+        _ => Err("usage: lstack docker ls | import [<name…>|--all] [--running]".into()),
     }
 }
 
