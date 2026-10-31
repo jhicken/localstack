@@ -119,6 +119,7 @@ pub fn router(st: AppState) -> Router {
         .route("/api/services/:name/metrics", get(metrics))
         .route("/api/docker/containers", get(docker_containers))
         .route("/api/docker/import", post(docker_import))
+        .route("/api/docker/sync", get(docker_sync_status).post(docker_sync))
         .route("/api/system", get(system))
         .route("/api/processes", get(processes))
         .route("/api/services/:name/open-terminal", post(open_term))
@@ -210,16 +211,36 @@ async fn docker_containers(State(st): State<AppState>) -> Res {
     to_json(l.iter().map(|c| c.to_json()).collect::<Vec<_>>())
 }
 
-/// Body: `{"names": [...], "all": bool, "runningOnly": bool}`.
+/// Body: `{"names": [...]}`.
 async fn docker_import(State(st): State<AppState>, body: Bytes) -> Res {
     let v = parse_body(&body)?;
     let names: Vec<String> = v["names"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect();
-    let all = v["all"].as_bool().unwrap_or(false);
-    if names.is_empty() && !all {
-        return Err(ApiErr(400, "give \"names\" or \"all\": true".into()));
+    if names.is_empty() {
+        return Err(ApiErr(400, "give \"names\"".into()));
     }
-    let (imported, skipped) = super::docker_import::import(&st.sup, &names, all, v["runningOnly"].as_bool().unwrap_or(false)).await.map_err(|e| ApiErr(503, e))?;
+    let (imported, skipped) = super::docker_import::import(&st.sup, &names).await.map_err(|e| ApiErr(503, e))?;
     to_json(json!({ "imported": imported, "skipped": skipped }))
+}
+
+async fn docker_sync_status() -> Res {
+    to_json(json!({ "enabled": super::terminal::load().docker_sync }))
+}
+
+/// Body: `{"enabled": bool}` turns automatic sync on/off; `{"run": true}` also syncs once right now
+/// (services whose container is gone are dropped immediately).
+async fn docker_sync(State(st): State<AppState>, body: Bytes) -> Res {
+    let v = parse_body(&body)?;
+    let mut s = super::terminal::load();
+    if let Some(on) = v["enabled"].as_bool() {
+        s.docker_sync = on;
+        super::terminal::save(&s).map_err(|e| ApiErr(500, format!("cannot save settings.json: {e}")))?;
+    }
+    let mut out = json!({ "enabled": s.docker_sync, "imported": [], "removed": [], "skipped": [] });
+    if v["run"].as_bool().unwrap_or(false) {
+        let r = super::docker_import::reconcile(&st.sup, &mut Default::default(), 0).await.map_err(|e| ApiErr(503, e))?;
+        out = json!({ "enabled": s.docker_sync, "imported": r.imported, "removed": r.removed, "skipped": r.skipped });
+    }
+    to_json(out)
 }
 
 async fn create(State(st): State<AppState>, q: Q, body: Bytes) -> Res {

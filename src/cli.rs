@@ -27,7 +27,9 @@ fn help() -> String {
   lstack exec <name> [cmd…]      shell into a docker/compose service (docker exec -it)
   lstack metrics <name> [--range 1h|24h|7d]
   lstack docker ls               containers in Docker Desktop and whether LStack manages them
-  lstack docker import [<name…>|--all] [--running]   manage existing containers / compose projects
+  lstack docker import <name…>   manage specific existing containers / compose projects
+  lstack docker sync [on|off|status]   register every container now (and drop ones that are gone);
+                                 `on` keeps doing it automatically
   lstack setup [--cli] [--login] [--app <path>]   install the CLI + start at login
   lstack setup status|repair [--keep-daemon]|uninstall
   lstack remote [on|off|passwd|share|status]   web dashboard for other machines (see below)
@@ -954,21 +956,46 @@ fn cmd_docker(args: &[String]) -> R {
             Ok(())
         }
         "import" | "adopt" => {
-            let a = Args::parse(rest, &[("all", "", false), ("running", "", false)])?;
-            if a.pos.is_empty() && !a.has("all") {
-                return Err("name containers/projects to import, or pass --all (see `lstack docker ls`)".into());
+            let a = Args::parse(rest, &[])?;
+            if a.pos.is_empty() {
+                return Err("name the containers/projects to import (see `lstack docker ls`), or use `lstack docker sync`".into());
             }
-            let body = serde_json::json!({ "names": a.pos, "all": a.has("all"), "runningOnly": a.has("running") });
-            let v: serde_json::Value = cl.req("POST", "/api/docker/import", Some(body))?;
-            for n in v["imported"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
-                println!("{} imported {}", c::green("✓"), c::bold(n));
+            let v: serde_json::Value = cl.req("POST", "/api/docker/import", Some(serde_json::json!({ "names": a.pos })))?;
+            print_sync(&v);
+            Ok(())
+        }
+        "sync" => {
+            let a = Args::parse(rest, &[])?;
+            let (body, now) = match a.pos.first().map(String::as_str) {
+                None => (serde_json::json!({ "run": true }), true),
+                Some("on") => (serde_json::json!({ "enabled": true, "run": true }), true),
+                Some("off") => (serde_json::json!({ "enabled": false }), false),
+                Some("status") => (serde_json::json!({}), false),
+                Some(_) => return Err("usage: lstack docker sync [on|off|status]".into()),
+            };
+            let v: serde_json::Value = cl.req("POST", "/api/docker/sync", Some(body))?;
+            if !a.pos.is_empty() || now {
+                println!("automatic sync: {}", if v["enabled"].as_bool() == Some(true) { c::green("on") } else { c::dim("off") });
             }
-            for n in v["skipped"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
-                println!("{} {n}", c::dim("–"));
+            if now {
+                print_sync(&v);
             }
             Ok(())
         }
-        _ => Err("usage: lstack docker ls | import [<name…>|--all] [--running]".into()),
+        _ => Err("usage: lstack docker ls | import <name…> | sync [on|off|status]".into()),
+    }
+}
+
+fn print_sync(v: &serde_json::Value) {
+    let list = |k: &str| v[k].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect::<Vec<_>>();
+    for n in list("imported") {
+        println!("{} registered {}", c::green("✓"), c::bold(&n));
+    }
+    for n in list("removed") {
+        println!("{} removed {} (container is gone)", c::yellow("−"), c::bold(&n));
+    }
+    for n in list("skipped") {
+        println!("{} {n}", c::dim("–"));
     }
 }
 

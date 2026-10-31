@@ -6,8 +6,9 @@ use super::supervisor::Sup;
 use crate::config;
 use crate::types::ServiceConfig;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// One importable unit: a container or a whole compose project.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,10 +131,9 @@ pub fn unique_name(base: &str, taken: &HashSet<String>) -> String {
 }
 
 pub fn config_for(c: &Candidate, name: String) -> ServiceConfig {
-    let mut cfg = ServiceConfig { name, kind: c.kind.into(), autostart: Some(false), ..Default::default() };
+    let mut cfg = ServiceConfig { name, kind: c.kind.into(), autostart: Some(false), discovered: Some(true), ..Default::default() };
     if c.kind == "docker" {
         cfg.container = Some(c.name.clone());
-        cfg.image = Some(c.image.clone()).filter(|i| !i.is_empty());
     } else {
         cfg.project = Some(c.name.clone());
         cfg.compose_file = c.compose_file.clone();
@@ -152,25 +152,21 @@ pub async fn list(sup: &Arc<Sup>) -> Result<Vec<Candidate>, String> {
     Ok(candidates(&all, &sup.configs()))
 }
 
-/// Import `names` (container names / compose projects), or everything not yet managed when `all`.
+/// Register unmanaged candidates: those named in `names`, or every one when `names` is None.
 /// Returns (imported service names, skipped reasons).
-pub async fn import(sup: &Arc<Sup>, names: &[String], all: bool, running_only: bool) -> Result<(Vec<String>, Vec<String>), String> {
-    let cands = list(sup).await?;
+async fn register(sup: &Arc<Sup>, cands: &[Candidate], names: Option<&[String]>) -> (Vec<String>, Vec<String>) {
     let mut taken: HashSet<String> = sup.configs().into_iter().map(|c| c.name).collect();
     let (mut done, mut skipped) = (vec![], vec![]);
-    for n in names {
+    for n in names.into_iter().flatten() {
         if !cands.iter().any(|c| &c.name == n) {
             skipped.push(format!("{n}: no such container or compose project"));
         }
     }
-    for c in cands.iter().filter(|c| all || names.contains(&c.name)) {
+    for c in cands.iter().filter(|c| names.is_none_or(|n| n.contains(&c.name))) {
         if c.managed {
-            if !all {
+            if names.is_some() {
                 skipped.push(format!("{}: already managed", c.name));
             }
-            continue;
-        }
-        if running_only && !c.running() {
             continue;
         }
         if c.kind == "compose" && c.compose_file.is_none() {
@@ -196,7 +192,93 @@ pub async fn import(sup: &Arc<Sup>, names: &[String], all: bool, running_only: b
             Err(e) => skipped.push(format!("{}: {}", c.name, e.msg)),
         }
     }
-    Ok((done, skipped))
+    (done, skipped)
+}
+
+/// Import the named containers / compose projects.
+pub async fn import(sup: &Arc<Sup>, names: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+    let cands = list(sup).await?;
+    Ok(register(sup, &cands, Some(names)).await)
+}
+
+/// Discovered services whose container (or compose project) is gone from `docker ps -a`.
+pub fn gone(cands: &[Candidate], services: &[ServiceConfig]) -> Vec<String> {
+    services
+        .iter()
+        .filter(|s| s.discovered == Some(true))
+        .filter(|s| match s.kind.as_str() {
+            "docker" => !cands.iter().any(|c| c.kind == "docker" && c.name == s.container_name()),
+            "compose" => !s.project.as_deref().is_some_and(|p| cands.iter().any(|c| c.kind == "compose" && c.name == p)),
+            _ => false,
+        })
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+pub struct SyncResult {
+    pub imported: Vec<String>,
+    pub removed: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+/// Make LStack match Docker: register new containers and drop discovered services whose container is
+/// gone. A service must be missing in more than `grace` consecutive passes before it is dropped
+/// (`missing` carries the counts), so a container that is being recreated isn't dropped and re-added.
+pub async fn reconcile(sup: &Arc<Sup>, missing: &mut HashMap<String, u32>, grace: u32) -> Result<SyncResult, String> {
+    let cands = list(sup).await?;
+    let gone_now = gone(&cands, &sup.configs());
+    missing.retain(|n, _| gone_now.contains(n));
+    let mut removed = vec![];
+    for n in gone_now {
+        let seen = missing.entry(n.clone()).or_insert(0);
+        *seen += 1;
+        if *seen > grace && sup.destroy(&n, true).await.is_ok() {
+            missing.remove(&n);
+            removed.push(n);
+        }
+    }
+    let cands = candidates_after(sup, cands);
+    let (imported, skipped) = register(sup, &cands, None).await;
+    Ok(SyncResult { imported, removed, skipped })
+}
+
+/// Re-flag `managed` after services were removed, so a just-dropped name can be registered again.
+fn candidates_after(sup: &Arc<Sup>, mut cands: Vec<Candidate>) -> Vec<Candidate> {
+    let services = sup.configs();
+    for c in cands.iter_mut() {
+        c.managed = services.iter().any(|s| match (c.kind, s.kind.as_str()) {
+            ("docker", "docker") => s.container_name() == c.name,
+            ("compose", "compose") => s.project.as_deref() == Some(c.name.as_str()),
+            _ => false,
+        });
+    }
+    cands
+}
+
+/// Background loop: while `dockerSync` is on in settings.json, reconcile every few seconds.
+pub fn spawn_sync(sup: Arc<Sup>) {
+    tokio::spawn(async move {
+        let mut missing = HashMap::new();
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            if !super::terminal::load().docker_sync {
+                missing.clear();
+                continue;
+            }
+            match reconcile(&sup, &mut missing, 1).await {
+                Ok(r) => {
+                    for n in &r.imported {
+                        super::log(&format!("docker sync: registered {n}"));
+                    }
+                    for n in &r.removed {
+                        super::log(&format!("docker sync: removed {n} (container is gone)"));
+                    }
+                }
+                Err(_) => missing.clear(), // engine unreachable: never drop anything
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -223,6 +305,28 @@ mod tests {
         assert!(c[0].running());
         assert_eq!(c[0].compose_file.as_deref(), Some("/a/dc.yml"));
         assert_eq!(c[1].ports, vec!["8080:80"]);
+    }
+
+    #[test]
+    fn finds_gone_discovered_services() {
+        let rows = vec![row("db", "running", json!({})), row("w", "running", json!({"com.docker.compose.project": "app"}))];
+        let c = candidates(&rows, &[]);
+        let mk = |name: &str, kind: &str, container: Option<&str>, project: Option<&str>, disc: bool| ServiceConfig {
+            name: name.into(),
+            kind: kind.into(),
+            container: container.map(Into::into),
+            project: project.map(Into::into),
+            discovered: disc.then_some(true),
+            ..Default::default()
+        };
+        let svcs = vec![
+            mk("db", "docker", Some("db"), None, true),
+            mk("old", "docker", Some("old"), None, true),
+            mk("hand", "docker", Some("hand"), None, false),
+            mk("app", "compose", None, Some("app"), true),
+            mk("dead", "compose", None, Some("dead"), true),
+        ];
+        assert_eq!(gone(&c, &svcs), vec!["old", "dead"]);
     }
 
     #[test]

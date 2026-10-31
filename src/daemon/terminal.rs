@@ -17,6 +17,8 @@ pub struct Settings {
     pub processes: ProcessThresholds,
     /// How 1Password references in services' env files are handled (see `envimport.rs`).
     pub onepassword: OnePassword,
+    /// Keep LStack's services in step with `docker ps -a` (see `docker_import::spawn_sync`).
+    pub docker_sync: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

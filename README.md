@@ -109,8 +109,9 @@ lstack add api -a -c ~/code/api -- npm run dev                         # script,
 lstack add db -t docker --image postgres:16 -p 5432:5432 -e POSTGRES_PASSWORD=dev -a
 lstack add stack -t compose --file ~/code/app/docker-compose.yml -a
 lstack docker ls                 # every container in Docker Desktop, and whether LStack manages it
-lstack docker import --all       # adopt them all (compose containers become one service per project)
-lstack docker import db cache    # or pick by container name / compose project
+lstack docker sync               # register every container now; drops ones no longer in `docker ps -a`
+lstack docker sync on            # ...and keep doing it automatically (new containers appear, destroyed ones go away)
+lstack docker import db cache    # or adopt just some, by container name / compose project
 lstack add web --health-url http://localhost:3000/health -- npm start
 lstack add app -a -- 'cd ~/code/app && PORT=3000 bun run dev'        # cd/env are split out automatically
 
@@ -472,6 +473,7 @@ autostart: true
 - When the daemon exits, it stops scripts but **leaves containers running**. On restart it re-adopts them, and it reaps orphaned script process groups if the daemon was killed.
 - Quitting the menu bar app leaves the daemon running by default. Turn on **Settings → Stop everything when I quit** to run `lstack daemon stop` on quit, which also ends forwards and the link to other Macs. Containers keep running.
 - At login, the daemon waits up to 10 minutes for Docker Desktop before it starts container services.
+- **Docker sync.** `lstack docker sync on` checks `docker ps -a` every 5 s: containers (and compose projects, one service each) that appear are registered, and services registered this way (`discovered: true`) are removed once their container is gone for two checks in a row. Services you added yourself are never removed. Nothing is dropped while the Docker engine is unreachable. While sync is on, a service you `rm` for a container that still exists is registered again, so use `lstack docker sync off` first.
 - **Machine load.** The top of the menu bar panel shows whole-Mac CPU and memory with ~15 minutes of sparkline history. Each is split into **LStack** (your services) and **Other** (every other app), so you can tell when the machine itself is overloaded. The same data is at `GET /api/system`. Machine CPU is a share of all cores, while per-service CPU is a share of one core, as in Activity Monitor.
 - **Crash loops.** Crashed scripts restart with exponential backoff (1 s → 30 s, up to `maxRestarts`). While a script waits to restart, the menu bar shows **RESTART IN Ns** with a red stop button. `lstack ls` and `lstack top` show `restarting Ns`. Stopping it cancels the pending restart, and stop waits for a start that's already in progress.
 - **Terminal app.** Dashboard, Attach and Shell open in the app chosen under **Settings → Terminal app** (or `lstack terminal <id>`): Terminal, iTerm, cmux or Ghostty. macOS asks once to allow LStack to control iTerm or Terminal.

@@ -168,6 +168,7 @@ async fn serve() -> i32 {
     tokio::spawn(async move {
         s2.boot().await;
         envimport::spawn_watcher(s2.clone());
+        docker_import::spawn_sync(s2.clone());
         secretshare::spawn_sync(s2.clone(), p2, r2);
         for e in s2.config_errors() {
             log(&format!("config error: {e}"));

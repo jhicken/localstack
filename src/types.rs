@@ -119,6 +119,10 @@ pub struct ServiceConfig {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autostart: Option<bool>,
+    /// Registered from the Docker engine (`lstack docker import|sync`); sync removes it again once
+    /// its container / compose project no longer exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovered: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
