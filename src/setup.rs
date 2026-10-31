@@ -271,6 +271,8 @@ pub fn status_json() -> serde_json::Value {
             "pid": info.as_ref().filter(|_| alive).map(|i| i.pid),
             "port": info.as_ref().filter(|_| alive).map(|i| i.port),
             "version": info.as_ref().filter(|_| alive).map(|i| i.version.clone()),
+            "protocol": info.as_ref().filter(|_| alive).map(|i| i.protocol),
+            "upgradable": info.as_ref().filter(|_| alive).is_some_and(daemon_upgradable),
             "bin": info.as_ref().filter(|_| alive).and_then(|i| i.bin.clone()),
             "stale": stale.is_some(),
             "staleReason": stale,
@@ -278,9 +280,15 @@ pub fn status_json() -> serde_json::Value {
     })
 }
 
-/// Why the running daemon is out of date, if it is: a different version, or its binary was replaced
-/// after it started (e.g. the app was updated in place, keeping the same path).
+/// Why the running daemon can't be used by this build, if it can't: it predates (or is below) the
+/// protocol this app needs. A different app version or a replaced binary is NOT a reason: the daemon
+/// keeps running (and so do your services) until you choose to restart it. Set
+/// `LSTACK_STRICT_DAEMON=1` (dev builds) to also require the same version and an unchanged binary.
 pub fn daemon_stale(i: &crate::types::DaemonInfo) -> Option<String> {
+    if i.protocol < paths::MIN_DAEMON_PROTOCOL {
+        return Some(format!("the background service (v{}, protocol {}) is too old for this version (needs protocol {})", i.version, i.protocol, paths::MIN_DAEMON_PROTOCOL));
+    }
+    std::env::var_os("LSTACK_STRICT_DAEMON")?;
     if i.version != paths::VERSION {
         return Some(format!("the background service is running v{} but this is v{}", i.version, paths::VERSION));
     }
@@ -289,6 +297,11 @@ pub fn daemon_stale(i: &crate::types::DaemonInfo) -> Option<String> {
     let modified = std::fs::metadata(&bin).and_then(|m| m.modified()).ok()?;
     let modified_ms = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
     (modified_ms > i.started_at + 2_000).then(|| "LStack was updated after the background service started".to_string())
+}
+
+/// The daemon works but a newer protocol exists (new features need a restart; nothing is forced).
+pub fn daemon_upgradable(i: &crate::types::DaemonInfo) -> bool {
+    i.protocol < paths::PROTOCOL
 }
 
 fn print_notes(notes: &[String]) {
@@ -351,7 +364,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             println!(
                 "  daemon        {}",
                 if s["daemon"]["running"].as_bool() == Some(true) {
-                    c::green(&format!("running (pid {}, port {})", s["daemon"]["pid"], s["daemon"]["port"]))
+                    let up = if s["daemon"]["upgradable"].as_bool() == Some(true) { c::dim("  — newer features available after `lstack daemon restart`") } else { String::new() };
+                    format!("{}{up}", c::green(&format!("running v{} (pid {}, port {})", s["daemon"]["version"].as_str().unwrap_or("?"), s["daemon"]["pid"], s["daemon"]["port"])))
                 } else {
                     c::gray("not running")
                 }
@@ -420,5 +434,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 None => Ok(()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DaemonInfo;
+
+    fn info(version: &str, protocol: u32) -> DaemonInfo {
+        DaemonInfo { pid: 1, port: 1, token: String::new(), version: version.into(), protocol, started_at: 0, bin: Some("/nonexistent".into()), running: Some(true) }
+    }
+
+    #[test]
+    fn daemon_is_stale_only_below_min_protocol() {
+        if std::env::var_os("LSTACK_STRICT_DAEMON").is_some() {
+            return;
+        }
+        assert!(daemon_stale(&info("0.9.0", 0)).is_some());
+        assert!(daemon_stale(&info("0.1.0", paths::MIN_DAEMON_PROTOCOL)).is_none());
+        assert!(!daemon_upgradable(&info("0.1.0", paths::PROTOCOL)));
     }
 }

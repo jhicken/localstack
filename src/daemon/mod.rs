@@ -128,6 +128,7 @@ async fn serve() -> i32 {
         port,
         token,
         version: VERSION.into(),
+        protocol: paths::PROTOCOL,
         started_at: now_ms(),
         bin: Some(paths::self_exe().to_string_lossy().into_owned()),
         running: Some(true),

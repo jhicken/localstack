@@ -2,6 +2,15 @@ use std::path::PathBuf;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Capability level of the daemon's HTTP API, versioned separately from the app (`VERSION`) so a new
+/// app release can keep using an already-running daemon (no restart of your services). Bump it
+/// whenever the daemon gains something newer clients can use.
+pub const PROTOCOL: u32 = 1;
+/// Oldest daemon protocol this build of the app/CLI works with. Raise it only when a change makes
+/// older daemons unusable (removed/changed endpoints or semantics); that is what forces a restart.
+/// Additive endpoints must not raise it: clients report "the background service is older" instead.
+pub const MIN_DAEMON_PROTOCOL: u32 = 1;
+
 pub fn user_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }

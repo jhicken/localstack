@@ -106,7 +106,7 @@ fn loopback_host(h: Option<&str>) -> bool {
 
 pub fn router(st: AppState) -> Router {
     Router::new()
-        .route("/api/health", get(|| async { Json(json!({ "ok": true, "version": VERSION, "pid": std::process::id() })) }))
+        .route("/api/health", get(|| async { Json(json!({ "ok": true, "version": VERSION, "protocol": paths::PROTOCOL, "pid": std::process::id() })) }))
         .route("/api/services", get(list).post(create))
         .route("/api/services/:name/exec", get(super::exec::handler))
         .route("/api/services/:name", get(get_one).patch(patch).delete(destroy))

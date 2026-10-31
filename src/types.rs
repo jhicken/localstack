@@ -362,6 +362,9 @@ pub struct DaemonInfo {
     pub port: u16,
     pub token: String,
     pub version: String,
+    /// API capability level (`paths::PROTOCOL`); 0 for daemons that predate it.
+    #[serde(default)]
+    pub protocol: u32,
     #[serde(default)]
     pub started_at: i64,
     /// Absolute path of the lstack binary running the daemon.
