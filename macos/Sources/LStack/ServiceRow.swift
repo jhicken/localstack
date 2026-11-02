@@ -36,6 +36,7 @@ struct ServiceRow: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(service.isRestarting ? Color.orange.opacity(0.5) : service.isFailed ? Color.red.opacity(0.35) : .clear, lineWidth: 1)
         )
+        .padding(.leading, service.isDiscovered ? 18 : 0)
         .onHover { hover = $0 }
         .onAppear {
             if ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT_REMOVE"] == service.name { confirmRemove = true }
@@ -105,7 +106,8 @@ struct ServiceRow: View {
 
     private func titleLine(compact: Bool) -> some View {
         HStack(spacing: 5) {
-            Text(service.name).font(.system(size: 13, weight: .semibold)).lineLimit(1).layoutPriority(1)
+            Text(service.shortName).font(.system(size: 13, weight: .semibold)).lineLimit(1).layoutPriority(1)
+                .help(service.isDiscovered ? "\(service.name) — container on \(service.parent ?? "Docker")" : service.name)
             if service.autostart {
                 Image(systemName: "power.circle.fill")
                     .font(.system(size: 10))
@@ -208,34 +210,36 @@ struct ServiceRow: View {
                     store.openTerminal(service.name)
                 }
                 .disabled(!service.isRunning)
-                Menu {
-                    Button("Edit…") { openEditor(.general) }
-                    Button("Environment Variables…") { openEditor(.environment) }
-                    if !(service.config.envFiles ?? []).isEmpty {
-                        if service.isRunning, !(service.envStale ?? []).isEmpty {
-                            Button("Restart to Apply Env Changes") { store.perform(service, "restart") }
+                if !service.isDiscovered {
+                    Menu {
+                        Button("Edit…") { openEditor(.general) }
+                        Button("Environment Variables…") { openEditor(.environment) }
+                        if !(service.config.envFiles ?? []).isEmpty {
+                            if service.isRunning, !(service.envStale ?? []).isEmpty {
+                                Button("Restart to Apply Env Changes") { store.perform(service, "restart") }
+                            }
+                            Button("Review 1Password References…") {
+                                openWindow(id: "op-review", value: service.name)
+                                bringToFront()
+                            }
                         }
-                        Button("Review 1Password References…") {
-                            openWindow(id: "op-review", value: service.name)
-                            bringToFront()
+                        Button("Open YAML Definition") { store.revealConfig(service.name) }
+                        Divider()
+                        Button("Remove…", role: .destructive) {
+                            // The confirmation lives in the expanded detail, so open the card if it's collapsed.
+                            confirmRemove = true
+                            if !expanded {
+                                withAnimation(.snappy(duration: 0.25)) { store.expanded = service.id }
+                                Task { await store.loadHistory(service) }
+                            }
                         }
+                    } label: {
+                        Image(systemName: "ellipsis").frame(width: 22, height: 22)
                     }
-                    Button("Open YAML Definition") { store.revealConfig(service.name) }
-                    Divider()
-                    Button("Remove…", role: .destructive) {
-                        // The confirmation lives in the expanded detail, so open the card if it's collapsed.
-                        confirmRemove = true
-                        if !expanded {
-                            withAnimation(.snappy(duration: 0.25)) { store.expanded = service.id }
-                            Task { await store.loadHistory(service) }
-                        }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis").frame(width: 22, height: 22)
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
             }
         }
     }

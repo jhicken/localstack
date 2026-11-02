@@ -57,6 +57,8 @@ struct ServiceConfig: Codable, Hashable {
     var volumes: [String]?
     var composeFile: String?
     var project: String?
+    /// Script services: list the Docker engine's containers under this service (nil = automatic).
+    var watchContainers: Bool?
     var healthcheck: HealthCheck?
     var secrets: SecretRefs?
     var heartbeat: HeartbeatConfig?
@@ -496,6 +498,24 @@ struct ServiceState: Codable, Identifiable, Hashable {
     var envFileKeys: [String]? = nil
     /// A Touch ID approval its secrets are waiting on.
     var approval: Approval? = nil
+    /// The Docker engine service this container was discovered under (not saved; it follows the container).
+    var parent: String? = nil
+    /// This service is the Docker engine: its containers are listed under it.
+    var containerHost: Bool? = nil
+
+    var isDiscovered: Bool { parent != nil }
+    /// "docker.web" under "docker" reads as "web".
+    var shortName: String {
+        guard let p = parent, name.hasPrefix(p + ".") else { return name }
+        return String(name.dropFirst(p.count + 1))
+    }
+    /// List order: by name, with discovered containers right after their engine.
+    static func inTreeOrder(_ a: ServiceState, _ b: ServiceState) -> Bool {
+        let (ra, rb) = (a.parent ?? a.name, b.parent ?? b.name)
+        if ra != rb { return ra < rb }
+        if a.isDiscovered != b.isDiscovered { return !a.isDiscovered }
+        return a.name < b.name
+    }
 
     /// Addresses that can be opened from here: a paired Mac's services only through their encrypted forwards.
     var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "untunneled" } }
@@ -526,7 +546,7 @@ struct ServiceState: Codable, Identifiable, Hashable {
     var summary: String {
         switch type {
         case "process": return config.command ?? ""
-        case "docker": return config.image ?? config.container ?? ""
+        case "docker": return config.image ?? (isDiscovered ? description : nil) ?? config.container ?? ""
         case "compose": return (config.composeFile as NSString?)?.abbreviatingWithTildeInPath ?? ""
         default: return ""
         }

@@ -191,6 +191,17 @@ mod tests {
     }
 
     #[test]
+    fn docker_engine_services_list_containers() {
+        let engine = |y: &str| parse_yaml(y).unwrap().watches_containers();
+        assert!(engine("name: docker\ncommand: open -W /Applications/Docker.app\n"));
+        assert!(engine("name: engine\ncommand: \"'/Applications/OrbStack.app/Contents/MacOS/OrbStack'\"\n"));
+        assert!(!engine("name: api\ncommand: npm run dev\n"));
+        assert!(!engine("name: docker\ncommand: x\nwatchContainers: false\n"));
+        assert!(engine("name: colima\ncommand: colima start -f\nwatchContainers: true\n"));
+        assert!(!engine("name: docker\ntype: docker\ncontainer: c\n"));
+    }
+
+    #[test]
     fn lenient_scalars() {
         let c = parse_yaml("name: a\ncommand: x\nenv: {PORT: 3000, DEBUG: true}\nports: [8080:80]\n").unwrap();
         assert_eq!(c.env.unwrap()["PORT"], "3000");

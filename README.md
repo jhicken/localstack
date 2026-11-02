@@ -460,6 +460,13 @@ autostart: true
 ```
 
 ```yaml
+name: docker             # the Docker engine itself: Docker Desktop, OrbStack…
+command: open -W /Applications/Docker.app
+watchContainers: true    # optional: on automatically for Docker Desktop and OrbStack; false turns it off
+autostart: true
+```
+
+```yaml
 name: stack
 type: compose
 composeFile: ~/code/app/docker-compose.yml
@@ -474,6 +481,7 @@ autostart: true
 - Quitting the menu bar app leaves the daemon running by default. Turn on **Settings → Stop everything when I quit** to run `lstack daemon stop` on quit, which also ends forwards and the link to other Macs. Containers keep running.
 - At login, the daemon waits up to 10 minutes for Docker Desktop before it starts container services.
 - **Docker sync.** `lstack docker sync on` checks `docker ps -a` every 5 s: containers (and compose projects, one service each) that appear are registered, and services registered this way (`discovered: true`) are removed once their container is gone for two checks in a row. Services you added yourself are never removed. Nothing is dropped while the Docker engine is unreachable. While sync is on, a service you `rm` for a container that still exists is registered again, so use `lstack docker sync off` first.
+- **Docker engine and its containers.** Add Docker Desktop or OrbStack as a script (drop the app on Add Service, or use the Script or App type). Every running container is then listed as a child under it, indented, and works like a `type: docker` service: start, stop, restart, logs, CPU and memory, URLs, `lstack exec`. LStack notices containers as they start, keeps them listed (stopped) when they stop, and drops them when they are removed. Containers another service already manages aren't listed twice. They aren't saved to disk or editable, and are named `<engine>.<container>` (for example `docker.postgres`). `lstack start|stop|restart all` leaves them alone. The service is the engine when its name or command mentions Docker or OrbStack; set `watchContainers: true` (or choose Show under Docker containers in the editor) for others, such as Colima.
 - **Machine load.** The top of the menu bar panel shows whole-Mac CPU and memory with ~15 minutes of sparkline history. Each is split into **LStack** (your services) and **Other** (every other app), so you can tell when the machine itself is overloaded. The same data is at `GET /api/system`. Machine CPU is a share of all cores, while per-service CPU is a share of one core, as in Activity Monitor.
 - **Crash loops.** Crashed scripts restart with exponential backoff (1 s → 30 s, up to `maxRestarts`). While a script waits to restart, the menu bar shows **RESTART IN Ns** with a red stop button. `lstack ls` and `lstack top` show `restarting Ns`. Stopping it cancels the pending restart, and stop waits for a start that's already in progress.
 - **Terminal app.** Dashboard, Attach and Shell open in the app chosen under **Settings → Terminal app** (or `lstack terminal <id>`): Terminal, iTerm, cmux or Ghostty. macOS asks once to allow LStack to control iTerm or Terminal.

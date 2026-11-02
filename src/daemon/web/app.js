@@ -68,7 +68,11 @@
   const getSvc = (k) => { if (!k) return null; const { m, n } = parseKey(k); return svcMap(m)?.get(n) || null; };
   const selSvc = () => getSvc(S.selected);
   const svcPath = (s) => (s._m ? `/api/machines/${enc(s._m)}/services/${enc(s.name)}` : `/api/services/${enc(s.name)}`);
-  const sortedSvcs = (map) => [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+  // By name, with containers discovered under the Docker engine directly after it.
+  const sortedSvcs = (map) => {
+    const root = (s) => s.parent || s.name;
+    return [...map.values()].sort((a, b) => root(a).localeCompare(root(b)) || !!a.parent - !!b.parent || a.name.localeCompare(b.name));
+  };
   const sortedPeers = () => [...S.machines.values()].sort((a, b) => a.info.name.localeCompare(b.info.name));
   // A machine overview is selected with a 3-element key; services use 2 (see keyOf).
   const machKey = (m) => JSON.stringify([m || "", "", "machine"]);
@@ -423,7 +427,7 @@
     const links = s.urls?.length ? `<span class="links">${urlChips(s, 3)}</span>` : "";
     const op = s.secretsPending ? ` <span class="badge op" title="Env file secrets to review on its Mac">secrets ${esc(s.secretsPending.count || "!")}</span>` : "";
     const stale = s.envStale?.length && s.status === "running" ? ` <span class="badge op" title="Env file changed since it started: ${esc(s.envStale.join(", "))} (restart to apply)">env changed</span>` : "";
-    return `<div class="svc ${k === S.selected ? "sel" : ""}" data-key="${esc(k)}">
+    return `<div class="svc ${k === S.selected ? "sel" : ""}${s.parent ? " child" : ""}" data-key="${esc(k)}">
         <span class="dot ${esc(looping(s) ? "starting" : s.status)}"></span>
         <span class="name">${esc(s.name)}</span>
         <span class="nums"><b>${m ? pct(m.cpu) : "—"}</b> · ${m ? bytes(m.mem) : "—"}</span>

@@ -937,3 +937,134 @@ fn machines_pair_and_proxy() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+
+/// A stand-in Docker engine on a unix socket: `(id, name, running)` per container.
+struct FakeEngine {
+    sock: PathBuf,
+    containers: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
+}
+
+impl FakeEngine {
+    fn start() -> FakeEngine {
+        use std::io::{Read, Write};
+        let sock = PathBuf::from(format!("/tmp/lstack-fd-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let containers: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>> = Default::default();
+        let state = containers.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let mut first = req.lines().next().unwrap_or("").split_whitespace();
+                let (method, path) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+                let mut list = state.lock().unwrap();
+                let find = |list: &Vec<(String, String, bool)>, key: &str| list.iter().position(|c| c.0 == key || c.1 == key);
+                let (status, body) = if path.starts_with("/containers/json") {
+                    let rows: Vec<Value> = list.iter().map(|c| json!({ "Id": c.0, "Names": [format!("/{}", c.1)], "Image": "img:1", "State": if c.2 { "running" } else { "exited" } })).collect();
+                    (200, Value::Array(rows).to_string())
+                } else if let Some(rest) = path.strip_prefix("/containers/") {
+                    let (key, action) = rest.split_once('/').unwrap_or((rest, ""));
+                    let action = action.split('?').next().unwrap_or("");
+                    match (find(&list, key), method, action) {
+                        (None, ..) => (404, json!({ "message": "no such container" }).to_string()),
+                        (Some(i), "GET", "json") => {
+                            let c = &list[i];
+                            let state = json!({ "Status": if c.2 { "running" } else { "exited" }, "Pid": if c.2 { 4242 } else { 0 }, "StartedAt": "2026-01-01T00:00:00Z", "ExitCode": 0 });
+                            (200, json!({ "Id": c.0, "State": state, "NetworkSettings": { "Ports": { "80/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "8081" }] } } }).to_string())
+                        }
+                        (Some(i), "POST", "start") => {
+                            list[i].2 = true;
+                            (204, String::new())
+                        }
+                        (Some(i), "POST", "stop") => {
+                            list[i].2 = false;
+                            (204, String::new())
+                        }
+                        _ => (200, "{}".into()),
+                    }
+                } else {
+                    (200, "OK".into())
+                };
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        FakeEngine { sock, containers }
+    }
+
+    fn set(&self, id: &str, name: &str, running: bool) {
+        let mut l = self.containers.lock().unwrap();
+        match l.iter_mut().find(|c| c.0 == id) {
+            Some(c) => c.2 = running,
+            None => l.push((id.into(), name.into(), running)),
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        self.containers.lock().unwrap().retain(|c| c.0 != id);
+    }
+}
+
+impl Drop for FakeEngine {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+#[test]
+fn docker_engine_lists_its_containers_as_children() {
+    let home = std::env::temp_dir().join(format!("lstack-it-docker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("services")).unwrap();
+    let engine = FakeEngine::start();
+    engine.set("aaa111", "web", true);
+    engine.set("bbb222", "job", false);
+    // A saved docker service already manages this container, so it isn't listed twice.
+    engine.set("ccc333", "pinned", true);
+    std::fs::write(home.join("services/docker.yaml"), "name: docker\ncommand: sleep 300\n").unwrap();
+    std::fs::write(home.join("services/aaa.yaml"), "name: aaa\ncommand: echo hi\n").unwrap();
+    std::fs::write(home.join("services/pin.yaml"), "name: pin\ntype: docker\ncontainer: pinned\n").unwrap();
+    let d = Daemon::start_with(&home, &[("DOCKER_HOST", format!("unix://{}", engine.sock.display()))]);
+
+    let names = |d: &Daemon| -> Vec<String> { d.get("/api/services").unwrap()["services"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect() };
+
+    // Running containers are picked up under the engine service; exited and already-managed ones aren't.
+    wait_until("web discovered", 15, || names(&d).contains(&"docker.web".to_string()));
+    let web = d.svc("docker.web");
+    assert_eq!(web["parent"], "docker");
+    assert_eq!(web["type"], "docker");
+    assert_eq!(web["status"], "running");
+    wait_until("web url", 15, || d.svc("docker.web")["urls"][0]["url"] == "http://localhost:8081");
+    assert_eq!(d.svc("docker")["containerHost"], true);
+    assert_eq!(d.svc("aaa").get("parent"), None);
+    assert_eq!(names(&d), ["aaa", "docker", "docker.web", "pin"]);
+
+    // Containers that start later show up; ones that stop stay listed as stopped; removed ones go.
+    engine.set("ddd444", "db", true);
+    wait_until("db discovered", 15, || names(&d).contains(&"docker.db".to_string()));
+    engine.set("aaa111", "web", false);
+    wait_until("web stopped", 15, || d.svc("docker.web")["status"] == "stopped");
+    engine.set("bbb222", "job", true);
+    wait_until("job discovered", 15, || names(&d).contains(&"docker.job".to_string()));
+    engine.remove("aaa111");
+    wait_until("web removed", 15, || !names(&d).contains(&"docker.web".to_string()));
+
+    // Children are controlled like docker services, but aren't saved or editable.
+    d.post("/api/services/docker.db/stop", None).unwrap();
+    assert_eq!(d.svc("docker.db")["status"], "stopped");
+    assert!(!engine.containers.lock().unwrap().iter().find(|c| c.1 == "db").unwrap().2);
+    d.post("/api/services/docker.db/start", None).unwrap();
+    wait_until("db running again", 15, || d.svc("docker.db")["status"] == "running");
+    assert_eq!(d.call("PATCH", "/api/services/docker.db", Some(json!({ "autostart": true }))).unwrap_err().0, 400);
+    assert_eq!(d.call("DELETE", "/api/services/docker.db", None).unwrap_err().0, 400);
+    assert!(!home.join("services/docker.db.yaml").exists());
+    d.post("/api/reload", None).unwrap();
+    assert!(names(&d).contains(&"docker.db".to_string()));
+
+    // Removing the engine service removes its children.
+    d.call("DELETE", "/api/services/docker", None).unwrap();
+    wait_until("children gone", 15, || !names(&d).iter().any(|n| n.starts_with("docker.")));
+    assert!(d.svc("pin").get("parent").is_none());
+}

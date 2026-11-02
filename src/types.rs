@@ -142,6 +142,10 @@ pub struct ServiceConfig {
     pub detect_urls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<Heartbeat>,
+    /// Process services only: list every container on the Docker engine as a child of this service.
+    /// Unset = on when this looks like the Docker engine (Docker Desktop, OrbStack).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch_containers: Option<bool>,
     // process
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -200,6 +204,16 @@ impl ServiceConfig {
     }
     pub fn autostart(&self) -> bool {
         self.autostart.unwrap_or(false)
+    }
+    /// Whether this service is the Docker engine, whose containers show up under it.
+    pub fn watches_containers(&self) -> bool {
+        self.kind == "process" && self.watch_containers.unwrap_or_else(|| self.looks_like_docker_engine())
+    }
+    fn looks_like_docker_engine(&self) -> bool {
+        let name = self.name.to_lowercase();
+        let command = self.command.as_deref().unwrap_or("").to_lowercase();
+        ["docker", "docker-desktop", "docker_desktop", "dockerdesktop", "orbstack"].contains(&name.as_str())
+            || ["docker.app", "docker desktop", "orbstack"].iter().any(|k| command.contains(k))
     }
     /// (env var, secret name) pairs.
     pub fn secret_refs(&self) -> Vec<(String, String)> {
@@ -342,6 +356,13 @@ pub struct ServiceState {
     /// A Touch ID approval this service is waiting on (its secrets are withheld until then).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub approval: Option<serde_json::Value>,
+    /// The service this one was discovered under (a container on the Docker engine). Such services
+    /// aren't saved to disk: they come and go with the containers.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent: Option<String>,
+    /// This service is the Docker engine: its containers are listed as its children.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub container_host: bool,
     pub config: ServiceConfig,
 }
 
@@ -375,6 +396,11 @@ pub struct DaemonInfo {
 }
 
 impl ServiceState {
+    /// Display order: by name, with discovered children directly after their parent.
+    pub fn tree_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let root = |s: &Self| s.parent.clone().unwrap_or_else(|| s.name.clone());
+        root(self).cmp(&root(other)).then(self.parent.is_some().cmp(&other.parent.is_some())).then_with(|| self.name.cmp(&other.name))
+    }
     /// Status for display: "restarting 12s" while a crash-loop restart is pending.
     pub fn status_label(&self) -> String {
         match self.restart_at {

@@ -66,6 +66,12 @@ impl LogStore {
         LogStore { file, inner: Mutex::new(Inner { lines, fd: None, size: 0, gen: 1, rotated }), tx }
     }
 
+    /// Delete the log file (and its rotated copy) of a service that no longer exists.
+    pub fn delete_files(&self) {
+        let _ = std::fs::remove_file(&self.file);
+        let _ = std::fs::remove_file(rotated_path(&self.file));
+    }
+
     pub fn push(&self, stream: &str, line: String) {
         // Secrets never reach the ring buffer, the log file or any stream.
         let line = crate::scrub::scrub_string(line);

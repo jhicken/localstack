@@ -72,9 +72,9 @@ fn skey(s: &ServiceState) -> String {
     }
 }
 
-/// This machine first, then peers by name; services by name within a machine.
+/// This machine first, then peers by name; services by name within a machine, containers under their engine.
 fn svc_order(a: &ServiceState, b: &ServiceState) -> std::cmp::Ordering {
-    (a.machine.as_deref(), a.name.as_str()).cmp(&(b.machine.as_deref(), b.name.as_str()))
+    a.machine.cmp(&b.machine).then_with(|| a.tree_cmp(b))
 }
 
 /// Rows for the list. Machine headers only appear once at least one peer is known.
@@ -812,7 +812,7 @@ fn draw_list(fr: &mut Frame, ui: &Ui, area: Rect) {
             Span::raw(" "),
             Span::styled(if s.autostart { "⇡" } else { " " }, Style::new().fg(Color::Cyan)),
             Span::raw(" "),
-            Span::raw(f::pad(&s.name, name_w)),
+            Span::raw(f::pad(&if s.parent.is_some() { format!("  {}", s.name) } else { s.name.clone() }, name_w)),
             Span::raw(format!(" {cpu:>6} ")),
             if run { Span::raw(f::pad(&mem, 8)) } else { dim(f::pad(&mem, 8)) },
         ]);
@@ -1033,6 +1033,14 @@ mod tests {
                 Row::Service(3),
             ]
         );
+    }
+
+    #[test]
+    fn containers_follow_their_engine() {
+        let child = |n: &str| ServiceState { parent: Some("docker".into()), ..svc(n, None) };
+        let mut s = vec![svc("docker-x", None), child("docker.web"), svc("docker", None), child("docker.db"), svc("a", None)];
+        s.sort_by(svc_order);
+        assert_eq!(s.iter().map(skey).collect::<Vec<_>>(), ["a", "docker", "docker.db", "docker.web", "docker-x"]);
     }
 
     #[test]

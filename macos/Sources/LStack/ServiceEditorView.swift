@@ -191,6 +191,8 @@ struct ServiceEditorView: View {
     @State private var ports = ""
     @State private var composeFile = ""
     @State private var project = ""
+    /// Script services: "auto" | "show" | "hide" the Docker engine's containers under this service.
+    @State private var containers = "auto"
     @State private var sources = "~/.zshrc"
     @State private var defaultSource = ["~/.zshrc"]
     @State private var suggestion: CommandSplit?
@@ -327,6 +329,7 @@ struct ServiceEditorView: View {
         ports = (c.ports ?? []).joined(separator: ", ")
         composeFile = c.composeFile ?? ""
         project = c.project ?? ""
+        containers = c.watchContainers.map { $0 ? "show" : "hide" } ?? "auto"
         if let s = c.source { sources = s.joined(separator: ", ") }
         restart = c.restart ?? "on-failure"
         autostart = c.autostart ?? false
@@ -380,7 +383,7 @@ struct ServiceEditorView: View {
     @ViewBuilder private var generalSections: some View {
         Section {
             Picker("Type", selection: $type) {
-                Label("Script", systemImage: "terminal.fill").tag("process")
+                Label("Script or App", systemImage: "terminal.fill").tag("process")
                 Label("Docker", systemImage: "shippingbox.fill").tag("docker")
                 Label("Compose", systemImage: "square.stack.3d.up.fill").tag("compose")
             }
@@ -397,6 +400,12 @@ struct ServiceEditorView: View {
                     .font(.system(.body, design: .monospaced))
                 if let s = suggestion, s.changed { splitHint(s) }
                 pathField("Working directory", $cwd, directories: true)
+                Picker("Docker containers", selection: $containers) {
+                    Text("Automatic").tag("auto")
+                    Text("Show").tag("show")
+                    Text("Hide").tag("hide")
+                }
+                .help("List the containers on the Docker engine under this service, and keep them up to date as they start and stop. Automatic does this for Docker Desktop and OrbStack.")
             case "docker":
                 TextField("Image", text: $image, prompt: Text("postgres:16"))
                 TextField("Existing container", text: $container, prompt: Text("optional — manage an existing container instead"))
@@ -1072,6 +1081,7 @@ struct ServiceEditorView: View {
         case "process":
             cfg.command = command
             cfg.cwd = cwd.isEmpty ? nil : cwd
+            cfg.watchContainers = containers == "auto" ? nil : containers == "show"
             let files = list(sources) ?? []
             cfg.source = files == defaultSource ? nil : files
         case "docker":

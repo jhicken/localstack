@@ -311,6 +311,9 @@ fn cmd_list(args: &[String]) -> R {
             m["error"].as_str().map(String::from),
         ));
     }
+    for g in &mut groups {
+        g.1.sort_by(ServiceState::tree_cmp);
+    }
     if let Some(want) = a.get("machine") {
         groups.retain(|g| g.0 == want);
         if groups.is_empty() {
@@ -351,7 +354,7 @@ fn print_services(services: &[ServiceState], local: bool) {
             .iter()
             .map(|s| {
                 let mut row = vec![
-                    format!("{} {}", c::status_dot(&s.status), c::bold(&s.name)),
+                    format!("{}{} {}", if s.parent.is_some() { "  " } else { "" }, c::status_dot(&s.status), c::bold(&s.name)),
                     c::dim(&s.kind),
                     if s.restart_at.is_some() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) },
                     c::health_label(&s.health),
@@ -767,7 +770,8 @@ fn targets(cl: &Client, names: &[String]) -> Result<Vec<String>, String> {
         return Err("missing service name (or `all`)".into());
     }
     if names.iter().any(|n| n == "all") {
-        return Ok(cl.list()?.services.into_iter().map(|s| s.name).collect());
+        // Containers discovered under the Docker engine are left alone: `all` is the services you defined.
+        return Ok(cl.list()?.services.into_iter().filter(|s| s.parent.is_none()).map(|s| s.name).collect());
     }
     Ok(names.to_vec())
 }
