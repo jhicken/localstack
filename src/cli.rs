@@ -67,6 +67,7 @@ fn help() -> String {
   -e, --env KEY=VALUE    environment variable (repeatable)
   -a, --autostart        start at login / daemon boot
       --start-delay <s>  wait this many seconds before that automatic start
+      --wait-for-docker  don't start until the Docker engine is up (scripts)
   -r, --restart always|on-failure|never   (default: on-failure)
   -d, --description <text>
       --image <image>    docker: image to run      --container <name>  docker: existing container
@@ -418,6 +419,7 @@ fn cmd_show(args: &[String]) -> R {
         ("uptime", uptime(&s)),
         ("restarts", s.restarts.to_string()),
         ("autostart", if s.autostart { "yes" } else { "no" }.into()),
+        ("wait for docker", if s.config.wait_for_docker == Some(true) { "yes" } else { "no" }.into()),
         ("start delay", match s.config.start_delay { Some(d) if d > 0 => format!("{d}s"), _ => "off".into() }),
         ("cpu", c::pct(met.map(|m| m.cpu))),
         ("memory", c::bytes(met.map(|m| m.mem))),
@@ -483,6 +485,7 @@ fn cmd_add(args: &[String]) -> R {
             ("env", "e", true),
             ("autostart", "a", false),
             ("start-delay", "", true),
+            ("wait-for-docker", "", false),
             ("restart", "r", true),
             ("description", "d", true),
             ("image", "", true),
@@ -522,6 +525,7 @@ fn cmd_add(args: &[String]) -> R {
                 Some(d) => Some(d.parse().map_err(|_| format!("--start-delay must be a whole number of seconds, got {d:?}"))?),
                 None => None,
             },
+            wait_for_docker: a.has("wait-for-docker").then_some(true),
             restart: a.get("restart").map(String::from),
             command: if cmd.is_empty() { None } else { Some(cmdline::join_argv(cmd)) },
             cwd: match a.get("cwd") {

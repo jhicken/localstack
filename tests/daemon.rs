@@ -961,9 +961,18 @@ struct FakeEngine {
 }
 
 impl FakeEngine {
+    /// A socket path no other fake engine in this test run uses (so it can be handed to a daemon first).
+    fn unique_sock() -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        PathBuf::from(format!("/tmp/lstack-fd-{}-{}.sock", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+    }
+
     fn start() -> FakeEngine {
+        Self::start_at(Self::unique_sock())
+    }
+
+    fn start_at(sock: PathBuf) -> FakeEngine {
         use std::io::{Read, Write};
-        let sock = PathBuf::from(format!("/tmp/lstack-fd-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let containers: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>> = Default::default();
@@ -1125,4 +1134,31 @@ fn start_delay_holds_back_automatic_starts_only() {
     // Bounds are checked.
     let bad = d.call("PATCH", "/api/services/now", Some(json!({ "startDelay": 100000 }))).unwrap_err();
     assert_eq!(bad.0, 400);
+}
+
+#[test]
+fn wait_for_docker_holds_a_script_until_the_engine_answers() {
+    let home = std::env::temp_dir().join(format!("lstack-it-waitdocker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("services")).unwrap();
+    let svc = |name: &str, extra: &str| std::fs::write(home.join(format!("services/{name}.yaml")), format!("name: {name}\ncommand: sleep 60\nautostart: true\nrestart: never\n{extra}")).unwrap();
+    svc("plain", "");
+    svc("needs", "waitForDocker: true\n");
+    svc("cancelled", "waitForDocker: true\n");
+    let sock = FakeEngine::unique_sock();
+    let d = Daemon::start_with(&home, &[("DOCKER_HOST", format!("unix://{}", sock.display()))]);
+
+    // Without a Docker engine, only the script that needs it waits.
+    wait_until("plain started", 10, || d.svc("plain")["status"] == "running");
+    wait_until("waiting for docker", 10, || d.logs("needs").contains("waiting for the Docker engine"));
+    assert_eq!(d.svc("needs")["status"], "starting");
+
+    // Stop cancels the wait; it stays stopped when the engine shows up.
+    assert_eq!(d.post("/api/services/cancelled/stop", None).unwrap()["status"], "stopped");
+
+    let engine = FakeEngine::start_at(sock);
+    wait_until("started once docker is up", 20, || d.svc("needs")["status"] == "running");
+    assert!(d.logs("needs").contains("Docker engine is up"));
+    assert_eq!(d.svc("cancelled")["status"], "stopped");
+    drop(engine);
 }

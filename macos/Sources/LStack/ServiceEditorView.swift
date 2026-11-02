@@ -196,6 +196,7 @@ struct ServiceEditorView: View {
     @State private var suggestion: CommandSplit?
     @State private var restart = "on-failure"
     @State private var autostart = true
+    @State private var waitForDocker = false
     @State private var startDelayOn = false
     @State private var startDelay = 10
     @State private var startNow = true
@@ -333,6 +334,7 @@ struct ServiceEditorView: View {
         restart = c.restart ?? "on-failure"
         autostart = c.autostart ?? false
         if let d = c.startDelay, d > 0 { startDelayOn = true; startDelay = d }
+        waitForDocker = c.waitForDocker ?? false
         switch c.healthcheck?.type {
         case nil: healthKind = "none"
         case "http"?: healthKind = "http"; healthURL = c.healthcheck?.url ?? ""
@@ -443,6 +445,10 @@ struct ServiceEditorView: View {
                         Text("seconds").foregroundStyle(.secondary)
                     }
                 }
+            }
+            if type == "process" {
+                Toggle("Wait for Docker", isOn: $waitForDocker)
+                    .help("Don't start until the Docker engine is up")
             }
             Picker("Restart", selection: $restart) {
                 Text("On failure").tag("on-failure")
@@ -1081,6 +1087,7 @@ struct ServiceEditorView: View {
         cfg.description = description.isEmpty ? nil : description
         cfg.autostart = autostart
         cfg.startDelay = startDelayOn && startDelay > 0 ? min(startDelay, 86_400) : nil
+        cfg.waitForDocker = type == "process" && waitForDocker ? true : nil
         cfg.restart = restart
         switch type {
         case "process":

@@ -131,6 +131,9 @@ pub struct ServiceConfig {
     /// Starting it yourself is never delayed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_delay: Option<u32>,
+    /// Scripts only: don't start until the Docker engine is up (docker and compose services always wait).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_for_docker: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default, deserialize_with = "lenient_vec")]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

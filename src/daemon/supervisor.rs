@@ -714,10 +714,11 @@ impl Sup {
     /// Apply a new config now if stopped; otherwise queue it until the next stop/restart.
     fn apply_config(self: &Arc<Self>, m: &mut Managed, cfg: ServiceConfig) {
         let live = m.rt.live();
-        let strip = |c: &ServiceConfig| ServiceConfig { autostart: None, start_delay: None, description: None, tags: None, healthcheck: None, ..c.clone() };
+        let strip = |c: &ServiceConfig| ServiceConfig { autostart: None, start_delay: None, wait_for_docker: None, description: None, tags: None, healthcheck: None, ..c.clone() };
         if live && strip(&m.cfg) != strip(&cfg) {
             m.cfg.autostart = cfg.autostart;
             m.cfg.start_delay = cfg.start_delay;
+            m.cfg.wait_for_docker = cfg.wait_for_docker;
             m.cfg.description = cfg.description.clone();
             m.cfg.tags = cfg.tags.clone();
             m.pending = Some(cfg);
@@ -854,7 +855,11 @@ impl Sup {
             return;
         };
         let res = match kind.as_str() {
-            "process" => self.process_start(name, gen).await,
+            "process" => match self.docker_gate(name, gen).await {
+                Ok(true) => self.process_start(name, gen).await,
+                Ok(false) => return,
+                Err(e) => Err(e),
+            },
             "docker" => self.docker_start(name, gen).await,
             "compose" => self.compose_start(name, gen).await,
             _ => self.fail(name, gen, "Kubernetes services are not supported yet (planned for Phase 3)"),

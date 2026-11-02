@@ -281,6 +281,37 @@ impl Sup {
         });
     }
 
+    /// For scripts with `waitForDocker`: hold the start until the Docker engine answers. Ok(true) = go ahead,
+    /// Ok(false) = it was stopped meanwhile, Err = the engine never came up (the restart policy applies).
+    pub(crate) async fn docker_gate(self: &Arc<Self>, name: &str, gen: u64) -> Result<bool, String> {
+        if !self.with(name, Some(gen), |m| m.cfg.wait_for_docker == Some(true)).unwrap_or(false) || docker_api::ping().await {
+            return Ok(true);
+        }
+        self.with(name, Some(gen), |m| {
+            self.set_status(m, "starting");
+            m.system("[lstack] waiting for the Docker engine to start…");
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        let mut wait = 2.0f64;
+        loop {
+            // Short sleeps, so Stop is noticed promptly.
+            for _ in 0..(wait * 4.0) as u32 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if self.with(name, Some(gen), |m| !m.want_running).unwrap_or(true) {
+                    return Ok(false);
+                }
+            }
+            if docker_api::ping().await {
+                self.with(name, Some(gen), |m| m.system("[lstack] Docker engine is up"));
+                return Ok(true);
+            }
+            if std::time::Instant::now() > deadline {
+                return self.fail(name, gen, "Docker engine is not available").map(|_| false);
+            }
+            wait = (wait * 1.5).min(10.0);
+        }
+    }
+
     // ================================================================ docker
 
     pub(crate) async fn docker_start(self: &Arc<Self>, name: &str, gen: u64) -> Result<(), String> {

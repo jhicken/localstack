@@ -49,6 +49,8 @@ struct ServiceConfig: Codable, Hashable {
     var maxRestarts: Int?
     /// Seconds to wait before the automatic start at login (nil = no delay).
     var startDelay: Int?
+    /// Script services: don't start until the Docker engine is up.
+    var waitForDocker: Bool?
     var command: String?
     var cwd: String?
     var env: [String: String]?
