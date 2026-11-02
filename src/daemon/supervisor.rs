@@ -134,6 +134,9 @@ pub struct Managed {
     restart_task: Option<AbortHandle>,
     /// When the pending crash-loop restart fires (ms), while one is scheduled.
     restart_at: Option<i64>,
+    /// A delayed automatic start waiting to fire, and when (ms).
+    start_task: Option<AbortHandle>,
+    start_at: Option<i64>,
     health: &'static str,
     health_task: Option<AbortHandle>,
     metrics: Option<MetricSample>,
@@ -183,6 +186,7 @@ impl Managed {
             exit_code: self.rt.exit_code,
             restarts: self.restarts,
             restart_at: self.restart_at,
+            start_at: self.start_at,
             last_error: self.rt.last_error.clone().map(crate::scrub::scrub_string),
             metrics: self.metrics,
             urls: if self.rt.status == "running" { self.urls.clone() } else { vec![] },
@@ -193,13 +197,18 @@ impl Managed {
             env_file_keys: self.env_file_keys.clone(),
             approval: super::approvals::pending_for(&self.cfg.name),
             parent: self.parent.clone(),
-            container_host: self.cfg.watches_containers(),
+            container_host: self.cfg.is_docker_engine(),
             config: self.pending.clone().unwrap_or_else(|| self.cfg.clone()),
         }
     }
+    /// Cancel a pending crash-loop restart or delayed start.
     fn cancel_restart(&mut self) {
         self.restart_at = None;
+        self.start_at = None;
         if let Some(h) = self.restart_task.take() {
+            h.abort();
+        }
+        if let Some(h) = self.start_task.take() {
             h.abort();
         }
     }
@@ -357,14 +366,19 @@ impl Sup {
         }
         while set.join_next().await.is_some() {}
         let resume = take_resume();
-        let auto: Vec<String> = self
+        // Scripts that were running before a daemon restart come straight back; the rest wait out their start delay.
+        let auto: Vec<(String, u64)> = self
             .lock()
             .services
             .values()
             .filter(|m| (m.cfg.autostart() || (m.cfg.kind == "process" && resume.contains(&m.cfg.name))) && m.rt.status != "running")
-            .map(|m| m.cfg.name.clone())
+            .map(|m| (m.cfg.name.clone(), if resume.contains(&m.cfg.name) { 0 } else { m.cfg.start_delay_secs() }))
             .collect();
-        for name in auto {
+        for (name, delay) in auto {
+            if delay > 0 {
+                self.start_after_delay(&name, delay);
+                continue;
+            }
             let sup = self.clone();
             tokio::spawn(async move {
                 let _ = sup.start(&name).await;
@@ -432,6 +446,33 @@ impl Sup {
         }
         drop(g);
         self.write_state();
+    }
+
+    /// Start `name` once its start delay is over. Starting or stopping it meanwhile cancels the wait.
+    pub(super) fn start_after_delay(self: &Arc<Self>, name: &str, secs: u64) {
+        self.with(name, None, |m| {
+            m.cancel_restart();
+            m.want_running = true;
+            m.start_at = Some(now_ms() + secs as i64 * 1000);
+            m.sys(&format!("start delay: starting in {secs}s"));
+            let (sup, n) = (self.clone(), name.to_string());
+            let h = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                let go = sup.with(&n, None, |m| {
+                    m.start_task = None;
+                    m.start_at = None;
+                    sup.changed(m);
+                    m.want_running && !m.rt.live()
+                });
+                if go == Some(true) {
+                    if let Ok(_g) = sup.try_busy(&n) {
+                        sup.do_start(&n).await;
+                    }
+                }
+            });
+            m.start_task = Some(h.abort_handle());
+            self.changed(m);
+        });
     }
 
     /// Re-read the config folder and reconcile.
@@ -553,12 +594,15 @@ impl Sup {
     pub async fn stop(self: &Arc<Self>, name: &str) -> R<ServiceState> {
         let was_restarting = self.get(name, |m| {
             m.want_running = false;
-            let r = m.restart_at.is_some();
+            let (restarting, delayed) = (m.restart_at.is_some(), m.start_at.is_some());
             m.cancel_restart();
-            if r {
+            if restarting {
                 m.sys("crash-loop restart cancelled");
             }
-            r
+            if delayed {
+                m.sys("delayed start cancelled");
+            }
+            restarting || delayed
         })?;
         {
             // A start may be in flight (e.g. a crash-loop restart); wait for it rather than refusing.
@@ -651,6 +695,8 @@ impl Sup {
             restarts: 0,
             restart_task: None,
             restart_at: None,
+            start_task: None,
+            start_at: None,
             health_task: None,
             metrics: None,
             net: None,
@@ -668,9 +714,10 @@ impl Sup {
     /// Apply a new config now if stopped; otherwise queue it until the next stop/restart.
     fn apply_config(self: &Arc<Self>, m: &mut Managed, cfg: ServiceConfig) {
         let live = m.rt.live();
-        let strip = |c: &ServiceConfig| ServiceConfig { autostart: None, description: None, tags: None, healthcheck: None, ..c.clone() };
+        let strip = |c: &ServiceConfig| ServiceConfig { autostart: None, start_delay: None, description: None, tags: None, healthcheck: None, ..c.clone() };
         if live && strip(&m.cfg) != strip(&cfg) {
             m.cfg.autostart = cfg.autostart;
+            m.cfg.start_delay = cfg.start_delay;
             m.cfg.description = cfg.description.clone();
             m.cfg.tags = cfg.tags.clone();
             m.pending = Some(cfg);
@@ -744,8 +791,9 @@ impl Sup {
     /// The service that lists the Docker engine's containers, the discovered ones so far, and what other
     /// services already manage (container names and ids), so those aren't listed twice.
     pub(super) fn container_snapshot(&self) -> Option<super::containers::Snapshot> {
+        let on = super::terminal::load().docker_containers;
         let g = self.lock();
-        let parent = g.services.values().find(|m| m.parent.is_none() && m.cfg.watches_containers()).map(|m| m.cfg.name.clone());
+        let parent = g.services.values().find(|m| on && m.parent.is_none() && m.cfg.is_docker_engine()).map(|m| m.cfg.name.clone());
         let mut snap = super::containers::Snapshot { parent, ..Default::default() };
         for m in g.services.values() {
             if m.parent.is_some() {

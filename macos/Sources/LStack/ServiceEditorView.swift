@@ -191,13 +191,13 @@ struct ServiceEditorView: View {
     @State private var ports = ""
     @State private var composeFile = ""
     @State private var project = ""
-    /// Script services: "auto" | "show" | "hide" the Docker engine's containers under this service.
-    @State private var containers = "auto"
     @State private var sources = "~/.zshrc"
     @State private var defaultSource = ["~/.zshrc"]
     @State private var suggestion: CommandSplit?
     @State private var restart = "on-failure"
     @State private var autostart = true
+    @State private var startDelayOn = false
+    @State private var startDelay = 10
     @State private var startNow = true
     @State private var restartAfter = true
     @State private var healthKind = "none"
@@ -329,10 +329,10 @@ struct ServiceEditorView: View {
         ports = (c.ports ?? []).joined(separator: ", ")
         composeFile = c.composeFile ?? ""
         project = c.project ?? ""
-        containers = c.watchContainers.map { $0 ? "show" : "hide" } ?? "auto"
         if let s = c.source { sources = s.joined(separator: ", ") }
         restart = c.restart ?? "on-failure"
         autostart = c.autostart ?? false
+        if let d = c.startDelay, d > 0 { startDelayOn = true; startDelay = d }
         switch c.healthcheck?.type {
         case nil: healthKind = "none"
         case "http"?: healthKind = "http"; healthURL = c.healthcheck?.url ?? ""
@@ -400,12 +400,6 @@ struct ServiceEditorView: View {
                     .font(.system(.body, design: .monospaced))
                 if let s = suggestion, s.changed { splitHint(s) }
                 pathField("Working directory", $cwd, directories: true)
-                Picker("Docker containers", selection: $containers) {
-                    Text("Automatic").tag("auto")
-                    Text("Show").tag("show")
-                    Text("Hide").tag("hide")
-                }
-                .help("List the containers on the Docker engine under this service, and keep them up to date as they start and stop. Automatic does this for Docker Desktop and OrbStack.")
             case "docker":
                 TextField("Image", text: $image, prompt: Text("postgres:16"))
                 TextField("Existing container", text: $container, prompt: Text("optional — manage an existing container instead"))
@@ -440,6 +434,16 @@ struct ServiceEditorView: View {
         }
         Section("Behavior") {
             Toggle("Start at login", isOn: $autostart)
+            if autostart {
+                Toggle("Start delay", isOn: $startDelayOn)
+                if startDelayOn {
+                    HStack(spacing: 6) {
+                        TextField("", value: $startDelay, format: .number).labelsHidden().frame(width: 64).multilineTextAlignment(.trailing)
+                        Stepper("", value: $startDelay, in: 1...3600, step: 5).labelsHidden()
+                        Text("seconds").foregroundStyle(.secondary)
+                    }
+                }
+            }
             Picker("Restart", selection: $restart) {
                 Text("On failure").tag("on-failure")
                 Text("Always").tag("always")
@@ -1076,12 +1080,12 @@ struct ServiceEditorView: View {
         var cfg = original ?? ServiceConfig(name: name.trimmingCharacters(in: .whitespaces), type: type)
         cfg.description = description.isEmpty ? nil : description
         cfg.autostart = autostart
+        cfg.startDelay = startDelayOn && startDelay > 0 ? min(startDelay, 86_400) : nil
         cfg.restart = restart
         switch type {
         case "process":
             cfg.command = command
             cfg.cwd = cwd.isEmpty ? nil : cwd
-            cfg.watchContainers = containers == "auto" ? nil : containers == "show"
             let files = list(sources) ?? []
             cfg.source = files == defaultSource ? nil : files
         case "docker":

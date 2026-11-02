@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// Terminal app for the dashboard / attach / shell buttons: terminal, iterm, cmux, ghostty.
@@ -19,6 +19,21 @@ pub struct Settings {
     pub onepassword: OnePassword,
     /// Keep LStack's services in step with `docker ps -a` (see `docker_import::spawn_sync`).
     pub docker_sync: bool,
+    /// List the Docker engine's containers under the Docker service (see `containers.rs`). On by default.
+    pub docker_containers: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            terminal: String::new(),
+            healthchecks: Healthchecks::default(),
+            processes: ProcessThresholds::default(),
+            onepassword: OnePassword::default(),
+            docker_sync: false,
+            docker_containers: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -161,7 +176,29 @@ pub fn status() -> Value {
         "healthchecks": super::heartbeat::settings_status(&settings.healthchecks),
         "processes": settings.processes,
         "onepassword": settings.onepassword,
+        "dockerContainers": settings.docker_containers,
     })
+}
+
+/// The settings other machines may read and change (with control permission): `{ dockerContainers }`.
+pub fn shared() -> Value {
+    json!({ "dockerContainers": load().docker_containers })
+}
+
+/// Apply a patch of the shared settings; unknown keys are an error. Returns the new values.
+pub fn set_shared(patch: &Value) -> Result<Value, String> {
+    let Some(obj) = patch.as_object() else { return Err("expected a JSON object".into()) };
+    if let Some(k) = obj.keys().find(|k| *k != "dockerContainers") {
+        return Err(format!("unknown setting {k:?}"));
+    }
+    let mut s = load();
+    match obj.get("dockerContainers") {
+        Some(Value::Bool(on)) => s.docker_containers = *on,
+        Some(_) => return Err("dockerContainers must be true or false".into()),
+        None => return Err("give \"dockerContainers\"".into()),
+    }
+    save(&s).map_err(|e| format!("cannot save settings.json: {e}"))?;
+    Ok(shared())
 }
 
 fn shell_quote(s: &str) -> String {

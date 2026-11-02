@@ -49,7 +49,7 @@ struct ServiceRow: View {
         HStack(spacing: 10) {
             TypeBadge(type: service.type)
                 .overlay(alignment: .bottomTrailing) {
-                    StatusDot(status: service.isRestarting ? "starting" : service.status, size: 8)
+                    StatusDot(status: service.isRestarting || service.isStartPending ? "starting" : service.status, size: 8)
                         .padding(1.5)
                         .background(Circle().fill(.background))
                         .offset(x: 4, y: 4)
@@ -70,17 +70,17 @@ struct ServiceRow: View {
             Spacer(minLength: 6)
             if hover || expanded {
                 controls
-            } else if service.isRestarting {
-                // Crash loop: make it obvious it can be stopped without hovering.
+            } else if service.isRestarting || service.isStartPending {
+                // Crash loop or start delay: make it obvious it can be stopped without hovering.
                 HStack(spacing: 4) {
                     TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                        Text("restart in \(service.restartsIn(now: ctx.date))s")
+                        Text(service.isRestarting ? "restart in \(service.restartsIn(now: ctx.date))s" : "start in \(service.startsIn(now: ctx.date))s")
                             .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(service.isRestarting ? .orange : .secondary)
                             .textCase(.uppercase)
                             .monospacedDigit()
                     }
-                    IconButton(icon: "stop.fill", help: "Stop — cancel the pending restart", tint: .red) { store.perform(service, "stop") }
+                    IconButton(icon: "stop.fill", help: service.isRestarting ? "Stop — cancel the pending restart" : "Stop — cancel the delayed start", tint: .red) { store.perform(service, "stop") }
                 }
             } else if service.isRunning {
                 if let u = service.links.first {
@@ -188,6 +188,7 @@ struct ServiceRow: View {
             let max = service.config.maxRestarts ?? 10
             return "Crashed\(service.exitCode.map { " (exit \($0))" } ?? "") · retry \(service.restarts)/\(max)"
         }
+        if service.isStartPending { return "Waiting to start (start delay)" }
         if service.isFailed, let e = service.lastError { return e }
         // The command is shown in the expanded detail; don't repeat it in the header.
         if let u = service.uptime { return expanded ? "up \(Fmt.duration(u))" : "up \(Fmt.duration(u)) · \(service.summary)" }
@@ -247,7 +248,7 @@ struct ServiceRow: View {
     @ViewBuilder private var controlButtons: some View {
         HStack(spacing: 0) {
             if service.isStoppable {
-                IconButton(icon: "stop.fill", help: service.isRestarting ? "Stop — cancel the pending restart" : "Stop", tint: .red) { store.perform(service, "stop") }
+                IconButton(icon: "stop.fill", help: service.isRestarting ? "Stop — cancel the pending restart" : service.isStartPending ? "Stop — cancel the delayed start" : "Stop", tint: .red) { store.perform(service, "stop") }
             } else {
                 IconButton(icon: "play.fill", help: "Start", tint: .green) { store.perform(service, "start") }
             }

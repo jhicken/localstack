@@ -563,6 +563,15 @@ fn web_dashboard_redacts_local_machine_routes() {
         assert!(body.contains("API_KEY") && !body.contains(secret), "{body}");
     }
     let _ = d.post("/api/services/api/stop", None);
+
+    // Settings from the dashboard need remote control.
+    let put = |p: &str, on: bool| ureq::put(&format!("{base}{p}")).set("Cookie", &cookie).set("X-LStack", "1").send_json(json!({ "dockerContainers": on }));
+    assert_eq!(serde_json::from_str::<Value>(&get(&format!("/api/machines/{me}/settings"))).unwrap()["dockerContainers"], true);
+    assert_eq!(put(&format!("/api/machines/{me}/settings"), false).unwrap().into_json::<Value>().unwrap()["dockerContainers"], false);
+    assert_eq!(d.get("/api/settings").unwrap()["dockerContainers"], false);
+    d.call("PUT", "/api/remote", Some(json!({ "allowControl": false }))).unwrap();
+    wait_until("control off", 10, || matches!(put(&format!("/api/machines/{me}/settings"), true), Err(ureq::Error::Status(403, _))));
+    assert_eq!(d.get("/api/settings").unwrap()["dockerContainers"], false);
 }
 
 /// A paired Mac receives a 1Password value only after one ask and one approval: it asks and the other Mac
@@ -899,8 +908,15 @@ fn machines_pair_and_proxy() {
     assert!(host.get("/api/machines/studio/services/web/logs?tail=50").unwrap()["lines"].is_array());
     assert!(host.get("/api/machines/studio/services/web/metrics?range=5m").unwrap()["samples"].is_array());
     assert_eq!(host.post("/api/machines/studio/services/web/stop", None).unwrap_err().0, 403);
+    // Settings: any paired Mac can read the shared ones; changing them needs the control grant too.
+    assert_eq!(host.get("/api/machines/studio/settings").unwrap()["dockerContainers"], true);
+    assert_eq!(host.call("PUT", "/api/machines/studio/settings", Some(json!({ "dockerContainers": false }))).unwrap_err().0, 403);
     client.call("PATCH", &format!("/api/remote/peers/{id}"), Some(json!({ "control": true }))).unwrap();
     wait_until("control granted", 20, || host.post("/api/machines/studio/services/web/stop", None).is_ok());
+    assert_eq!(host.call("PUT", "/api/machines/studio/settings", Some(json!({ "dockerContainers": false }))).unwrap()["dockerContainers"], false);
+    assert_eq!(client.get("/api/settings").unwrap()["dockerContainers"], false);
+    assert_eq!(host.call("PUT", "/api/machines/studio/settings", Some(json!({ "terminal": "x" }))).unwrap_err().0, 400);
+    host.call("PUT", "/api/machines/studio/settings", Some(json!({ "dockerContainers": true }))).unwrap();
     wait_until("peer stop seen on host", 20, || {
         let v = host.get("/api/machines/studio").unwrap();
         v["services"].as_array().unwrap().iter().any(|s| s["name"] == "web" && s["status"] == "stopped")
@@ -1063,8 +1079,50 @@ fn docker_engine_lists_its_containers_as_children() {
     d.post("/api/reload", None).unwrap();
     assert!(names(&d).contains(&"docker.db".to_string()));
 
+    // Turning the setting off drops the children (the containers keep running); on brings them back.
+    let me = d.get("/api/machines").unwrap()["local"]["name"].as_str().unwrap().to_string();
+    assert_eq!(d.call("PUT", &format!("/api/machines/{me}/settings"), Some(json!({ "dockerContainers": false }))).unwrap()["dockerContainers"], false);
+    wait_until("children dropped", 15, || !names(&d).iter().any(|n| n.starts_with("docker.")));
+    assert!(engine.containers.lock().unwrap().iter().any(|c| c.1 == "db" && c.2));
+    d.call("PUT", "/api/settings", Some(json!({ "dockerContainers": true }))).unwrap();
+    wait_until("children back", 15, || names(&d).contains(&"docker.db".to_string()));
+
     // Removing the engine service removes its children.
     d.call("DELETE", "/api/services/docker", None).unwrap();
     wait_until("children gone", 15, || !names(&d).iter().any(|n| n.starts_with("docker.")));
     assert!(d.svc("pin").get("parent").is_none());
+}
+
+#[test]
+fn start_delay_holds_back_automatic_starts_only() {
+    let home = std::env::temp_dir().join(format!("lstack-it-delay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("services")).unwrap();
+    let svc = |name: &str, extra: &str| std::fs::write(home.join(format!("services/{name}.yaml")), format!("name: {name}\ncommand: sleep 60\nautostart: true\nrestart: never\n{extra}")).unwrap();
+    svc("now", "");
+    svc("soon", "startDelay: 3\n");
+    svc("later", "startDelay: 60\n");
+    svc("never", "startDelay: 60\n");
+    let d = Daemon::start(&home);
+
+    // No delay starts at once; a delayed one waits, shows when it will start, then starts by itself.
+    wait_until("undelayed service started", 10, || d.svc("now")["status"] == "running");
+    let soon = d.svc("soon");
+    assert_eq!(soon["status"], "stopped");
+    assert!(soon["startAt"].as_i64().unwrap() > 0);
+    assert!(d.logs("soon").contains("start delay: starting in 3s"));
+    wait_until("delayed service started", 15, || d.svc("soon")["status"] == "running");
+    assert!(d.svc("soon").get("startAt").is_none());
+
+    // Starting it yourself skips the wait; stopping it cancels it.
+    assert_eq!(d.post("/api/services/later/start", None).unwrap()["status"], "running");
+    assert!(d.svc("later").get("startAt").is_none());
+    let stopped = d.post("/api/services/never/stop", None).unwrap();
+    assert!(stopped.get("startAt").is_none());
+    assert!(d.logs("never").contains("delayed start cancelled"));
+    assert_eq!(d.svc("never")["status"], "stopped");
+
+    // Bounds are checked.
+    let bad = d.call("PATCH", "/api/services/now", Some(json!({ "startDelay": 100000 }))).unwrap_err();
+    assert_eq!(bad.0, 400);
 }

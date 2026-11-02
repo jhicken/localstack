@@ -996,6 +996,22 @@ final class AppStore {
         } catch { return error.localizedDescription }
     }
 
+    /// Whether a machine lists its Docker engine's containers (nil if it can't be read). `machine` is the
+    /// paired Mac's name; this Mac is reached through the same route.
+    func dockerContainers(on machine: String) async -> Bool? {
+        guard let client else { return nil }
+        struct Shared: Decodable { let dockerContainers: Bool? }
+        return (try? await client.send("GET", "/api/machines/\(machine.urlPath)/settings", as: Shared.self))?.dockerContainers
+    }
+
+    /// Turn the Docker container listing on or off on a paired Mac (it must allow control).
+    func setDockerContainers(on machine: String, _ on: Bool) async -> String? {
+        do {
+            _ = try await sendJSON("PUT", "/api/machines/\(machine.urlPath)/settings", ["dockerContainers": on])
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
     /// PATCH a service definition (JSON merge patch; NSNull removes a key).
     func patchService(_ name: String, _ patch: [String: Any]) async -> String? {
         do {

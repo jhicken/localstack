@@ -127,6 +127,10 @@ pub struct ServiceConfig {
     pub restart: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_restarts: Option<u32>,
+    /// Seconds to wait before starting automatically at login / daemon boot. Unset or 0 = no delay.
+    /// Starting it yourself is never delayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_delay: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default, deserialize_with = "lenient_vec")]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,10 +146,6 @@ pub struct ServiceConfig {
     pub detect_urls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<Heartbeat>,
-    /// Process services only: list every container on the Docker engine as a child of this service.
-    /// Unset = on when this looks like the Docker engine (Docker Desktop, OrbStack).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub watch_containers: Option<bool>,
     // process
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -205,15 +205,17 @@ impl ServiceConfig {
     pub fn autostart(&self) -> bool {
         self.autostart.unwrap_or(false)
     }
-    /// Whether this service is the Docker engine, whose containers show up under it.
-    pub fn watches_containers(&self) -> bool {
-        self.kind == "process" && self.watch_containers.unwrap_or_else(|| self.looks_like_docker_engine())
+    pub fn start_delay_secs(&self) -> u64 {
+        self.start_delay.unwrap_or(0) as u64
     }
-    fn looks_like_docker_engine(&self) -> bool {
+    /// Whether this is the Docker engine itself (Docker Desktop, OrbStack, Colima): a script whose name or
+    /// command says so. Its containers are listed under it while the `dockerContainers` setting is on.
+    pub fn is_docker_engine(&self) -> bool {
         let name = self.name.to_lowercase();
         let command = self.command.as_deref().unwrap_or("").to_lowercase();
-        ["docker", "docker-desktop", "docker_desktop", "dockerdesktop", "orbstack"].contains(&name.as_str())
-            || ["docker.app", "docker desktop", "orbstack"].iter().any(|k| command.contains(k))
+        self.kind == "process"
+            && (["docker", "docker-desktop", "docker_desktop", "dockerdesktop", "orbstack", "colima"].contains(&name.as_str())
+                || ["docker.app", "docker desktop", "orbstack", "colima start"].iter().any(|k| command.contains(k)))
     }
     /// (env var, secret name) pairs.
     pub fn secret_refs(&self) -> Vec<(String, String)> {
@@ -333,6 +335,9 @@ pub struct ServiceState {
     /// Set while a crash-loop restart is scheduled: when it will fire (ms since epoch).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub restart_at: Option<i64>,
+    /// Set while a delayed automatic start is waiting: when it will happen (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -360,7 +365,7 @@ pub struct ServiceState {
     /// aren't saved to disk: they come and go with the containers.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent: Option<String>,
-    /// This service is the Docker engine: its containers are listed as its children.
+    /// This service is the Docker engine, which lists its containers as children (see the `dockerContainers` setting).
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub container_host: bool,
     pub config: ServiceConfig,
@@ -401,11 +406,17 @@ impl ServiceState {
         let root = |s: &Self| s.parent.clone().unwrap_or_else(|| s.name.clone());
         root(self).cmp(&root(other)).then(self.parent.is_some().cmp(&other.parent.is_some())).then_with(|| self.name.cmp(&other.name))
     }
-    /// Status for display: "restarting 12s" while a crash-loop restart is pending.
+    /// Status for display: "restarting 12s" while a crash-loop restart is pending, "starts in 5s" during a start delay.
     pub fn status_label(&self) -> String {
-        match self.restart_at {
-            Some(t) => format!("restarting {}s", ((t - crate::paths::now_ms()).max(0) + 999) / 1000),
-            None => self.status.clone(),
+        let secs = |t: i64| ((t - crate::paths::now_ms()).max(0) + 999) / 1000;
+        match (self.restart_at, self.start_at) {
+            (Some(t), _) => format!("restarting {}s", secs(t)),
+            (None, Some(t)) => format!("starts in {}s", secs(t)),
+            _ => self.status.clone(),
         }
+    }
+    /// Waiting to (re)start: a crash-loop restart or a start delay. Stop cancels it.
+    pub fn counting_down(&self) -> bool {
+        self.restart_at.is_some() || self.start_at.is_some()
     }
 }

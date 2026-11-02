@@ -805,7 +805,7 @@ fn draw_list(fr: &mut Frame, ui: &Ui, area: Rect) {
         let run = s.status == "running";
         let m = s.metrics.as_ref();
         let cpu = if run { f::pct(m.map(|m| m.cpu)) } else { String::new() };
-        let mem = if run { f::bytes(m.map(|m| m.mem)) } else if s.restart_at.is_some() { "restarting".into() } else { s.status.clone() };
+        let mem = if run { f::bytes(m.map(|m| m.mem)) } else if s.restart_at.is_some() { "restarting".into() } else if s.start_at.is_some() { "waiting".into() } else { s.status.clone() };
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled("●", Style::new().fg(status_color(&s.status))),
@@ -868,7 +868,7 @@ fn proc_lines(ui: &Ui, w: usize) -> Vec<Line<'static>> {
 
 fn details(s: &ServiceState, hist: &[MetricSample], w: usize) -> Vec<Line<'static>> {
     let mut out = vec![];
-    let st = if s.restart_at.is_some() { Span::styled(format!("{} (x to stop)", s.status_label()), Style::new().fg(Color::Yellow)) } else { Span::styled(s.status.clone(), Style::new().fg(status_color(&s.status))) };
+    let st = if s.counting_down() { Span::styled(format!("{} (x to stop)", s.status_label()), Style::new().fg(Color::Yellow)) } else { Span::styled(s.status.clone(), Style::new().fg(status_color(&s.status))) };
     let mut head = vec![dim(format!(" {}  ", s.kind)), st, Span::raw("  ")];
     match s.health.as_str() {
         "healthy" => head.push(Span::styled("♥ healthy  ", Style::new().fg(Color::Green))),

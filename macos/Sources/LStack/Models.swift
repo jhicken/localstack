@@ -47,6 +47,8 @@ struct ServiceConfig: Codable, Hashable {
     var autostart: Bool?
     var restart: String?
     var maxRestarts: Int?
+    /// Seconds to wait before the automatic start at login (nil = no delay).
+    var startDelay: Int?
     var command: String?
     var cwd: String?
     var env: [String: String]?
@@ -57,8 +59,6 @@ struct ServiceConfig: Codable, Hashable {
     var volumes: [String]?
     var composeFile: String?
     var project: String?
-    /// Script services: list the Docker engine's containers under this service (nil = automatic).
-    var watchContainers: Bool?
     var healthcheck: HealthCheck?
     var secrets: SecretRefs?
     var heartbeat: HeartbeatConfig?
@@ -483,6 +483,8 @@ struct ServiceState: Codable, Identifiable, Hashable {
     let restarts: Int
     /// Set while a crash-loop restart is pending (ms since epoch).
     let restartAt: Double?
+    /// Set while a delayed automatic start is waiting (ms since epoch).
+    var startAt: Double? = nil
     let lastError: String?
     var metrics: MetricSample?
     let urls: [ServiceURL]?
@@ -531,7 +533,14 @@ struct ServiceState: Codable, Identifiable, Hashable {
     /// Crashed and waiting to be restarted; Stop cancels the pending restart.
     var isRestarting: Bool { restartAt != nil }
     /// Whether Stop applies (running, starting/stopping, or between crash-loop attempts).
-    var isStoppable: Bool { isRunning || isTransitioning || isRestarting }
+    var isStoppable: Bool { isRunning || isTransitioning || isRestarting || isStartPending }
+    /// Waiting out its start delay; Stop cancels the start.
+    var isStartPending: Bool { startAt != nil }
+
+    func startsIn(now: Date = Date()) -> Int {
+        guard let s = startAt else { return 0 }
+        return max(0, Int(ceil((s / 1000) - now.timeIntervalSince1970)))
+    }
 
     func restartsIn(now: Date = Date()) -> Int {
         guard let r = restartAt else { return 0 }
@@ -703,6 +712,8 @@ struct DaemonSettings: Decodable, Equatable {
     var healthchecks: HealthchecksStatus?
     var processes: ProcessThresholds?
     var onepassword: OnePasswordSettings?
+    /// List the Docker engine's containers under the Docker service (nil from daemons that predate it).
+    var dockerContainers: Bool?
 }
 
 struct CmuxStatus: Decodable, Equatable {

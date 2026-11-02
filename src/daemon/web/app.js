@@ -49,9 +49,10 @@
   const clock = (ts) => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const shortTime = (ts, range) => new Date(ts).toLocaleString([], range === "7d" ? { weekday: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
   const live = (s) => ["running", "starting", "stopping"].includes(s.status);
-  // A crash-looping service is between attempts: not live, but Stop cancels the pending restart.
-  const looping = (s) => !!s.restartAt;
-  const statusLabel = (s) => looping(s) ? `restarting ${Math.max(0, Math.ceil((s.restartAt - Date.now()) / 1000))}s` : s.status;
+  // A crash-looping service is between attempts, and one with a start delay is waiting: not live, but Stop cancels it.
+  const looping = (s) => !!(s.restartAt || s.startAt);
+  const secsTo = (t) => Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  const statusLabel = (s) => s.restartAt ? `restarting ${secsTo(s.restartAt)}s` : s.startAt ? `starts in ${secsTo(s.startAt)}s` : s.status;
   const enc = encodeURIComponent;
   const ago = (ts) => {
     const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -280,7 +281,7 @@
     renderList();
     if (svcKey(s) !== S.selected) return;
     if (S.shown !== S.selected) renderDetail();
-    else if (prev && prev.status === s.status && prev.restartAt === s.restartAt && prev.health === s.health && prev.lastError === s.lastError) renderTiles();
+    else if (prev && prev.status === s.status && prev.restartAt === s.restartAt && prev.startAt === s.startAt && prev.health === s.health && prev.lastError === s.lastError) renderTiles();
     else renderHead();
   }
 
@@ -740,8 +741,37 @@
         <div class="card"><div class="card-h"><span class="t">CPU</span><span class="val" id="mcpuv"></span></div><div class="chart-wrap"><div class="chart" id="mcpuc"></div></div></div>
         <div class="card"><div class="card-h"><span class="t">Memory</span><span class="val" id="mmemv"></span></div><div class="chart-wrap"><div class="chart" id="mmemc"></div></div></div>
       </div>
-      <div id="mprocs"></div>`;
+      <div id="mprocs"></div>
+      <div class="card" id="msettings" hidden></div>`;
     renderMachineLive();
+    loadMachineSettings(i);
+  }
+
+  // Settings a watcher can change on a machine (this one or a paired Mac); changing them needs control.
+  async function loadMachineSettings(i) {
+    const el = document.getElementById("msettings");
+    if (!el || i.status !== "online") return;
+    const path = `/api/machines/${enc(i.name)}/settings`;
+    let cur;
+    try { cur = await api(path); } catch { return; }
+    if (document.getElementById("msettings") !== el) return;
+    const can = !!S.session?.allowControl && (i.local || !!i.allowControl);
+    el.hidden = false;
+    el.innerHTML = `<label class="setting${can ? "" : " ro"}" title="${can ? "" : esc(i.local ? "Remote control is off on this machine" : "That Mac lets this one view, not change settings")}">
+        <input type="checkbox" ${cur.dockerContainers ? "checked" : ""} ${can ? "" : "disabled"}>
+        <span><b>Show Docker containers</b><small>Lists them under the Docker service.</small></span>
+      </label>`;
+    const box = el.querySelector("input");
+    box.addEventListener("change", async () => {
+      const want = box.checked;
+      box.disabled = true;
+      try {
+        const v = await api(path, { method: "PUT", body: { dockerContainers: want } });
+        box.checked = !!v.dockerContainers;
+        toast(`Docker containers ${v.dockerContainers ? "shown" : "hidden"} on ${i.name}`);
+      } catch (e) { box.checked = !want; toast(e.message, true); }
+      box.disabled = false;
+    });
   }
 
   function renderMachineLive() {
