@@ -196,6 +196,9 @@ struct ServiceEditorView: View {
     @State private var suggestion: CommandSplit?
     @State private var restart = "on-failure"
     @State private var autostart = true
+    @State private var waitForDocker = false
+    @State private var startDelayOn = false
+    @State private var startDelay = 10
     @State private var startNow = true
     @State private var restartAfter = true
     @State private var healthKind = "none"
@@ -330,6 +333,8 @@ struct ServiceEditorView: View {
         if let s = c.source { sources = s.joined(separator: ", ") }
         restart = c.restart ?? "on-failure"
         autostart = c.autostart ?? false
+        if let d = c.startDelay, d > 0 { startDelayOn = true; startDelay = d }
+        waitForDocker = c.waitForDocker ?? false
         switch c.healthcheck?.type {
         case nil: healthKind = "none"
         case "http"?: healthKind = "http"; healthURL = c.healthcheck?.url ?? ""
@@ -380,7 +385,7 @@ struct ServiceEditorView: View {
     @ViewBuilder private var generalSections: some View {
         Section {
             Picker("Type", selection: $type) {
-                Label("Script", systemImage: "terminal.fill").tag("process")
+                Label("Script or App", systemImage: "terminal.fill").tag("process")
                 Label("Docker", systemImage: "shippingbox.fill").tag("docker")
                 Label("Compose", systemImage: "square.stack.3d.up.fill").tag("compose")
             }
@@ -431,6 +436,20 @@ struct ServiceEditorView: View {
         }
         Section("Behavior") {
             Toggle("Start at login", isOn: $autostart)
+            if autostart {
+                Toggle("Start delay", isOn: $startDelayOn)
+                if startDelayOn {
+                    HStack(spacing: 6) {
+                        TextField("", value: $startDelay, format: .number).labelsHidden().frame(width: 64).multilineTextAlignment(.trailing)
+                        Stepper("", value: $startDelay, in: 1...3600, step: 5).labelsHidden()
+                        Text("seconds").foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if type == "process" {
+                Toggle("Wait for Docker", isOn: $waitForDocker)
+                    .help("Don't start until the Docker engine is up")
+            }
             Picker("Restart", selection: $restart) {
                 Text("On failure").tag("on-failure")
                 Text("Always").tag("always")
@@ -1067,6 +1086,8 @@ struct ServiceEditorView: View {
         var cfg = original ?? ServiceConfig(name: name.trimmingCharacters(in: .whitespaces), type: type)
         cfg.description = description.isEmpty ? nil : description
         cfg.autostart = autostart
+        cfg.startDelay = startDelayOn && startDelay > 0 ? min(startDelay, 86_400) : nil
+        cfg.waitForDocker = type == "process" && waitForDocker ? true : nil
         cfg.restart = restart
         switch type {
         case "process":

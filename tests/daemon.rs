@@ -563,6 +563,15 @@ fn web_dashboard_redacts_local_machine_routes() {
         assert!(body.contains("API_KEY") && !body.contains(secret), "{body}");
     }
     let _ = d.post("/api/services/api/stop", None);
+
+    // Settings from the dashboard need remote control.
+    let put = |p: &str, on: bool| ureq::put(&format!("{base}{p}")).set("Cookie", &cookie).set("X-LStack", "1").send_json(json!({ "dockerContainers": on }));
+    assert_eq!(serde_json::from_str::<Value>(&get(&format!("/api/machines/{me}/settings"))).unwrap()["dockerContainers"], true);
+    assert_eq!(put(&format!("/api/machines/{me}/settings"), false).unwrap().into_json::<Value>().unwrap()["dockerContainers"], false);
+    assert_eq!(d.get("/api/settings").unwrap()["dockerContainers"], false);
+    d.call("PUT", "/api/remote", Some(json!({ "allowControl": false }))).unwrap();
+    wait_until("control off", 10, || matches!(put(&format!("/api/machines/{me}/settings"), true), Err(ureq::Error::Status(403, _))));
+    assert_eq!(d.get("/api/settings").unwrap()["dockerContainers"], false);
 }
 
 /// A paired Mac receives a 1Password value only after one ask and one approval: it asks and the other Mac
@@ -899,8 +908,15 @@ fn machines_pair_and_proxy() {
     assert!(host.get("/api/machines/studio/services/web/logs?tail=50").unwrap()["lines"].is_array());
     assert!(host.get("/api/machines/studio/services/web/metrics?range=5m").unwrap()["samples"].is_array());
     assert_eq!(host.post("/api/machines/studio/services/web/stop", None).unwrap_err().0, 403);
+    // Settings: any paired Mac can read the shared ones; changing them needs the control grant too.
+    assert_eq!(host.get("/api/machines/studio/settings").unwrap()["dockerContainers"], true);
+    assert_eq!(host.call("PUT", "/api/machines/studio/settings", Some(json!({ "dockerContainers": false }))).unwrap_err().0, 403);
     client.call("PATCH", &format!("/api/remote/peers/{id}"), Some(json!({ "control": true }))).unwrap();
     wait_until("control granted", 20, || host.post("/api/machines/studio/services/web/stop", None).is_ok());
+    assert_eq!(host.call("PUT", "/api/machines/studio/settings", Some(json!({ "dockerContainers": false }))).unwrap()["dockerContainers"], false);
+    assert_eq!(client.get("/api/settings").unwrap()["dockerContainers"], false);
+    assert_eq!(host.call("PUT", "/api/machines/studio/settings", Some(json!({ "terminal": "x" }))).unwrap_err().0, 400);
+    host.call("PUT", "/api/machines/studio/settings", Some(json!({ "dockerContainers": true }))).unwrap();
     wait_until("peer stop seen on host", 20, || {
         let v = host.get("/api/machines/studio").unwrap();
         v["services"].as_array().unwrap().iter().any(|s| s["name"] == "web" && s["status"] == "stopped")
@@ -937,3 +953,212 @@ fn machines_pair_and_proxy() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+
+/// A stand-in Docker engine on a unix socket: `(id, name, running)` per container.
+struct FakeEngine {
+    sock: PathBuf,
+    containers: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
+}
+
+impl FakeEngine {
+    /// A socket path no other fake engine in this test run uses (so it can be handed to a daemon first).
+    fn unique_sock() -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        PathBuf::from(format!("/tmp/lstack-fd-{}-{}.sock", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    fn start() -> FakeEngine {
+        Self::start_at(Self::unique_sock())
+    }
+
+    fn start_at(sock: PathBuf) -> FakeEngine {
+        use std::io::{Read, Write};
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let containers: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>> = Default::default();
+        let state = containers.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let mut first = req.lines().next().unwrap_or("").split_whitespace();
+                let (method, path) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+                let mut list = state.lock().unwrap();
+                let find = |list: &Vec<(String, String, bool)>, key: &str| list.iter().position(|c| c.0 == key || c.1 == key);
+                let (status, body) = if path.starts_with("/containers/json") {
+                    let rows: Vec<Value> = list.iter().map(|c| json!({ "Id": c.0, "Names": [format!("/{}", c.1)], "Image": "img:1", "State": if c.2 { "running" } else { "exited" } })).collect();
+                    (200, Value::Array(rows).to_string())
+                } else if let Some(rest) = path.strip_prefix("/containers/") {
+                    let (key, action) = rest.split_once('/').unwrap_or((rest, ""));
+                    let action = action.split('?').next().unwrap_or("");
+                    match (find(&list, key), method, action) {
+                        (None, ..) => (404, json!({ "message": "no such container" }).to_string()),
+                        (Some(i), "GET", "json") => {
+                            let c = &list[i];
+                            let state = json!({ "Status": if c.2 { "running" } else { "exited" }, "Pid": if c.2 { 4242 } else { 0 }, "StartedAt": "2026-01-01T00:00:00Z", "ExitCode": 0 });
+                            (200, json!({ "Id": c.0, "State": state, "NetworkSettings": { "Ports": { "80/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "8081" }] } } }).to_string())
+                        }
+                        (Some(i), "POST", "start") => {
+                            list[i].2 = true;
+                            (204, String::new())
+                        }
+                        (Some(i), "POST", "stop") => {
+                            list[i].2 = false;
+                            (204, String::new())
+                        }
+                        _ => (200, "{}".into()),
+                    }
+                } else {
+                    (200, "OK".into())
+                };
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        FakeEngine { sock, containers }
+    }
+
+    fn set(&self, id: &str, name: &str, running: bool) {
+        let mut l = self.containers.lock().unwrap();
+        match l.iter_mut().find(|c| c.0 == id) {
+            Some(c) => c.2 = running,
+            None => l.push((id.into(), name.into(), running)),
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        self.containers.lock().unwrap().retain(|c| c.0 != id);
+    }
+}
+
+impl Drop for FakeEngine {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+#[test]
+fn docker_engine_lists_its_containers_as_children() {
+    let home = std::env::temp_dir().join(format!("lstack-it-docker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("services")).unwrap();
+    let engine = FakeEngine::start();
+    engine.set("aaa111", "web", true);
+    engine.set("bbb222", "job", false);
+    // A saved docker service already manages this container, so it isn't listed twice.
+    engine.set("ccc333", "pinned", true);
+    std::fs::write(home.join("services/docker.yaml"), "name: docker\ncommand: sleep 300\n").unwrap();
+    std::fs::write(home.join("services/aaa.yaml"), "name: aaa\ncommand: echo hi\n").unwrap();
+    std::fs::write(home.join("services/pin.yaml"), "name: pin\ntype: docker\ncontainer: pinned\n").unwrap();
+    let d = Daemon::start_with(&home, &[("DOCKER_HOST", format!("unix://{}", engine.sock.display()))]);
+
+    let names = |d: &Daemon| -> Vec<String> { d.get("/api/services").unwrap()["services"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect() };
+
+    // Running containers are picked up under the engine service; exited and already-managed ones aren't.
+    wait_until("web discovered", 15, || names(&d).contains(&"docker.web".to_string()));
+    let web = d.svc("docker.web");
+    assert_eq!(web["parent"], "docker");
+    assert_eq!(web["type"], "docker");
+    assert_eq!(web["status"], "running");
+    wait_until("web url", 15, || d.svc("docker.web")["urls"][0]["url"] == "http://localhost:8081");
+    assert_eq!(d.svc("docker")["containerHost"], true);
+    assert_eq!(d.svc("aaa").get("parent"), None);
+    assert_eq!(names(&d), ["aaa", "docker", "docker.web", "pin"]);
+
+    // Containers that start later show up; ones that stop stay listed as stopped; removed ones go.
+    engine.set("ddd444", "db", true);
+    wait_until("db discovered", 15, || names(&d).contains(&"docker.db".to_string()));
+    engine.set("aaa111", "web", false);
+    wait_until("web stopped", 15, || d.svc("docker.web")["status"] == "stopped");
+    engine.set("bbb222", "job", true);
+    wait_until("job discovered", 15, || names(&d).contains(&"docker.job".to_string()));
+    engine.remove("aaa111");
+    wait_until("web removed", 15, || !names(&d).contains(&"docker.web".to_string()));
+
+    // Children are controlled like docker services, but aren't saved or editable.
+    d.post("/api/services/docker.db/stop", None).unwrap();
+    assert_eq!(d.svc("docker.db")["status"], "stopped");
+    assert!(!engine.containers.lock().unwrap().iter().find(|c| c.1 == "db").unwrap().2);
+    d.post("/api/services/docker.db/start", None).unwrap();
+    wait_until("db running again", 15, || d.svc("docker.db")["status"] == "running");
+    assert_eq!(d.call("PATCH", "/api/services/docker.db", Some(json!({ "autostart": true }))).unwrap_err().0, 400);
+    assert_eq!(d.call("DELETE", "/api/services/docker.db", None).unwrap_err().0, 400);
+    assert!(!home.join("services/docker.db.yaml").exists());
+    d.post("/api/reload", None).unwrap();
+    assert!(names(&d).contains(&"docker.db".to_string()));
+
+    // Turning the setting off drops the children (the containers keep running); on brings them back.
+    let me = d.get("/api/machines").unwrap()["local"]["name"].as_str().unwrap().to_string();
+    assert_eq!(d.call("PUT", &format!("/api/machines/{me}/settings"), Some(json!({ "dockerContainers": false }))).unwrap()["dockerContainers"], false);
+    wait_until("children dropped", 15, || !names(&d).iter().any(|n| n.starts_with("docker.")));
+    assert!(engine.containers.lock().unwrap().iter().any(|c| c.1 == "db" && c.2));
+    d.call("PUT", "/api/settings", Some(json!({ "dockerContainers": true }))).unwrap();
+    wait_until("children back", 15, || names(&d).contains(&"docker.db".to_string()));
+
+    // Removing the engine service removes its children.
+    d.call("DELETE", "/api/services/docker", None).unwrap();
+    wait_until("children gone", 15, || !names(&d).iter().any(|n| n.starts_with("docker.")));
+    assert!(d.svc("pin").get("parent").is_none());
+}
+
+#[test]
+fn start_delay_holds_back_automatic_starts_only() {
+    let home = std::env::temp_dir().join(format!("lstack-it-delay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("services")).unwrap();
+    let svc = |name: &str, extra: &str| std::fs::write(home.join(format!("services/{name}.yaml")), format!("name: {name}\ncommand: sleep 60\nautostart: true\nrestart: never\n{extra}")).unwrap();
+    svc("now", "");
+    svc("soon", "startDelay: 3\n");
+    svc("later", "startDelay: 60\n");
+    svc("never", "startDelay: 60\n");
+    let d = Daemon::start(&home);
+
+    // No delay starts at once; a delayed one waits, shows when it will start, then starts by itself.
+    wait_until("undelayed service started", 10, || d.svc("now")["status"] == "running");
+    let soon = d.svc("soon");
+    assert_eq!(soon["status"], "stopped");
+    assert!(soon["startAt"].as_i64().unwrap() > 0);
+    assert!(d.logs("soon").contains("start delay: starting in 3s"));
+    wait_until("delayed service started", 15, || d.svc("soon")["status"] == "running");
+    assert!(d.svc("soon").get("startAt").is_none());
+
+    // Starting it yourself skips the wait; stopping it cancels it.
+    assert_eq!(d.post("/api/services/later/start", None).unwrap()["status"], "running");
+    assert!(d.svc("later").get("startAt").is_none());
+    let stopped = d.post("/api/services/never/stop", None).unwrap();
+    assert!(stopped.get("startAt").is_none());
+    assert!(d.logs("never").contains("delayed start cancelled"));
+    assert_eq!(d.svc("never")["status"], "stopped");
+
+    // Bounds are checked.
+    let bad = d.call("PATCH", "/api/services/now", Some(json!({ "startDelay": 100000 }))).unwrap_err();
+    assert_eq!(bad.0, 400);
+}
+
+#[test]
+fn wait_for_docker_holds_a_script_until_the_engine_answers() {
+    let home = std::env::temp_dir().join(format!("lstack-it-waitdocker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("services")).unwrap();
+    let svc = |name: &str, extra: &str| std::fs::write(home.join(format!("services/{name}.yaml")), format!("name: {name}\ncommand: sleep 60\nautostart: true\nrestart: never\n{extra}")).unwrap();
+    svc("plain", "");
+    svc("needs", "waitForDocker: true\n");
+    svc("cancelled", "waitForDocker: true\n");
+    let sock = FakeEngine::unique_sock();
+    let d = Daemon::start_with(&home, &[("DOCKER_HOST", format!("unix://{}", sock.display()))]);
+
+    // Without a Docker engine, only the script that needs it waits.
+    wait_until("plain started", 10, || d.svc("plain")["status"] == "running");
+    wait_until("waiting for docker", 10, || d.logs("needs").contains("waiting for the Docker engine"));
+    assert_eq!(d.svc("needs")["status"], "starting");
+
+    // Stop cancels the wait; it stays stopped when the engine shows up.
+    assert_eq!(d.post("/api/services/cancelled/stop", None).unwrap()["status"], "stopped");
+
+    let engine = FakeEngine::start_at(sock);
+    wait_until("started once docker is up", 20, || d.svc("needs")["status"] == "running");
+    assert!(d.logs("needs").contains("Docker engine is up"));
+    assert_eq!(d.svc("cancelled")["status"], "stopped");
+    drop(engine);
+}

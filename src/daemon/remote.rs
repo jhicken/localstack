@@ -1487,6 +1487,7 @@ pub(super) fn peer_router(app: AppState, remote: Arc<Remote>, peer_id: String, m
         .route("/peer/api/services/:name/logs/stream", get(log_stream))
         .route("/peer/api/services/:name/metrics", get(metrics))
         .route("/peer/api/services/:name/:action", post(peer_action))
+        .route("/peer/api/settings", get(|| async { Json(super::terminal::shared()) }).put(peer_settings_put))
         .route("/peer/api/system", get(|State(rs): State<RState>| async move { Json(rs.app.sup.system()) }))
         .route("/peer/api/processes", get(|State(rs): State<RState>| async move { Json(json!({ "processes": *rs.app.sup.processes() })) }))
         .route("/peer/api/events", get(peer_events))
@@ -1515,6 +1516,7 @@ fn router(app: AppState, remote: Arc<Remote>, gen: u64) -> Router {
         .route("/api/processes", get(|State(rs): State<RState>| async move { server::processes(State(rs.app)).await.into_response() }))
         .route("/api/machines", get(|State(rs): State<RState>| async move { server::machines_list(State(rs.app)).await.into_response() }))
         .route("/api/machines/:m", get(|State(rs): State<RState>, p: Path<String>| async move { server::machine_get(State(rs.app), p).await.into_response() }))
+        .route("/api/machines/:m/settings", get(|State(rs): State<RState>, p: Path<String>| async move { server::m_settings(State(rs.app), p).await.into_response() }).put(m_settings_put))
         .route("/api/machines/:m/services/:name", get(m_service))
         .route("/api/machines/:m/services/:name/logs", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_logs(State(rs.app), p, q).await.into_response() }))
         .route("/api/machines/:m/services/:name/logs/stream", get(|State(rs): State<RState>, p: Path<(String, String)>, q: Q| async move { server::m_log_stream(State(rs.app), p, q).await.into_response() }))
@@ -1794,6 +1796,27 @@ async fn m_action(State(rs): State<RState>, Path((m, name, act)): Path<(String, 
     }
     let allowed = rs.remote.config().allow_control;
     server::m_action(State(rs.app), Path((m, name, act)), allowed).await.into_response()
+}
+
+/// Change settings from the web dashboard: needs remote control to be on.
+async fn m_settings_put(State(rs): State<RState>, Path(m): Path<String>, body: Bytes) -> Response {
+    let allowed = rs.remote.config().allow_control;
+    if allowed && server::is_local(&m) {
+        println!("{} remote: settings {}", paths::iso(now_ms()), String::from_utf8_lossy(&body));
+    }
+    server::m_settings_put(State(rs.app), Path(m), body, allowed).await.into_response()
+}
+
+/// Change settings from a paired Mac: needs its `control` grant.
+async fn peer_settings_put(State(rs): State<RState>, body: Bytes) -> Result<Json<Value>, ApiErr> {
+    let (peer, grants) = link_grants(&rs).ok_or_else(|| ApiErr::new(403, "not paired"))?;
+    if !grants.control {
+        return Err(ApiErr::new(403, format!("{} doesn't let this Mac change its settings (give it the control permission there)", hostname())));
+    }
+    let patch: Value = serde_json::from_slice(&body).map_err(|_| ApiErr::new(400, "invalid JSON body"))?;
+    let v = super::terminal::set_shared(&patch).map_err(|e| ApiErr::new(400, e))?;
+    rs.remote.audit(json!({ "event": "settings", "peer": peer, "settings": patch }));
+    Ok(Json(v))
 }
 
 type Q = Query<HashMap<String, String>>;

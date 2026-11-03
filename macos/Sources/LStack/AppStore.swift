@@ -235,7 +235,7 @@ final class AppStore {
         switch event {
         case "snapshot":
             guard let snap = try? dec.decode(Snapshot.self, from: data) else { return }
-            services = snap.services.sorted { $0.name < $1.name }
+            services = snap.services.sorted(by: ServiceState.inTreeOrder)
             configErrors = snap.configErrors
             if let m = snap.machine { localName = m }
             for s in services where s.isRunning { Task { await loadHistory(s) } }
@@ -252,7 +252,7 @@ final class AppStore {
         case "machines":
             guard let e = try? dec.decode(MachinesEvent.self, from: data) else { return }
             localName = e.local
-            machines = e.machines.map { var m = $0; m.services = m.services?.sorted { $0.name < $1.name }; return m }
+            machines = e.machines.map { var m = $0; m.services = m.services?.sorted(by: ServiceState.inTreeOrder); return m }
         case "peer":
             guard let e = try? dec.decode(PeerEvent.self, from: data) else { return }
             handlePeer(e.machine, e.event, e.data.data)
@@ -289,7 +289,7 @@ final class AppStore {
                 services[i] = next
             } else {
                 services.append(s)
-                services.sort { $0.name < $1.name }
+                services.sort(by: ServiceState.inTreeOrder)
             }
         case "removed":
             guard let e = try? dec.decode(NameEvent.self, from: data) else { return }
@@ -331,7 +331,7 @@ final class AppStore {
         switch event {
         case "snapshot":
             guard let snap = try? dec.decode(Snapshot.self, from: data) else { return }
-            machines[i].services = snap.services.sorted { $0.name < $1.name }
+            machines[i].services = snap.services.sorted(by: ServiceState.inTreeOrder)
             machines[i].configErrors = snap.configErrors
         case "service":
             guard var s = try? dec.decode(ServiceState.self, from: data) else { return }
@@ -341,7 +341,7 @@ final class AppStore {
                 list[j] = s
             } else {
                 list.append(s)
-                list.sort { $0.name < $1.name }
+                list.sort(by: ServiceState.inTreeOrder)
             }
             machines[i].services = list
         case "removed":
@@ -992,6 +992,22 @@ final class AppStore {
             let data = try await sendJSON("PUT", "/api/settings", patch)
             settings = try? JSONDecoder().decode(DaemonSettings.self, from: data)
             if settings == nil { await refreshSettings() }
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    /// Whether a machine lists its Docker engine's containers (nil if it can't be read). `machine` is the
+    /// paired Mac's name; this Mac is reached through the same route.
+    func dockerContainers(on machine: String) async -> Bool? {
+        guard let client else { return nil }
+        struct Shared: Decodable { let dockerContainers: Bool? }
+        return (try? await client.send("GET", "/api/machines/\(machine.urlPath)/settings", as: Shared.self))?.dockerContainers
+    }
+
+    /// Turn the Docker container listing on or off on a paired Mac (it must allow control).
+    func setDockerContainers(on machine: String, _ on: Bool) async -> String? {
+        do {
+            _ = try await sendJSON("PUT", "/api/machines/\(machine.urlPath)/settings", ["dockerContainers": on])
             return nil
         } catch { return error.localizedDescription }
     }

@@ -444,6 +444,8 @@ source: [~/.zshrc, .env] # sourced first (default: your shell rc); [] = none
 envFiles: [.env]         # op run-compatible: plain values at each start, op:// via `lstack secret import`
 secrets: [GITHUB_TOKEN]  # from the secret store
 autostart: true          # start at login / daemon boot
+startDelay: 30           # optional: seconds to wait before that automatic start
+waitForDocker: true      # optional: don't start until the Docker engine is up
 restart: on-failure      # always | on-failure | never
 maxRestarts: 10
 healthcheck: { type: http, url: http://localhost:3000/health, interval: 10 }
@@ -456,6 +458,12 @@ image: postgres:16       # or `container: existing-name` to manage an existing c
 ports: ["5432:5432"]
 volumes: ["pgdata:/var/lib/postgresql/data"]
 env: { POSTGRES_PASSWORD: dev }
+autostart: true
+```
+
+```yaml
+name: docker             # the Docker engine itself: Docker Desktop, OrbStack…
+command: open -W /Applications/Docker.app   # its containers are listed under it (Settings → Monitoring)
 autostart: true
 ```
 
@@ -474,7 +482,10 @@ autostart: true
 - Quitting the menu bar app leaves the daemon running by default. Turn on **Settings → Stop everything when I quit** to run `lstack daemon stop` on quit, which also ends forwards and the link to other Macs. Containers keep running.
 - At login, the daemon waits up to 10 minutes for Docker Desktop before it starts container services.
 - **Docker sync.** `lstack docker sync on` checks `docker ps -a` every 5 s: containers (and compose projects, one service each) that appear are registered, and services registered this way (`discovered: true`) are removed once their container is gone for two checks in a row. Services you added yourself are never removed. Nothing is dropped while the Docker engine is unreachable. While sync is on, a service you `rm` for a container that still exists is registered again, so use `lstack docker sync off` first.
+- **Docker engine and its containers.** Add Docker Desktop, OrbStack or Colima as a script (drop the app on Add Service, or use the Script or App type; the service is the engine when its name or command mentions it). While **Settings → Monitoring → Show Docker containers** is on (the default), every running container is listed as a child under it, indented, and works like a `type: docker` service: start, stop, restart, logs, CPU and memory, URLs, `lstack exec`. LStack notices containers as they start, keeps them listed (stopped) when they stop, and drops them when they are removed. Containers another service already manages (a Docker service, or a compose project) aren't listed twice. They aren't saved to disk or editable, and are named `<engine>.<container>` (for example `docker.postgres`). `lstack start|stop|restart all` leaves them alone. The setting lives in `settings.json` (`dockerContainers`), and is also at `lstack docker containers [on|off]`. A paired Mac with the control permission, or the web dashboard with remote control on, can change it on this one: `lstack docker containers off -m <machine>`, the switch next to each machine in Settings → Machines, or the Docker containers box on a machine's overview in the web dashboard.
 - **Machine load.** The top of the menu bar panel shows whole-Mac CPU and memory with ~15 minutes of sparkline history. Each is split into **LStack** (your services) and **Other** (every other app), so you can tell when the machine itself is overloaded. The same data is at `GET /api/system`. Machine CPU is a share of all cores, while per-service CPU is a share of one core, as in Activity Monitor.
+- **Start delay.** `startDelay: <seconds>` (Start delay in the editor, `lstack add --start-delay`) holds back a service's automatic start at login or daemon boot, for example so Docker is up before the scripts that need it. It is off by default. While it waits the menu bar shows **START IN Ns** with a stop button, and `lstack ls` and `lstack top` show `starts in Ns`. Starting the service yourself skips the wait and stopping it cancels the start. Crash-loop restarts, and scripts that come back after a daemon restart, aren't delayed.
+- **Wait for Docker.** `waitForDocker: true` (Wait for Docker in the editor, `lstack add --wait-for-docker`) keeps a script from starting until the Docker engine answers, whenever it starts: at login, after a crash, or when you start it. Until then it shows as starting, with "waiting for the Docker engine to start…" in its log, and Stop cancels the wait. After 10 minutes it gives up and the restart policy applies. Docker and compose services already wait this way. It runs after any start delay.
 - **Crash loops.** Crashed scripts restart with exponential backoff (1 s → 30 s, up to `maxRestarts`). While a script waits to restart, the menu bar shows **RESTART IN Ns** with a red stop button. `lstack ls` and `lstack top` show `restarting Ns`. Stopping it cancels the pending restart, and stop waits for a start that's already in progress.
 - **Terminal app.** Dashboard, Attach and Shell open in the app chosen under **Settings → Terminal app** (or `lstack terminal <id>`): Terminal, iTerm, cmux or Ghostty. macOS asks once to allow LStack to control iTerm or Terminal.
 - **cmux.** By default, cmux only accepts commands from processes started inside cmux, so the daemon gets "Access denied". When that happens, the menu bar offers **Allow LStack** or **Use Terminal**. You'll find the same switch under **Settings → cmux access**, and in the CLI as `lstack terminal cmux --fix`. Allowing it backs up `~/.config/cmux/cmux.json`, switches `automation.socketControlMode` to `password` with a random password kept in LStack's secret store, and reloads cmux. You can change or undo this anytime in cmux's settings.

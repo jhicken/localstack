@@ -30,6 +30,7 @@ fn help() -> String {
   lstack docker import <name…>   manage specific existing containers / compose projects
   lstack docker sync [on|off|status]   register every container now (and drop ones that are gone);
                                  `on` keeps doing it automatically
+  lstack docker containers [on|off] [-m <machine>]   list the Docker engine's containers under the Docker service
   lstack setup [--cli] [--login] [--app <path>]   install the CLI + start at login
   lstack setup status|repair [--keep-daemon]|uninstall
   lstack remote [on|off|passwd|share|status]   web dashboard for other machines (see below)
@@ -65,6 +66,8 @@ fn help() -> String {
   -c, --cwd <dir>        working directory (process)
   -e, --env KEY=VALUE    environment variable (repeatable)
   -a, --autostart        start at login / daemon boot
+      --start-delay <s>  wait this many seconds before that automatic start
+      --wait-for-docker  don't start until the Docker engine is up (scripts)
   -r, --restart always|on-failure|never   (default: on-failure)
   -d, --description <text>
       --image <image>    docker: image to run      --container <name>  docker: existing container
@@ -311,6 +314,9 @@ fn cmd_list(args: &[String]) -> R {
             m["error"].as_str().map(String::from),
         ));
     }
+    for g in &mut groups {
+        g.1.sort_by(ServiceState::tree_cmp);
+    }
     if let Some(want) = a.get("machine") {
         groups.retain(|g| g.0 == want);
         if groups.is_empty() {
@@ -351,9 +357,9 @@ fn print_services(services: &[ServiceState], local: bool) {
             .iter()
             .map(|s| {
                 let mut row = vec![
-                    format!("{} {}", c::status_dot(&s.status), c::bold(&s.name)),
+                    format!("{}{} {}", if s.parent.is_some() { "  " } else { "" }, c::status_dot(&s.status), c::bold(&s.name)),
                     c::dim(&s.kind),
-                    if s.restart_at.is_some() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) },
+                    if s.counting_down() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) },
                     c::health_label(&s.health),
                     c::pct(s.metrics.as_ref().map(|m| m.cpu)),
                     c::bytes(s.metrics.as_ref().map(|m| m.mem)),
@@ -391,9 +397,11 @@ fn cmd_show(args: &[String]) -> R {
     let cl = client::connect(true)?;
     let s = cl.get(&name)?;
     let m = cl.metrics(&name, "1h", 60).unwrap_or_default();
-    println!("{} {} {}  {}  {}", c::status_dot(&s.status), c::bold(&s.name), c::dim(&format!("({})", s.kind)), if s.restart_at.is_some() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) }, c::health_label(&s.health));
+    println!("{} {} {}  {}  {}", c::status_dot(&s.status), c::bold(&s.name), c::dim(&format!("({})", s.kind)), if s.counting_down() { c::yellow(&s.status_label()) } else { c::status_color(&s.status, &s.status) }, c::health_label(&s.health));
     if s.restart_at.is_some() {
         println!("{}", c::dim(&format!("crash loop: `lstack stop {}` cancels the pending restart", s.name)));
+    } else if s.start_at.is_some() {
+        println!("{}", c::dim(&format!("start delay: `lstack start {0}` starts it now, `lstack stop {0}` cancels", s.name)));
     }
     if let Some(d) = &s.description {
         println!("{}", c::dim(d));
@@ -411,6 +419,8 @@ fn cmd_show(args: &[String]) -> R {
         ("uptime", uptime(&s)),
         ("restarts", s.restarts.to_string()),
         ("autostart", if s.autostart { "yes" } else { "no" }.into()),
+        ("wait for docker", if s.config.wait_for_docker == Some(true) { "yes" } else { "no" }.into()),
+        ("start delay", match s.config.start_delay { Some(d) if d > 0 => format!("{d}s"), _ => "off".into() }),
         ("cpu", c::pct(met.map(|m| m.cpu))),
         ("memory", c::bytes(met.map(|m| m.mem))),
         ("network", format!("↓ {}  ↑ {}", c::rate(met.and_then(|m| m.net_rx)), c::rate(met.and_then(|m| m.net_tx)))),
@@ -474,6 +484,8 @@ fn cmd_add(args: &[String]) -> R {
             ("cwd", "c", true),
             ("env", "e", true),
             ("autostart", "a", false),
+            ("start-delay", "", true),
+            ("wait-for-docker", "", false),
             ("restart", "r", true),
             ("description", "d", true),
             ("image", "", true),
@@ -509,6 +521,11 @@ fn cmd_add(args: &[String]) -> R {
             kind: kind.clone(),
             description: a.get("description").map(String::from),
             autostart: Some(a.has("autostart")),
+            start_delay: match a.get("start-delay") {
+                Some(d) => Some(d.parse().map_err(|_| format!("--start-delay must be a whole number of seconds, got {d:?}"))?),
+                None => None,
+            },
+            wait_for_docker: a.has("wait-for-docker").then_some(true),
             restart: a.get("restart").map(String::from),
             command: if cmd.is_empty() { None } else { Some(cmdline::join_argv(cmd)) },
             cwd: match a.get("cwd") {
@@ -767,7 +784,8 @@ fn targets(cl: &Client, names: &[String]) -> Result<Vec<String>, String> {
         return Err("missing service name (or `all`)".into());
     }
     if names.iter().any(|n| n == "all") {
-        return Ok(cl.list()?.services.into_iter().map(|s| s.name).collect());
+        // Containers discovered under the Docker engine are left alone: `all` is the services you defined.
+        return Ok(cl.list()?.services.into_iter().filter(|s| s.parent.is_none()).map(|s| s.name).collect());
     }
     Ok(names.to_vec())
 }
@@ -982,7 +1000,27 @@ fn cmd_docker(args: &[String]) -> R {
             }
             Ok(())
         }
-        _ => Err("usage: lstack docker ls | import <name…> | sync [on|off|status]".into()),
+        "containers" => {
+            let a = Args::parse(rest, &[("machine", "m", true)])?;
+            let on = match a.pos.first().map(String::as_str) {
+                None | Some("status") => None,
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                Some(_) => return Err("usage: lstack docker containers [on|off|status] [-m <machine>]".into()),
+            };
+            let machine = match a.get("machine") {
+                Some(m) => m.to_string(),
+                None => cl.req::<serde_json::Value>("GET", "/api/machines", None)?["local"]["name"].as_str().unwrap_or_default().to_string(),
+            };
+            let path = format!("/api/machines/{}/settings", crate::daemon::docker_api::enc(&machine));
+            let v: serde_json::Value = match on {
+                Some(on) => cl.req("PUT", &path, Some(serde_json::json!({ "dockerContainers": on })))?,
+                None => cl.req("GET", &path, None)?,
+            };
+            println!("docker containers on {machine}: {}", if v["dockerContainers"].as_bool() == Some(true) { c::green("shown") } else { c::dim("hidden") });
+            Ok(())
+        }
+        _ => Err("usage: lstack docker ls | import <name…> | sync [on|off|status] | containers [on|off|status]".into()),
     }
 }
 

@@ -30,7 +30,7 @@ pub fn socket_path() -> Option<PathBuf> {
         return h.strip_prefix("unix://").map(PathBuf::from);
     }
     let home = crate::paths::user_home();
-    let mut candidates = vec![home.join(".docker/run/docker.sock"), PathBuf::from("/var/run/docker.sock")];
+    let mut candidates = vec![home.join(".docker/run/docker.sock"), home.join(".orbstack/run/docker.sock"), PathBuf::from("/var/run/docker.sock")];
     if let Some(c) = context_socket() {
         candidates.insert(0, c);
     }
@@ -190,6 +190,14 @@ pub async fn inspect(name: &str) -> Result<Option<Value>, String> {
 pub async fn compose_containers() -> Result<Vec<Value>, String> {
     let filters = enc(r#"{"label":["com.docker.compose.project"]}"#);
     match call("GET", &format!("/containers/json?all=1&filters={filters}"), None, 15).await? {
+        (200, Value::Array(a)) => Ok(a),
+        (s, v) => Err(api_error(s, &v)),
+    }
+}
+
+/// Every container on the engine, running or not.
+pub async fn all_containers() -> Result<Vec<Value>, String> {
+    match call("GET", "/containers/json?all=1", None, 15).await? {
         (200, Value::Array(a)) => Ok(a),
         (s, v) => Err(api_error(s, &v)),
     }

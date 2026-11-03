@@ -47,6 +47,10 @@ struct ServiceConfig: Codable, Hashable {
     var autostart: Bool?
     var restart: String?
     var maxRestarts: Int?
+    /// Seconds to wait before the automatic start at login (nil = no delay).
+    var startDelay: Int?
+    /// Script services: don't start until the Docker engine is up.
+    var waitForDocker: Bool?
     var command: String?
     var cwd: String?
     var env: [String: String]?
@@ -481,6 +485,8 @@ struct ServiceState: Codable, Identifiable, Hashable {
     let restarts: Int
     /// Set while a crash-loop restart is pending (ms since epoch).
     let restartAt: Double?
+    /// Set while a delayed automatic start is waiting (ms since epoch).
+    var startAt: Double? = nil
     let lastError: String?
     var metrics: MetricSample?
     let urls: [ServiceURL]?
@@ -496,6 +502,24 @@ struct ServiceState: Codable, Identifiable, Hashable {
     var envFileKeys: [String]? = nil
     /// A Touch ID approval its secrets are waiting on.
     var approval: Approval? = nil
+    /// The Docker engine service this container was discovered under (not saved; it follows the container).
+    var parent: String? = nil
+    /// This service is the Docker engine: its containers are listed under it.
+    var containerHost: Bool? = nil
+
+    var isDiscovered: Bool { parent != nil }
+    /// "docker.web" under "docker" reads as "web".
+    var shortName: String {
+        guard let p = parent, name.hasPrefix(p + ".") else { return name }
+        return String(name.dropFirst(p.count + 1))
+    }
+    /// List order: by name, with discovered containers right after their engine.
+    static func inTreeOrder(_ a: ServiceState, _ b: ServiceState) -> Bool {
+        let (ra, rb) = (a.parent ?? a.name, b.parent ?? b.name)
+        if ra != rb { return ra < rb }
+        if a.isDiscovered != b.isDiscovered { return !a.isDiscovered }
+        return a.name < b.name
+    }
 
     /// Addresses that can be opened from here: a paired Mac's services only through their encrypted forwards.
     var links: [ServiceURL] { (urls ?? []).filter { $0.blocked != "untunneled" } }
@@ -511,7 +535,14 @@ struct ServiceState: Codable, Identifiable, Hashable {
     /// Crashed and waiting to be restarted; Stop cancels the pending restart.
     var isRestarting: Bool { restartAt != nil }
     /// Whether Stop applies (running, starting/stopping, or between crash-loop attempts).
-    var isStoppable: Bool { isRunning || isTransitioning || isRestarting }
+    var isStoppable: Bool { isRunning || isTransitioning || isRestarting || isStartPending }
+    /// Waiting out its start delay; Stop cancels the start.
+    var isStartPending: Bool { startAt != nil }
+
+    func startsIn(now: Date = Date()) -> Int {
+        guard let s = startAt else { return 0 }
+        return max(0, Int(ceil((s / 1000) - now.timeIntervalSince1970)))
+    }
 
     func restartsIn(now: Date = Date()) -> Int {
         guard let r = restartAt else { return 0 }
@@ -526,7 +557,7 @@ struct ServiceState: Codable, Identifiable, Hashable {
     var summary: String {
         switch type {
         case "process": return config.command ?? ""
-        case "docker": return config.image ?? config.container ?? ""
+        case "docker": return config.image ?? (isDiscovered ? description : nil) ?? config.container ?? ""
         case "compose": return (config.composeFile as NSString?)?.abbreviatingWithTildeInPath ?? ""
         default: return ""
         }
@@ -683,6 +714,8 @@ struct DaemonSettings: Decodable, Equatable {
     var healthchecks: HealthchecksStatus?
     var processes: ProcessThresholds?
     var onepassword: OnePasswordSettings?
+    /// List the Docker engine's containers under the Docker service (nil from daemons that predate it).
+    var dockerContainers: Bool?
 }
 
 struct CmuxStatus: Decodable, Equatable {

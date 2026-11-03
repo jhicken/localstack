@@ -127,11 +127,16 @@ pub struct Managed {
     pub logs: Arc<LogStore>,
     pub rt: Rt,
     pub gen: u64,
-    want_running: bool,
+    /// The Docker engine service this container was discovered under (not saved to disk).
+    pub parent: Option<String>,
+    pub(super) want_running: bool,
     restarts: u32,
     restart_task: Option<AbortHandle>,
     /// When the pending crash-loop restart fires (ms), while one is scheduled.
     restart_at: Option<i64>,
+    /// A delayed automatic start waiting to fire, and when (ms).
+    start_task: Option<AbortHandle>,
+    start_at: Option<i64>,
     health: &'static str,
     health_task: Option<AbortHandle>,
     metrics: Option<MetricSample>,
@@ -181,6 +186,7 @@ impl Managed {
             exit_code: self.rt.exit_code,
             restarts: self.restarts,
             restart_at: self.restart_at,
+            start_at: self.start_at,
             last_error: self.rt.last_error.clone().map(crate::scrub::scrub_string),
             metrics: self.metrics,
             urls: if self.rt.status == "running" { self.urls.clone() } else { vec![] },
@@ -190,16 +196,23 @@ impl Managed {
             env_stale: if self.rt.status == "running" { self.env_stale.clone() } else { None },
             env_file_keys: self.env_file_keys.clone(),
             approval: super::approvals::pending_for(&self.cfg.name),
+            parent: self.parent.clone(),
+            container_host: self.cfg.is_docker_engine(),
             config: self.pending.clone().unwrap_or_else(|| self.cfg.clone()),
         }
     }
+    /// Cancel a pending crash-loop restart or delayed start.
     fn cancel_restart(&mut self) {
         self.restart_at = None;
+        self.start_at = None;
         if let Some(h) = self.restart_task.take() {
             h.abort();
         }
+        if let Some(h) = self.start_task.take() {
+            h.abort();
+        }
     }
-    fn abort_tasks(&mut self) {
+    pub(super) fn abort_tasks(&mut self) {
         self.cancel_restart();
         if let Some(h) = self.health_task.take() {
             h.abort();
@@ -353,14 +366,19 @@ impl Sup {
         }
         while set.join_next().await.is_some() {}
         let resume = take_resume();
-        let auto: Vec<String> = self
+        // Scripts that were running before a daemon restart come straight back; the rest wait out their start delay.
+        let auto: Vec<(String, u64)> = self
             .lock()
             .services
             .values()
             .filter(|m| (m.cfg.autostart() || (m.cfg.kind == "process" && resume.contains(&m.cfg.name))) && m.rt.status != "running")
-            .map(|m| m.cfg.name.clone())
+            .map(|m| (m.cfg.name.clone(), if resume.contains(&m.cfg.name) { 0 } else { m.cfg.start_delay_secs() }))
             .collect();
-        for name in auto {
+        for (name, delay) in auto {
+            if delay > 0 {
+                self.start_after_delay(&name, delay);
+                continue;
+            }
             let sup = self.clone();
             tokio::spawn(async move {
                 let _ = sup.start(&name).await;
@@ -376,6 +394,7 @@ impl Sup {
         self.every(30_000, |s| async move { s.sample_network().await });
         self.every(4_000, |s| async move { s.refresh_external().await });
         self.every(5_000, |s| async move { s.sample_ports().await });
+        self.every(3_000, |s| async move { s.sync_containers().await });
         self.every(3_600_000, |s| async move { s.store.prune(now_ms()) });
     }
 
@@ -429,6 +448,33 @@ impl Sup {
         self.write_state();
     }
 
+    /// Start `name` once its start delay is over. Starting or stopping it meanwhile cancels the wait.
+    pub(super) fn start_after_delay(self: &Arc<Self>, name: &str, secs: u64) {
+        self.with(name, None, |m| {
+            m.cancel_restart();
+            m.want_running = true;
+            m.start_at = Some(now_ms() + secs as i64 * 1000);
+            m.sys(&format!("start delay: starting in {secs}s"));
+            let (sup, n) = (self.clone(), name.to_string());
+            let h = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                let go = sup.with(&n, None, |m| {
+                    m.start_task = None;
+                    m.start_at = None;
+                    sup.changed(m);
+                    m.want_running && !m.rt.live()
+                });
+                if go == Some(true) {
+                    if let Ok(_g) = sup.try_busy(&n) {
+                        sup.do_start(&n).await;
+                    }
+                }
+            });
+            m.start_task = Some(h.abort_handle());
+            self.changed(m);
+        });
+    }
+
     /// Re-read the config folder and reconcile.
     pub fn reload(self: &Arc<Self>) -> ReloadResult {
         let (services, errors) = config::load_services();
@@ -439,6 +485,12 @@ impl Sup {
             g.config_errors = errors;
             for cfg in services {
                 seen.insert(cfg.name.clone());
+                if g.services.get(&cfg.name).is_some_and(|m| m.parent.is_some()) {
+                    // A saved service takes over the name of a discovered container.
+                    if let Some(mut c) = g.services.remove(&cfg.name) {
+                        self.discard(&mut c);
+                    }
+                }
                 match g.services.get_mut(&cfg.name) {
                     None => {
                         res.added.push(cfg.name.clone());
@@ -453,7 +505,7 @@ impl Sup {
                     _ => {}
                 }
             }
-            res.removed = g.services.keys().filter(|n| !seen.contains(*n)).cloned().collect();
+            res.removed = g.services.values().filter(|m| m.parent.is_none() && !seen.contains(&m.cfg.name)).map(|m| m.cfg.name.clone()).collect();
         }
         for name in res.removed.clone() {
             let sup = self.clone();
@@ -499,6 +551,9 @@ impl Sup {
     pub fn update(self: &Arc<Self>, name: &str, patch: &serde_json::Value) -> R<ServiceState> {
         let mut g = self.lock();
         let m = g.services.get_mut(name).ok_or_else(|| SupErr::new(404, format!("no such service \"{name}\"")))?;
+        if let Some(p) = &m.parent {
+            return Err(SupErr::new(400, format!("{name} is discovered from {p}; its settings can't be edited")));
+        }
         let base = m.pending.clone().unwrap_or_else(|| m.cfg.clone());
         let cfg = config::merge_patch(&base, patch).map_err(|e| SupErr::new(400, e))?;
         config::save_service(&cfg).map_err(|e| SupErr::new(400, e))?;
@@ -508,10 +563,15 @@ impl Sup {
 
     /// Remove a service; with `keep`, leave its container(s) running (docker/compose only).
     pub async fn destroy(self: &Arc<Self>, name: &str, keep: bool) -> R<()> {
-        self.get(name, |_| ())?;
+        if let Some(p) = self.get(name, |m| m.parent.clone())? {
+            return Err(SupErr::new(400, format!("{name} is discovered from {p}; it goes away when the container is removed")));
+        }
         self.remove(name, keep).await;
         config::delete_service(name);
         self.store.forget(name);
+        for child in self.children_of(name) {
+            self.drop_child(&child);
+        }
         Ok(())
     }
 
@@ -534,12 +594,15 @@ impl Sup {
     pub async fn stop(self: &Arc<Self>, name: &str) -> R<ServiceState> {
         let was_restarting = self.get(name, |m| {
             m.want_running = false;
-            let r = m.restart_at.is_some();
+            let (restarting, delayed) = (m.restart_at.is_some(), m.start_at.is_some());
             m.cancel_restart();
-            if r {
+            if restarting {
                 m.sys("crash-loop restart cancelled");
             }
-            r
+            if delayed {
+                m.sys("delayed start cancelled");
+            }
+            restarting || delayed
         })?;
         {
             // A start may be in flight (e.g. a crash-loop restart); wait for it rather than refusing.
@@ -579,7 +642,9 @@ impl Sup {
     // ------------------------------------------------------------ queries
 
     pub fn list(&self) -> Vec<ServiceState> {
-        self.lock().services.values().map(|m| m.state()).collect()
+        let mut l: Vec<ServiceState> = self.lock().services.values().map(|m| m.state()).collect();
+        l.sort_by(ServiceState::tree_cmp);
+        l
     }
     pub fn config_errors(&self) -> Vec<String> {
         self.lock().config_errors.clone()
@@ -588,11 +653,11 @@ impl Sup {
         self.get(name, |m| m.state())
     }
     pub fn configs(&self) -> Vec<ServiceConfig> {
-        self.lock().services.values().map(|m| m.cfg.clone()).collect()
+        self.lock().services.values().filter(|m| m.parent.is_none()).map(|m| m.cfg.clone()).collect()
     }
     /// Configs including changes queued until the next restart (what the service will run with).
     pub fn effective_configs(&self) -> Vec<ServiceConfig> {
-        self.lock().services.values().map(|m| m.pending.clone().unwrap_or_else(|| m.cfg.clone())).collect()
+        self.lock().services.values().filter(|m| m.parent.is_none()).map(|m| m.pending.clone().unwrap_or_else(|| m.cfg.clone())).collect()
     }
 
     /// Mask a newly added secret in logs already written (memory + files, including the daemon log).
@@ -617,7 +682,7 @@ impl Sup {
 
     // ------------------------------------------------------------ internals
 
-    fn make(&self, cfg: ServiceConfig) -> Managed {
+    pub(super) fn make(&self, cfg: ServiceConfig) -> Managed {
         Managed {
             logs: Arc::new(LogStore::new(&cfg.name)),
             health: if cfg.healthcheck.is_some() { "unknown" } else { "none" },
@@ -625,10 +690,13 @@ impl Sup {
             pending: None,
             rt: Rt::default(),
             gen: NEXT_GEN.fetch_add(1, Ordering::Relaxed),
+            parent: None,
             want_running: false,
             restarts: 0,
             restart_task: None,
             restart_at: None,
+            start_task: None,
+            start_at: None,
             health_task: None,
             metrics: None,
             net: None,
@@ -646,9 +714,11 @@ impl Sup {
     /// Apply a new config now if stopped; otherwise queue it until the next stop/restart.
     fn apply_config(self: &Arc<Self>, m: &mut Managed, cfg: ServiceConfig) {
         let live = m.rt.live();
-        let strip = |c: &ServiceConfig| ServiceConfig { autostart: None, description: None, tags: None, healthcheck: None, ..c.clone() };
+        let strip = |c: &ServiceConfig| ServiceConfig { autostart: None, start_delay: None, wait_for_docker: None, description: None, tags: None, healthcheck: None, ..c.clone() };
         if live && strip(&m.cfg) != strip(&cfg) {
             m.cfg.autostart = cfg.autostart;
+            m.cfg.start_delay = cfg.start_delay;
+            m.cfg.wait_for_docker = cfg.wait_for_docker;
             m.cfg.description = cfg.description.clone();
             m.cfg.tags = cfg.tags.clone();
             m.pending = Some(cfg);
@@ -671,6 +741,84 @@ impl Sup {
         }
         self.schedule_health_m(m, None);
         self.changed(m);
+    }
+
+    /// Stop tracking a service without touching its workload.
+    fn discard(&self, m: &mut Managed) {
+        m.abort_tasks();
+        m.rt.dispose();
+        m.logs.close();
+        for id in &m.rt.ids {
+            self.docker_prev.lock().unwrap().remove(id);
+        }
+    }
+
+    // ------------------------------------------------------------ discovered containers
+
+    pub(super) fn children_of(&self, parent: &str) -> Vec<String> {
+        self.lock().services.values().filter(|m| m.parent.as_deref() == Some(parent)).map(|m| m.cfg.name.clone()).collect()
+    }
+
+    /// Track a discovered container under `parent`. Returns its runner generation, or None if the name is taken.
+    pub(super) fn add_child(&self, cfg: ServiceConfig, parent: &str) -> Option<u64> {
+        let mut g = self.lock();
+        if g.services.contains_key(&cfg.name) {
+            return None;
+        }
+        let mut m = self.make(cfg);
+        m.parent = Some(parent.to_string());
+        let gen = m.gen;
+        self.changed(&m);
+        g.services.insert(m.cfg.name.clone(), m);
+        Some(gen)
+    }
+
+    /// Forget a discovered container (it was removed, or is managed some other way now). The container itself
+    /// is left alone. False if the service is busy or isn't a discovered one.
+    pub(super) fn drop_child(&self, name: &str) -> bool {
+        let mut g = self.lock();
+        if g.busy.contains(name) || g.services.get(name).is_none_or(|m| m.parent.is_none()) {
+            return false;
+        }
+        let Some(mut m) = g.services.remove(name) else { return false };
+        self.discard(&mut m);
+        drop(g);
+        m.logs.delete_files();
+        self.store.forget(name);
+        let _ = self.events.send(Event::Removed(name.to_string()));
+        true
+    }
+
+    /// The service that lists the Docker engine's containers, the discovered ones so far, and what other
+    /// services already manage (container names and ids), so those aren't listed twice.
+    pub(super) fn container_snapshot(&self) -> Option<super::containers::Snapshot> {
+        let on = super::terminal::load().docker_containers;
+        let g = self.lock();
+        let parent = g.services.values().find(|m| on && m.parent.is_none() && m.cfg.is_docker_engine()).map(|m| m.cfg.name.clone());
+        let mut snap = super::containers::Snapshot { parent, ..Default::default() };
+        for m in g.services.values() {
+            if m.parent.is_some() {
+                snap.children.push(super::containers::Child { name: m.cfg.name.clone(), running: m.rt.status == "running", ids: m.rt.ids.clone() });
+                continue;
+            }
+            snap.taken.insert(m.cfg.name.clone());
+            if m.cfg.kind == "docker" {
+                snap.owned_names.insert(m.cfg.container_name());
+            }
+            snap.owned_ids.extend(m.rt.ids.iter().cloned());
+            if m.cfg.kind == "compose" {
+                snap.owned_projects.extend(m.cfg.project.clone());
+                if let Some(f) = m.cfg.compose_file.as_deref().map(paths::expand_home) {
+                    snap.owned_files.extend(std::fs::canonicalize(&f).map(|p| p.to_string_lossy().into_owned()));
+                    snap.owned_files.insert(f);
+                }
+            }
+        }
+        Some(snap)
+    }
+
+    pub(super) fn mark_wanted(&self, name: &str, gen: u64) {
+        self.with(name, Some(gen), |m| m.want_running = true);
     }
 
     async fn remove(self: &Arc<Self>, name: &str, keep: bool) {
@@ -707,7 +855,11 @@ impl Sup {
             return;
         };
         let res = match kind.as_str() {
-            "process" => self.process_start(name, gen).await,
+            "process" => match self.docker_gate(name, gen).await {
+                Ok(true) => self.process_start(name, gen).await,
+                Ok(false) => return,
+                Err(e) => Err(e),
+            },
             "docker" => self.docker_start(name, gen).await,
             "compose" => self.compose_start(name, gen).await,
             _ => self.fail(name, gen, "Kubernetes services are not supported yet (planned for Phase 3)"),

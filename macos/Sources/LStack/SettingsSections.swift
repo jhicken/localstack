@@ -733,6 +733,7 @@ struct MachinesSettings: View {
                 }
                 .controlSize(.small)
             }
+            if m.online { RemoteDockerToggle(machine: m, error: $error) }
             if !m.needsRepair, store.settings?.onepassword?.pushToPeers ?? true {
                 Button("Push Secrets…") { pushTo = PushTarget(id: "machine:\(m.name)", name: m.name) }
                     .controlSize(.small)
@@ -945,6 +946,32 @@ struct MachinesSettings: View {
     }
 }
 
+/// Switch for a paired Mac's "Show Docker containers" setting: anyone watching can read it; changing it
+/// needs the control permission there.
+private struct RemoteDockerToggle: View {
+    @Environment(AppStore.self) private var store
+    let machine: Machine
+    @Binding var error: String?
+    @State private var on: Bool?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "shippingbox.fill").font(.system(size: 10)).foregroundStyle(.blue)
+            Toggle("", isOn: Binding(get: { on ?? true }, set: { v in
+                let old = on
+                on = v
+                Task {
+                    if let e = await store.setDockerContainers(on: machine.name, v) { on = old; error = e }
+                }
+            }))
+            .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            .disabled(on == nil || !machine.canControl)
+        }
+        .help(machine.canControl ? "Show Docker containers on \(machine.name)" : "\(machine.name) doesn't let this Mac change its settings (turn on control there)")
+        .task(id: machine.status) { on = await store.dockerContainers(on: machine.name) }
+    }
+}
+
 // MARK: - Monitoring (heartbeats + busy processes)
 
 struct MonitoringSettings: View {
@@ -985,6 +1012,16 @@ struct MonitoringSettings: View {
                 Divider().padding(.leading, 52)
                 thresholds.padding(.leading, 52).padding(.trailing, 12).padding(.vertical, 10)
                     .disabled(!procEnabled)
+            }
+            SettingsCard {
+                SetupRow(icon: "shippingbox.fill", tint: .blue, title: "Show Docker containers",
+                         detail: "Lists them under the Docker service.") {
+                    Toggle("", isOn: Binding(
+                        get: { store.settings?.dockerContainers ?? true },
+                        set: { on in Task { error = await store.updateSettings(["dockerContainers": on]) } }
+                    ))
+                    .toggleStyle(.switch).labelsHidden()
+                }
             }
             if let note { Label(note, systemImage: "checkmark.circle.fill").font(.system(size: 11)).foregroundStyle(.green) }
             ErrorText(text: error)

@@ -22,6 +22,9 @@ pub fn validate(mut c: ServiceConfig) -> Result<ServiceConfig, String> {
     if !TYPES.contains(&c.kind.as_str()) {
         return Err(format!("{}: unknown type \"{}\"", c.name, c.kind));
     }
+    if c.start_delay.is_some_and(|d| d > 86_400) {
+        return Err(format!("{}: startDelay must be at most 86400 seconds", c.name));
+    }
     if let Some(r) = &c.restart {
         if !["always", "on-failure", "never"].contains(&r.as_str()) {
             return Err(format!("{}: restart must be always | on-failure | never", c.name));
@@ -188,6 +191,16 @@ mod tests {
         assert!(parse_yaml("name: a\ncommand: x\nsecrets: [bad-name]\n").is_err());
         assert!(parse_yaml("name: a\ncommand: x\nurls: [localhost:3000]\n").is_err());
         assert!(parse_yaml("name: a\ncommand: x\nheartbeat: {interval: 1}\n").is_err());
+    }
+
+    #[test]
+    fn finds_the_docker_engine_service() {
+        let engine = |y: &str| parse_yaml(y).unwrap().is_docker_engine();
+        assert!(engine("name: docker\ncommand: open -W /Applications/Docker.app\n"));
+        assert!(engine("name: engine\ncommand: \"'/Applications/OrbStack.app/Contents/MacOS/OrbStack'\"\n"));
+        assert!(engine("name: vm\ncommand: colima start -f\n"));
+        assert!(!engine("name: api\ncommand: npm run dev\n"));
+        assert!(!engine("name: docker\ntype: docker\ncontainer: c\n"));
     }
 
     #[test]

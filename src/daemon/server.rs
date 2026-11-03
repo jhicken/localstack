@@ -189,6 +189,7 @@ pub fn router(st: AppState) -> Router {
         .route("/api/machines", get(machines_list).post(machine_add))
         .route("/api/machines/:m", get(machine_get).patch(machine_patch).delete(machine_remove))
         .route("/api/machines/reconnect", post(|State(st): State<AppState>| async move { Json(json!({ "reconnecting": st.peers.reconnect_down() })) }))
+        .route("/api/machines/:m/settings", get(m_settings).put(|st: State<AppState>, p: Path<String>, b: Bytes| async move { m_settings_put(st, p, b, true).await }))
         .route("/api/machines/:m/services/:name", get(m_service))
         .route("/api/machines/:m/services/:name/logs", get(m_logs))
         .route("/api/machines/:m/services/:name/logs/stream", get(m_log_stream))
@@ -862,6 +863,9 @@ async fn settings_update(body: Bytes) -> Res {
         merge(&mut cur, p);
         s.onepassword = serde_json::from_value(cur).map_err(|e| ApiErr(400, format!("onepassword: {e}")))?;
     }
+    if let Some(on) = v.get("dockerContainers").and_then(Value::as_bool) {
+        s.docker_containers = on;
+    }
     if let Some(t) = v.get("terminal").and_then(Value::as_str) {
         if !t.is_empty() && !super::terminal::is_known(t) {
             return Err(ApiErr(400, format!("unknown terminal {t:?} (terminal, iterm, cmux, ghostty)")));
@@ -1013,6 +1017,28 @@ pub(super) async fn m_service(State(st): State<AppState>, Path((m, name)): Path<
     }
     let peers = st.peers.clone();
     Ok(Json(blocking(move || peers.call(&m, "GET", &format!("/services/{}", enc(&name)))).await?))
+}
+
+/// The settings a watcher can see and change on a machine (this one or a paired Mac).
+pub(super) async fn m_settings(State(st): State<AppState>, Path(m): Path<String>) -> Res {
+    if is_local(&m) {
+        return to_json(super::terminal::shared());
+    }
+    let peers = st.peers.clone();
+    Ok(Json(blocking(move || peers.call(&m, "GET", "/settings")).await?))
+}
+
+/// `allowed`: whether *this* daemon lets the caller change settings (the peer also checks its own grant).
+pub(super) async fn m_settings_put(State(st): State<AppState>, Path(m): Path<String>, body: Bytes, allowed: bool) -> Res {
+    if !allowed {
+        return Err(ApiErr(403, "remote control is disabled on this machine".into()));
+    }
+    let v = parse_body(&body)?;
+    if is_local(&m) {
+        return to_json(super::terminal::set_shared(&v).map_err(|e| ApiErr(400, e))?);
+    }
+    let peers = st.peers.clone();
+    Ok(Json(blocking(move || peers.call_json(&m, "PUT", "/settings", &v)).await?))
 }
 
 pub(super) async fn m_logs(State(st): State<AppState>, Path((m, name)): Path<(String, String)>, q: Q) -> Res {
