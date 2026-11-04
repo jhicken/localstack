@@ -206,7 +206,7 @@ struct ServiceRow: View {
                 openWindow(id: "logs", value: service.id)
                 bringToFront()
             }
-            if !service.isRemote {
+            if !service.isRemote, service.type != "machine" {
                 IconButton(icon: "apple.terminal", help: service.type == "process" ? "Attach" : "Shell") {
                     store.openTerminal(service.name)
                 }

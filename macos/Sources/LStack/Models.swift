@@ -511,7 +511,8 @@ struct ServiceState: Codable, Identifiable, Hashable {
     /// "docker.web" under "docker" reads as "web".
     var shortName: String {
         guard let p = parent, name.hasPrefix(p + ".") else { return name }
-        return String(name.dropFirst(p.count + 1))
+        let rest = String(name.dropFirst(p.count + 1))
+        return type == "machine" && rest.hasPrefix("vm.") ? String(rest.dropFirst(3)) : rest
     }
     /// List order: by name, with discovered containers right after their engine.
     static func inTreeOrder(_ a: ServiceState, _ b: ServiceState) -> Bool {
@@ -559,6 +560,7 @@ struct ServiceState: Codable, Identifiable, Hashable {
         case "process": return config.command ?? ""
         case "docker": return config.image ?? (isDiscovered ? description : nil) ?? config.container ?? ""
         case "compose": return (config.composeFile as NSString?)?.abbreviatingWithTildeInPath ?? ""
+        case "machine": return description ?? "OrbStack machine"
         default: return ""
         }
     }

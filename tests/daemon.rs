@@ -1162,3 +1162,66 @@ fn wait_for_docker_holds_a_script_until_the_engine_answers() {
     assert_eq!(d.svc("cancelled")["status"], "stopped");
     drop(engine);
 }
+
+#[test]
+fn orbstack_machines_are_listed_under_the_orbstack_service() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = std::env::temp_dir().join(format!("lstack-it-orb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("services")).unwrap();
+    // A stand-in `orbctl`: machines live in a file, one `name state` per line.
+    let state = home.join("machines.txt");
+    let running = home.join("orb-running");
+    std::fs::write(&state, "ubuntu running\ndev stopped\n").unwrap();
+    std::fs::write(&running, "").unwrap();
+    let script = home.join("orbctl");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+S={s}; R={r}
+case "$1" in
+  status) if [ -e $R ]; then echo Running; else echo Stopped; exit 1; fi ;;
+  list) printf '['; sep=; while read n st; do printf '%s{{"record":{{"name":"%s","image":{{"distro":"ubuntu","version":"noble"}},"state":"%s"}}}}' "$sep" "$n" "$st"; sep=,; done < $S; printf ']\n' ;;
+  start) sed -i '' "s/^$2 .*/$2 running/" $S ;;
+  stop) sed -i '' "s/^$2 .*/$2 stopped/" $S ;;
+esac
+"#,
+            s = state.display(),
+            r = running.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(home.join("services/orbstack.yaml"), "name: orbstack\ncommand: sleep 300\n").unwrap();
+    let d = Daemon::start_with(&home, &[("LSTACK_ORBCTL", script.display().to_string()), ("DOCKER_HOST", "unix:///nonexistent/docker.sock".into())]);
+    let names = |d: &Daemon| -> Vec<String> { d.get("/api/services").unwrap()["services"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect() };
+
+    // Every machine is listed, running or not, indented under OrbStack.
+    wait_until("machines listed", 15, || names(&d).contains(&"orbstack.vm.dev".to_string()));
+    assert_eq!(names(&d), ["orbstack", "orbstack.vm.dev", "orbstack.vm.ubuntu"]);
+    let ubuntu = d.svc("orbstack.vm.ubuntu");
+    assert_eq!((ubuntu["parent"].as_str(), ubuntu["type"].as_str(), ubuntu["status"].as_str()), (Some("orbstack"), Some("machine"), Some("running")));
+    assert_eq!(ubuntu["config"]["description"], "ubuntu noble");
+    assert_eq!(d.svc("orbstack.vm.dev")["status"], "stopped");
+
+    // Start and stop go through orbctl.
+    assert_eq!(d.post("/api/services/orbstack.vm.dev/start", None).unwrap()["status"], "running");
+    assert!(std::fs::read_to_string(&state).unwrap().contains("dev running"));
+    assert_eq!(d.post("/api/services/orbstack.vm.ubuntu/stop", None).unwrap()["status"], "stopped");
+    assert!(std::fs::read_to_string(&state).unwrap().contains("ubuntu stopped"));
+
+    // Changes made outside LStack are followed: a new machine appears, a deleted one goes.
+    std::fs::write(&state, "dev running\nfresh running\n").unwrap();
+    wait_until("machine changes followed", 15, || names(&d).contains(&"orbstack.vm.fresh".to_string()) && !names(&d).contains(&"orbstack.vm.ubuntu".to_string()));
+
+    // While OrbStack is down its machines show as stopped (and nothing starts it).
+    std::fs::remove_file(&running).unwrap();
+    wait_until("machines stopped with OrbStack", 15, || d.svc("orbstack.vm.fresh")["status"] == "stopped");
+
+    // The shared switch hides them.
+    std::fs::write(&running, "").unwrap();
+    wait_until("running again", 15, || d.svc("orbstack.vm.fresh")["status"] == "running");
+    d.call("PUT", "/api/settings", Some(json!({ "dockerContainers": false }))).unwrap();
+    wait_until("machines hidden", 15, || !names(&d).iter().any(|n| n.starts_with("orbstack.vm.")));
+}

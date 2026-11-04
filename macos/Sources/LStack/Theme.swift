@@ -15,6 +15,7 @@ enum Theme {
         case "process": return "terminal.fill"
         case "docker": return "shippingbox.fill"
         case "compose": return "square.stack.3d.up.fill"
+        case "machine": return "desktopcomputer"
         case "k8s": return "helm"
         default: return "questionmark.circle"
         }
@@ -25,6 +26,7 @@ enum Theme {
         case "process": return .indigo
         case "docker": return .blue
         case "compose": return .cyan
+        case "machine": return .orange
         case "k8s": return .purple
         default: return .gray
         }

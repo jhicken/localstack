@@ -7,6 +7,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
     }
 
+    /// Opening LStack again (Finder, Spotlight, `open -a LStack`) while it runs: show the services panel in a
+    /// window, so there is a way in when the menu bar item is hidden by a crowded menu bar.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        NotificationCenter.default.post(name: .lstackShowPanel, object: nil)
+        return true
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard Helper.stopOnQuit, !Helper.relaunching else { return .terminateNow }
         Task {
@@ -15,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         return .terminateLater
     }
+}
+
+extension Notification.Name {
+    static let lstackShowPanel = Notification.Name("lstack.showPanel")
 }
 
 @main
@@ -60,6 +71,13 @@ struct LStackApp: App {
         }
         .windowResizability(.contentSize)
 
+        // The menu bar panel in a window: the way in when a crowded menu bar hides the item (reopen LStack to get it).
+        Window("LStack", id: "panel") {
+            PopoverView()
+                .environment(store)
+        }
+        .windowResizability(.contentSize)
+
         Window("LStack Setup", id: "setup") {
             SetupView()
                 .environment(store)
@@ -76,9 +94,13 @@ struct MenuBarLabel: View {
         let icon = !store.connected ? "square.stack.3d.up.slash" : store.failedCount > 0 ? "exclamationmark.triangle.fill" : "square.stack.3d.up.fill"
         HStack(spacing: 3) {
             Image(systemName: icon)
-            if store.connected, !store.running.isEmpty {
-                Text("\(store.running.count)").monospacedDigit()
+            if store.connected, store.runningTopLevel > 0 {
+                Text("\(store.runningTopLevel)").monospacedDigit()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .lstackShowPanel)) { _ in
+            openWindow(id: "panel")
+            bringToFront()
         }
         // A notification or Settings asked for a service's 1Password review.
         .onChange(of: store.reviewRequest) {
