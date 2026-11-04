@@ -394,7 +394,10 @@ impl Sup {
         self.every(30_000, |s| async move { s.sample_network().await });
         self.every(4_000, |s| async move { s.refresh_external().await });
         self.every(5_000, |s| async move { s.sample_ports().await });
-        self.every(3_000, |s| async move { s.sync_containers().await });
+        self.every(3_000, |s| async move {
+            s.sync_containers().await;
+            s.sync_machines().await;
+        });
         self.every(3_600_000, |s| async move { s.store.prune(now_ms()) });
     }
 
@@ -798,7 +801,9 @@ impl Sup {
         let mut snap = super::containers::Snapshot { parent, ..Default::default() };
         for m in g.services.values() {
             if m.parent.is_some() {
-                snap.children.push(super::containers::Child { name: m.cfg.name.clone(), running: m.rt.status == "running", ids: m.rt.ids.clone() });
+                if m.cfg.kind == "docker" {
+                    snap.children.push(super::containers::Child { name: m.cfg.name.clone(), running: m.rt.status == "running", ids: m.rt.ids.clone() });
+                }
                 continue;
             }
             snap.taken.insert(m.cfg.name.clone());
@@ -862,6 +867,7 @@ impl Sup {
             },
             "docker" => self.docker_start(name, gen).await,
             "compose" => self.compose_start(name, gen).await,
+            "machine" => self.machine_start(name, gen).await,
             _ => self.fail(name, gen, "Kubernetes services are not supported yet (planned for Phase 3)"),
         };
         if let Err(e) = res {
@@ -882,6 +888,7 @@ impl Sup {
             "process" => self.process_stop(name).await,
             "docker" => self.docker_stop(name).await,
             "compose" => self.compose_stop(name).await,
+            "machine" => self.machine_stop(name).await,
             _ => {
                 self.with(name, None, |m| self.set_status(m, "stopped"));
             }

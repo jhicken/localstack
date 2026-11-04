@@ -124,6 +124,7 @@ aside.list { border-right: 1px solid var(--border); overflow-y: auto; padding: 1
 .badge.process { color: var(--violet); background: rgba(167, 139, 250, 0.12); }
 .badge.docker { color: var(--accent-2); background: rgba(79, 209, 255, 0.12); }
 .badge.compose { color: var(--blue); background: rgba(96, 165, 250, 0.12); }
+.badge.machine { color: var(--amber); background: rgba(251, 191, 36, 0.12); }
 .badge.k8s { color: var(--amber); background: rgba(251, 191, 36, 0.12); }
 .h-healthy { color: var(--green); } .h-unhealthy { color: var(--red); } .h-starting { color: var(--amber); }
 .empty { color: var(--muted); text-align: center; padding: 60px 20px; }

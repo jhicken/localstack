@@ -898,6 +898,7 @@ fn details(s: &ServiceState, hist: &[MetricSample], w: usize) -> Vec<Line<'stati
             c.ports.as_ref().filter(|p| !p.is_empty()).map(|p| format!("  {}", p.join(" "))).unwrap_or_default()
         ),
         "compose" => format!("compose  {}", c.compose_file.as_deref().unwrap_or("")),
+        "machine" => format!("orbstack machine  {}", c.description.as_deref().unwrap_or("")),
         _ => format!("k8s  {}", c.manifest.clone().or(c.selector.clone()).unwrap_or_default()),
     };
     out.push(Line::from(dim(format!(" {}", f::truncate(&what, w.saturating_sub(2))))));
