@@ -5,6 +5,7 @@ let package = Package(
     name: "LStack",
     platforms: [.macOS(.v14)],
     targets: [
-        .executableTarget(name: "LStack", path: "Sources/LStack")
+        .executableTarget(name: "LStack", path: "Sources/LStack"),
+        .testTarget(name: "LStackTests", dependencies: ["LStack"])
     ]
 )

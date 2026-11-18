@@ -29,7 +29,7 @@ struct PopoverView: View {
                     VStack(spacing: 5) {
                         if !store.machines.isEmpty {
                             MachineHeader(name: store.localName ?? "This Mac", status: "online", detail: "this Mac",
-                                          count: store.services.count, collapsed: isCollapsed(Self.localKey)) { toggle(Self.localKey) }
+                                          services: store.services, collapsed: isCollapsed(Self.localKey)) { toggle(Self.localKey) }
                         }
                         if store.machines.isEmpty || !isCollapsed(Self.localKey) {
                             ForEach(store.services) { s in
@@ -47,7 +47,7 @@ struct PopoverView: View {
                         }
                         ForEach(store.machines) { m in
                             MachineHeader(name: m.name, status: m.status, detail: m.online ? (m.canControl ? nil : "view only") : (m.status == "repair" ? "pair again in Settings" : (m.error ?? m.status)),
-                                          help: m.linkDescription, count: m.services?.count ?? 0, collapsed: isCollapsed(m.name)) { toggle(m.name) }
+                                          help: m.linkDescription, services: m.services, collapsed: isCollapsed(m.name)) { toggle(m.name) }
                                 .padding(.top, 10)
                             if !isCollapsed(m.name) {
                                 ForEach(m.services ?? []) { s in
@@ -357,7 +357,7 @@ struct MachineHeader: View {
     let detail: String?
     /// Extra tooltip line (e.g. how the link travels).
     var help: String? = nil
-    var count = 0
+    var services: [ServiceState]? = nil
     var collapsed = false
     var toggle: () -> Void = {}
 
@@ -372,7 +372,10 @@ struct MachineHeader: View {
                 Text(name).font(.system(size: 12, weight: .semibold))
                 if let detail { Text(detail).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail) }
                 Spacer()
-                if count > 0 { Text("\(count)").font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit() }
+                if let serviceSummary {
+                    Text(serviceSummary).font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit()
+                        .help("\(serviceSummary) services running")
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 3)
@@ -382,9 +385,13 @@ struct MachineHeader: View {
         .help("\(name): \(status)\(help.map { " · \($0)" } ?? "") — click to \(collapsed ? "expand" : "collapse")")
     }
 
-    private var color: Color {
+    var serviceSummary: String? {
+        services.map { "\($0.filter(\.isRunning).count) of \($0.count)" }
+    }
+
+    var color: Color {
         switch status {
-        case "online": return .green
+        case "online": return services?.contains(where: { !$0.isRunning }) == true ? .orange : .green
         case "connecting": return .yellow
         case "unauthorized": return .red
         case "repair": return .orange
