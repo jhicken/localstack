@@ -99,7 +99,7 @@ impl Client {
     pub fn wait_approval(&self, msg: &str) -> Res<bool> {
         let Some(id) = crate::daemon::approvals::id_in(msg) else { return Ok(false) };
         eprintln!("{}", crate::fmt::dim(&format!("{msg}\nwaiting for approval in LStack.app… (Ctrl-C to stop waiting)")));
-        let _ = std::process::Command::new("/usr/bin/open").args(["-g", "-a", "LStack"]).status();
+        let _ = std::process::Command::new("/usr/bin/open").args(["-g", "-a", "LStack", "--args", "--background"]).status();
         loop {
             std::thread::sleep(Duration::from_millis(800));
             let v: Value = self.req("GET", &format!("/api/approvals/{}", enc(id)), None)?;

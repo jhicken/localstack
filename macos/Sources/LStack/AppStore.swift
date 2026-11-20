@@ -212,6 +212,9 @@ final class AppStore {
     /// bar count, so a long container list doesn't widen the icon (a crowded menu bar hides the widest items first).
     var runningTopLevel: Int { services.filter { $0.isRunning && !$0.isDiscovered }.count }
     var failedCount: Int { services.filter(\.isFailed).count }
+    var menuBarStatus: MenuBarStatus {
+        MenuBarStatus(connected: connected, localName: localName, services: services, machines: machines)
+    }
     var totalCPU: Double { running.reduce(0) { $0 + ($1.metrics?.cpu ?? 0) } }
     var totalMem: Double { running.reduce(0) { $0 + ($1.metrics?.mem ?? 0) } }
 
