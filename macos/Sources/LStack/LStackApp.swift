@@ -91,11 +91,22 @@ struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        let icon = !store.connected ? "square.stack.3d.up.slash" : store.failedCount > 0 ? "exclamationmark.triangle.fill" : "square.stack.3d.up.fill"
+        let status = store.menuBarStatus
         HStack(spacing: 3) {
-            Image(systemName: icon)
+            Image(systemName: status.symbol)
             if store.connected, store.runningTopLevel > 0 {
                 Text("\(store.runningTopLevel)").monospacedDigit()
+            }
+        }
+        .help(status.summary)
+        .accessibilityLabel(status.summary)
+        .onChange(of: status.summary, initial: true) {
+            let summary = status.summary
+            // MenuBarExtra renders the label as an image, dropping SwiftUI help and accessibility text.
+            DispatchQueue.main.async {
+                for window in NSApp.windows {
+                    if let view = window.contentView { applySummary(summary, to: view) }
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .lstackShowPanel)) { _ in
@@ -110,11 +121,20 @@ struct MenuBarLabel: View {
             bringToFront()
         }
         .task {
-            if await store.launch(), ProcessInfo.processInfo.environment["LSTACK_SNAPSHOT"] == nil {
-                openWindow(id: "setup")
+            let needsSetup = await store.launch()
+            if let window = LaunchWindow.initial(needsSetup: needsSetup) {
+                openWindow(id: window.rawValue)
                 bringToFront()
             }
         }
+    }
+
+    private func applySummary(_ summary: String, to view: NSView) {
+        if let button = view as? NSStatusBarButton {
+            button.toolTip = summary
+            button.setAccessibilityHelp(summary)
+        }
+        for subview in view.subviews { applySummary(summary, to: subview) }
     }
 }
 
